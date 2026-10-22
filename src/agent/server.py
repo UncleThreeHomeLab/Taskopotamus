@@ -114,13 +114,16 @@ def main():
     os.umask(0o077)
     state = private_directory(os.environ.get("CODEX_HOME", "/home/agent/.codex"))
     api_token = read_secret("AGENT_API_TOKEN")
-    with Codex(CodexConfig(config_overrides=('cli_auth_credentials_store="file"',))) as codex:
+    compact_percent = os.environ.get("CODEX_AUTO_COMPACT_PERCENT", "").strip()
+    codex_config = CodexConfig(config_overrides=('cli_auth_credentials_store="file"',))
+    with Codex(codex_config) as codex:
         auth = CodexAuth(codex)
         chat = ChatService(
-            codex,
+            lambda: Codex(codex_config),
             state / "taskopotamus.sqlite3",
             model=os.environ.get("CODEX_MODEL", "gpt-6-astra"),
             effort=os.environ.get("CODEX_REASONING_EFFORT", "medium"),
+            auto_compact_percent=int(compact_percent) if compact_percent else None,
         )
         with AgentHTTPServer(("0.0.0.0", 8080), make_handler(auth, api_token, chat)) as server:
             print("Agent service ready.", flush=True)

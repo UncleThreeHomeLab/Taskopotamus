@@ -2,6 +2,7 @@ import json
 import tempfile
 import threading
 import unittest
+from contextlib import contextmanager, nullcontext
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,17 +21,21 @@ class ChatServiceTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.database = Path(directory.name) / "chat.sqlite3"
         self.codex = Mock()
+        self.codex_factory = Mock(side_effect=lambda: nullcontext(self.codex))
         self.codex.account.return_value = SimpleNamespace(account=object())
         self.thread = Mock(id="synthetic-thread")
         self.turn = self.thread.turn.return_value
-        self.turn.run.return_value = SimpleNamespace(status=SimpleNamespace(value="completed"), final_response="Hello")
+        self.turn.run.return_value = SimpleNamespace(
+            status=SimpleNamespace(value="completed"), final_response="Hello",
+            usage=SimpleNamespace(model_context_window=80000),
+        )
         self.codex.thread_start.return_value = self.thread
         self.codex.thread_resume.return_value = self.thread
-        self.chat = ChatService(self.codex, self.database)
+        self.chat = ChatService(self.codex_factory, self.database, auto_compact_percent=50)
 
     def test_conversation_survives_service_recreation_and_other_chats_are_separate(self):
         self.assertEqual(self.chat.reply("42", "hello", "1"), {"text": "Hello"})
-        recreated = ChatService(self.codex, self.database)
+        recreated = ChatService(self.codex_factory, self.database)
         recreated.reply("42", "follow up", "2")
         self.codex.thread_resume.assert_called_once()
         self.assertEqual(self.codex.thread_resume.call_args.args[0], "synthetic-thread")
@@ -40,7 +45,104 @@ class ChatServiceTests(unittest.TestCase):
         self.assertEqual(options["model"], "gpt-6-astra")
         self.assertEqual(options["config"]["model_reasoning_effort"], "medium")
         self.assertFalse(options["config"]["features.shell_tool"])
+        self.assertNotIn("model_auto_compact_token_limit", options["config"])
         self.assertEqual(options["sandbox"].value, "read-only")
+
+    def test_compaction_learns_runtime_window_and_survives_restart(self):
+        chat = ChatService(self.codex_factory, self.database, auto_compact_percent=50)
+        chat.reply("42", "hello", "1")
+        self.assertNotIn("model_auto_compact_token_limit", self.codex.thread_start.call_args.kwargs["config"])
+        chat = ChatService(self.codex_factory, self.database, auto_compact_percent=50)
+        chat.reply("42", "follow up", "2")
+        config = self.codex.thread_resume.call_args.kwargs["config"]
+        self.assertEqual(config["model_auto_compact_token_limit"], 40000)
+        self.assertEqual(config["model_auto_compact_token_limit_scope"], "total")
+
+    def test_model_change_uses_defaults_then_learns_its_own_window(self):
+        self.chat.reply("42", "hello", "1")
+        changed = ChatService(self.codex_factory, self.database, model="synthetic-other-model", auto_compact_percent=50)
+        self.turn.run.return_value.usage.model_context_window = 30000
+        changed.reply("42", "switch model", "2")
+        self.assertNotIn("model_auto_compact_token_limit", self.codex.thread_resume.call_args.kwargs["config"])
+        changed.reply("42", "follow up", "3")
+        self.assertEqual(self.codex.thread_resume.call_args.kwargs["config"]["model_auto_compact_token_limit"], 15000)
+
+    def test_threads_keep_separate_windows(self):
+        self.chat.reply("42", "hello", "1")
+        other = Mock(id="synthetic-other-thread")
+        other.turn.return_value.run.return_value = SimpleNamespace(
+            status=SimpleNamespace(value="completed"), final_response="Other reply",
+            usage=SimpleNamespace(model_context_window=30000),
+        )
+        self.codex.thread_start.return_value = other
+        self.chat.reply("43", "another chat", "2")
+        self.assertNotIn("model_auto_compact_token_limit", self.codex.thread_start.call_args.kwargs["config"])
+        self.codex.thread_resume.return_value = other
+        self.chat.reply("43", "follow up", "3")
+        self.assertEqual(self.codex.thread_resume.call_args.kwargs["config"]["model_auto_compact_token_limit"], 15000)
+        self.codex.thread_resume.return_value = self.thread
+        self.chat.reply("42", "original chat", "4")
+        self.assertEqual(self.codex.thread_resume.call_args.kwargs["config"]["model_auto_compact_token_limit"], 40000)
+
+    def test_percentage_change_reuses_window_without_reusing_old_threshold(self):
+        self.chat.reply("42", "hello", "1")
+        changed = ChatService(self.codex_factory, self.database, auto_compact_percent=25)
+        changed.reply("42", "follow up", "2")
+        self.assertEqual(self.codex.thread_resume.call_args.kwargs["config"]["model_auto_compact_token_limit"], 20000)
+
+    def test_runtime_closes_between_turns_and_after_failure(self):
+        lifecycle = []
+
+        @contextmanager
+        def runtime():
+            lifecycle.append("open")
+            try:
+                yield self.codex
+            finally:
+                lifecycle.append("close")
+
+        chat = ChatService(runtime, self.database)
+        chat.reply("42", "hello", "1")
+        self.turn.run.side_effect = RuntimeError("synthetic failure")
+        with self.assertRaises(RuntimeError):
+            chat.reply("42", "follow up", "2")
+        self.assertEqual(lifecycle, ["open", "close", "open", "close"])
+
+    def test_runtime_window_refreshes_without_model_name_change(self):
+        self.chat.reply("42", "hello", "1")
+        self.turn.run.return_value.usage.model_context_window = 20000
+        self.chat.reply("42", "follow up", "2")
+        self.chat.reply("42", "again", "3")
+        self.assertEqual(self.codex.thread_resume.call_args.kwargs["config"]["model_auto_compact_token_limit"], 10000)
+
+    def test_missing_usage_discards_stale_window(self):
+        self.chat.reply("42", "hello", "1")
+        self.turn.run.return_value.usage = None
+        self.chat.reply("42", "follow up", "2")
+        self.chat.reply("42", "again", "3")
+        self.assertNotIn("model_auto_compact_token_limit", self.codex.thread_resume.call_args.kwargs["config"])
+
+    def test_default_policy_removes_previous_override_with_known_window(self):
+        self.chat.reply("42", "hello", "1")
+        chat = ChatService(self.codex_factory, self.database)
+        chat.reply("42", "follow up", "2")
+        self.assertNotIn("model_auto_compact_token_limit", self.codex.thread_resume.call_args.kwargs["config"])
+
+    def test_default_policy_keeps_codex_defaults_after_learning_window(self):
+        chat = ChatService(self.codex_factory, self.database)
+        chat.reply("42", "hello", "1")
+        chat.reply("42", "follow up", "2")
+        self.assertNotIn("model_auto_compact_token_limit", self.codex.thread_resume.call_args.kwargs["config"])
+
+    def test_failed_model_switch_discards_previous_window(self):
+        self.chat.reply("42", "hello", "1")
+        changed = ChatService(self.codex_factory, self.database, model="synthetic-other-model")
+        self.turn.run.side_effect = RuntimeError("synthetic failure")
+        with self.assertRaises(RuntimeError):
+            changed.reply("42", "switch model", "2")
+        self.turn.run.side_effect = None
+        self.chat.reply("42", "original model", "3")
+        self.assertNotIn("model_auto_compact_token_limit", self.codex.thread_resume.call_args.kwargs["config"])
 
     def test_reset_starts_a_new_thread(self):
         self.chat.reply("42", "hello", "1")
@@ -88,11 +190,14 @@ class ChatServiceTests(unittest.TestCase):
 
     def test_duplicate_request_reuses_saved_reply_after_restart(self):
         self.chat.reply("42", "hello", "1")
-        recreated = ChatService(self.codex, self.database)
+        self.codex_factory.reset_mock()
+        self.codex_factory.side_effect = RuntimeError("Runtime must not start for a replay")
+        recreated = ChatService(self.codex_factory, self.database)
         self.assertEqual(recreated.reply("42", "hello", "1"), {"text": "Hello"})
         self.turn.run.assert_called_once()
         with self.assertRaises(ValueError):
             recreated.reply("42", "different prompt", "1")
+        self.codex_factory.assert_not_called()
 
     def test_interrupted_request_never_repeats_inference(self):
         self.turn.run.side_effect = RuntimeError("synthetic failure")
