@@ -37,6 +37,7 @@ services:
     environment:
       CODEX_MODEL: ${CODEX_MODEL:-gpt-6-astra}
       CODEX_REASONING_EFFORT: ${CODEX_REASONING_EFFORT:-medium}
+      CODEX_AUTO_COMPACT_PERCENT: ${CODEX_AUTO_COMPACT_PERCENT:-}
       AGENT_API_TOKEN_FILE: /run/secrets/agent_api_token
     secrets:
       - agent_api_token
