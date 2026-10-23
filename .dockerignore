@@ -4,6 +4,7 @@
 !requirements.txt
 !requirements-mcp.txt
 !requirements-storage.txt
+!requirements-telegram.txt
 !tests/
 !tests/**
 !config/

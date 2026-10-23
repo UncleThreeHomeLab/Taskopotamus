@@ -3,12 +3,14 @@ import os
 import re
 import sys
 import time
+from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from psycopg import Error as DatabaseError
 
 from .agent_client import AgentClient
 from .delivery_store import DeliveryStore
+from .formatting import format_reply
 from src.runtime import read_secret
 from src.storage.database import Database
 
@@ -80,9 +82,24 @@ def reply_for(message, allowed_users, agent=None, request_id=None):
         return str(error)
 
 
-def reply_chunks(text):
-    # 2000 Unicode characters fit Telegram's limit even when every character uses two UTF-16 units.
-    return [text[start:start + 2000] for start in range(0, len(text), 2000)]
+class TelegramSendError(RuntimeError):
+    def __init__(self, kind):
+        self.kind = kind
+        super().__init__("Telegram send failed." if kind != "uncertain" else "Telegram delivery outcome uncertain.")
+
+
+def _send_rejection(data, body, http_code=None):
+    if not isinstance(data, dict) or data.get("ok") is not False or type(data.get("error_code")) is not int:
+        return "uncertain"
+    code = data["error_code"]
+    if http_code is not None and code != http_code:
+        return "uncertain"
+    description = data.get("description", "")
+    if code == 400 and body.get("parse_mode") == "HTML" and isinstance(description, str) and description.lower().startswith("bad request: can't parse entities"):
+        return "formatting"
+    if code == 429:
+        return "transient"
+    return "rejected" if 400 <= code < 500 else "uncertain"
 
 
 def api(token, method, body=None):
@@ -94,14 +111,38 @@ def api(token, method, body=None):
     )
     try:
         with urlopen(request, timeout=40) as response:
-            data = json.load(response)
+            if method == "sendMessage":
+                raw = response.read(262145)
+                if len(raw) > 262144:
+                    raise ValueError("Oversized send response")
+                data = json.loads(raw)
+            else:
+                data = json.load(response)
     except HTTPError as error:
+        if method == "sendMessage":
+            try:
+                raw = error.read(65537)
+                data = json.loads(raw) if len(raw) <= 65536 else None
+            except (OSError, HTTPException, ValueError, UnicodeError):
+                data = None
+            finally:
+                error.close()
+            raise TelegramSendError(_send_rejection(data, body or {}, error.code)) from None
         error.close()
         raise RuntimeError(f"Telegram {method} failed (HTTP {error.code}).") from None
-    except (URLError, TimeoutError, OSError):
+    except (URLError, TimeoutError, OSError, HTTPException):
+        if method == "sendMessage":
+            raise TelegramSendError("uncertain") from None
         raise RuntimeError("Telegram network request failed.") from None
     except (ValueError, UnicodeError):
+        if method == "sendMessage":
+            raise TelegramSendError("uncertain") from None
         raise RuntimeError("Telegram returned invalid JSON.") from None
+    if method == "sendMessage":
+        if isinstance(data, dict) and data.get("ok") is False:
+            raise TelegramSendError(_send_rejection(data, body or {}))
+        if not isinstance(data, dict) or data.get("ok") is not True or not isinstance(data.get("result"), dict) or type(data["result"].get("message_id")) is not int:
+            raise TelegramSendError("uncertain")
     if not isinstance(data, dict) or not data.get("ok"):
         raise RuntimeError(f"Telegram {method} failed.")
     return data["result"]
@@ -122,15 +163,42 @@ def process_update(update, allowed_users, agent, token, store):
             store.finish(update_id)
             return
         chat_id = message["chat"]["id"]
-        chunks = reply_chunks(text)
+        chunks = format_reply(text)
+        if not chunks:
+            store.finish(update_id)
+            return
         store.prepare(update_id, chat_id, chunks)
         pending = (chat_id, chunks, 0)
     chat_id, chunks, next_chunk = pending
     for index in range(next_chunk, len(chunks)):
-        api(token, "sendMessage", {
-            "chat_id": chat_id, "text": chunks[index], "protect_content": True,
-            "link_preview_options": {"is_disabled": True},
-        })
+        chunk = chunks[index]
+        if chunk["state"] != "pending":
+            state = "rejected" if chunk["state"] == "rejected" else "uncertain"
+            store.quarantine(update_id, index, state, "telegram_rejected" if state == "rejected" else "recovered_inflight")
+            print(f"Telegram delivery quarantined ({state}).", file=sys.stderr, flush=True)
+            return
+        while True:
+            store.mark_sending(update_id, index, chunk)
+            body = {"chat_id": chat_id, "text": chunk["text"], "protect_content": True,
+                    "link_preview_options": {"is_disabled": True}}
+            if chunk["parse_mode"] is not None:
+                body["parse_mode"] = chunk["parse_mode"]
+            try:
+                api(token, "sendMessage", body)
+            except RuntimeError as error:
+                kind = error.kind if isinstance(error, TelegramSendError) else "uncertain"
+                if kind == "formatting" and chunk["parse_mode"] == "HTML":
+                    chunk = {**chunk, "text": chunk["plain_text"], "parse_mode": None, "state": "pending"}
+                    store.replace_chunk(update_id, index, chunk)
+                    continue
+                if kind == "transient":
+                    store.replace_chunk(update_id, index, {**chunk, "state": "pending"})
+                    raise
+                state = "rejected" if kind in ("rejected", "formatting") else "uncertain"
+                store.quarantine(update_id, index, state, "telegram_rejected" if state == "rejected" else "network_outcome_unknown")
+                print(f"Telegram delivery quarantined ({state}).", file=sys.stderr, flush=True)
+                return
+            break
         store.mark_sent(update_id, index + 1)
     store.finish(update_id)
 

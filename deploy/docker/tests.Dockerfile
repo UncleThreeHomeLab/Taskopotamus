@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
 ENV PATH=/opt/tests/bin:$PATH PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY requirements*.txt ./
-RUN pip install --no-cache-dir -r requirements.txt -r requirements-mcp.txt
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-mcp.txt -r requirements-telegram.txt
 COPY src/ ./src/
 COPY config/agent/ ./config/agent/
 COPY tests/ ./tests/

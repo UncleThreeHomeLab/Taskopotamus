@@ -1,8 +1,11 @@
+import io
+import json
+from http.client import IncompleteRead
 import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError, URLError
 
-from src.telegram.bot import api, read_config, reply_chunks, reply_for
+from src.telegram.bot import api, read_config, reply_for, TelegramSendError
 
 
 class BotTests(unittest.TestCase):
@@ -73,11 +76,57 @@ class BotTests(unittest.TestCase):
         agent.chat.side_effect = RuntimeError("Codex is signed out. Send /codex_login.")
         self.assertIn("/codex_login", reply_for(message, {"42"}, agent))
 
-    def test_long_unicode_replies_are_split_without_losing_text(self):
-        text = "hello\n" + "\U0001f99b" * 5000
-        chunks = reply_chunks(text)
-        self.assertEqual("".join(chunks), text)
-        self.assertTrue(all(len(chunk.encode("utf-16-le")) // 2 <= 4096 for chunk in chunks))
+    def test_send_errors_use_only_reliable_format_rejections_and_sanitized_diagnostics(self):
+        token = "123:synthetic"
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        cases = [(400, "Bad Request: can't parse entities: synthetic-private", "formatting"),
+                 (400, "Bad Request: message is too long", "rejected"),
+                 (429, "Too many requests", "transient"), (500, "server error", "uncertain")]
+        for code, description, expected in cases:
+            error = HTTPError(url, code, description, {}, io.BytesIO(json.dumps({"ok": False, "error_code": code, "description": description}).encode()))
+            with self.subTest(code=code), patch("src.telegram.bot.urlopen", side_effect=error):
+                with self.assertRaises(TelegramSendError) as caught:
+                    api(token, "sendMessage", {"parse_mode": "HTML"})
+                self.assertEqual(caught.exception.kind, expected)
+                self.assertNotIn("synthetic", str(caught.exception))
+        for failure in (URLError(url), TimeoutError(url)):
+            with patch("src.telegram.bot.urlopen", side_effect=failure), self.assertRaises(TelegramSendError) as caught:
+                api(token, "sendMessage", {"parse_mode": "HTML"})
+            self.assertEqual(caught.exception.kind, "uncertain")
+        contradictory = HTTPError(url, 500, "synthetic-private", {}, io.BytesIO(json.dumps({
+            "ok": False, "error_code": 400, "description": "Bad Request: can't parse entities",
+        }).encode()))
+        with patch("src.telegram.bot.urlopen", side_effect=contradictory), self.assertRaises(TelegramSendError) as caught:
+            api(token, "sendMessage", {"parse_mode": "HTML"})
+        self.assertEqual(caught.exception.kind, "uncertain")
+
+    def test_send_response_is_bounded_but_polling_backlog_keeps_existing_behavior(self):
+        def response(body):
+            result = Mock()
+            result.__enter__ = Mock(return_value=io.BytesIO(body))
+            result.__exit__ = Mock(return_value=False)
+            return result
+        for body in (b"not json", b"x" * 262145, b'{"ok":true,"result":{}}'):
+            with patch("src.telegram.bot.urlopen", return_value=response(body)), self.assertRaises(TelegramSendError) as caught:
+                api("123:synthetic", "sendMessage", {})
+            self.assertEqual(caught.exception.kind, "uncertain")
+        broken = Mock()
+        broken.__enter__ = Mock(return_value=Mock(read=Mock(side_effect=IncompleteRead(b"synthetic-private"))))
+        broken.__exit__ = Mock(return_value=False)
+        with patch("src.telegram.bot.urlopen", return_value=broken), self.assertRaises(TelegramSendError) as caught:
+            api("123:synthetic", "sendMessage", {})
+        self.assertEqual(caught.exception.kind, "uncertain")
+        self.assertNotIn("synthetic-private", str(caught.exception))
+        with patch("src.telegram.bot.urlopen", return_value=response(b'{"ok":true,"result":{"message_id":1}}')):
+            self.assertEqual(api("123:synthetic", "sendMessage", {})["message_id"], 1)
+        rejection = json.dumps({"ok": False, "error_code": 400, "description": "Bad Request: can't parse entities"}).encode()
+        for mode, kind in (("HTML", "formatting"), (None, "rejected")):
+            with patch("src.telegram.bot.urlopen", return_value=response(rejection)), self.assertRaises(TelegramSendError) as caught:
+                api("123:synthetic", "sendMessage", {"parse_mode": mode})
+            self.assertEqual(caught.exception.kind, kind)
+        backlog = [{"synthetic": "x" * 300000}]
+        with patch("src.telegram.bot.urlopen", return_value=response(json.dumps({"ok": True, "result": backlog}).encode())):
+            self.assertEqual(api("123:synthetic", "getUpdates"), backlog)
 
 
 if __name__ == "__main__":
