@@ -11,6 +11,8 @@ from openai_codex import ApprovalMode, Sandbox
 from openai_codex.errors import JsonRpcError
 
 from src.profiles.instructions import load_system_instructions
+from src.profiles.auth import ProfileTokens
+from .run_details import summarize_run
 from .compaction_policy import CompactionPolicy
 from .instruction_refresh import refresh_instructions
 from .subagents import SubagentPolicy
@@ -34,13 +36,15 @@ class ChatService:
             db.execute("""CREATE TABLE IF NOT EXISTS replies (
                 chat_id TEXT, request_id TEXT, input_hash TEXT NOT NULL, reply TEXT,
                 PRIMARY KEY (chat_id, request_id))""")
+            db.execute("""CREATE TABLE IF NOT EXISTS reply_runs (
+                chat_id TEXT, request_id TEXT, status TEXT NOT NULL, details TEXT,
+                PRIMARY KEY (chat_id, request_id))""")
 
     @staticmethod
     def validate_chat_id(chat_id):
-        if not isinstance(chat_id, str) or not re.fullmatch(r"[1-9][0-9]{0,19}", chat_id):
-            raise ValueError("A numeric private chat ID is required.")
+        ProfileTokens.validate_chat(chat_id)
 
-    def reply(self, chat_id, text, request_id):
+    def reply(self, chat_id, text, request_id, include_details=False):
         self.validate_chat_id(chat_id)
         if not isinstance(text, str) or not text.strip() or len(text) > 16000:
             raise ValueError("Message must contain between 1 and 16000 characters.")
@@ -54,7 +58,7 @@ class ChatService:
 
         def run():
             try:
-                value = self._reply(chat_id, text, request_id, cancelled, active_turn)
+                value = self._reply(chat_id, text, request_id, cancelled, active_turn, include_details)
             except Exception as error:
                 if isinstance(error, JsonRpcError):
                     # Emit only fixed categories and code locations; RPC messages can contain credentials.
@@ -91,7 +95,7 @@ class ChatService:
         except Exception:
             pass
 
-    def _reply(self, chat_id, text, request_id, cancelled, active_turn):
+    def _reply(self, chat_id, text, request_id, cancelled, active_turn, include_details=False):
         digest = hashlib.sha256(text.encode()).hexdigest()
         with ExitStack() as runtime, self.database.connect() as db:
             row = db.execute(
@@ -101,7 +105,13 @@ class ChatService:
                 if row[0] != digest:
                     raise ValueError("Request ID already used for another message.")
                 # A crash may leave uncertain work. Fail closed instead of charging for it again.
-                return {"text": row[1] or "Previous request was interrupted. Please send your message again."}
+                result = {"text": row[1] or "Previous request was interrupted. Please send your message again."}
+                if include_details:
+                    saved = db.execute("SELECT status, details FROM reply_runs WHERE chat_id = %s AND request_id = %s",
+                                       (chat_id, request_id)).fetchone()
+                    result.update(status=saved[0] if saved and saved[0] != "pending" else "uncertain",
+                                  details=json.loads(saved[1]) if saved and saved[1] else None)
+                return result
             if cancelled.is_set():
                 raise TimeoutError("Request cancelled.")
             instructions, profile_config = load_system_instructions(), {}
@@ -118,6 +128,8 @@ class ChatService:
             if codex.account().account is None:
                 raise PermissionError("Sign in to Codex first.")
             db.execute("INSERT INTO replies VALUES (%s, %s, %s, NULL)", (chat_id, request_id, digest))
+            if include_details:
+                db.execute("INSERT INTO reply_runs VALUES (%s, %s, 'pending', NULL)", (chat_id, request_id))
             db.commit()
             try:
                 row = db.execute("SELECT thread_id FROM conversations WHERE chat_id = %s", (chat_id,)).fetchone()
@@ -170,9 +182,31 @@ class ChatService:
                     ("Codex could not finish this message. Please send your message again.", chat_id, request_id),
                 )
                 db.commit()
+                if include_details:
+                    self._save_run(db, chat_id, request_id, "failed", None)
                 raise
             db.execute("UPDATE replies SET reply = %s WHERE chat_id = %s AND request_id = %s", (reply, chat_id, request_id))
-            return {"text": reply}
+            db.commit()
+            result = {"text": reply}
+            if include_details:
+                details = None
+                try:
+                    details = summarize_run(response, self.model, self.effort, self.subagents)
+                except Exception:
+                    # A telemetry defect must not discard a completed reply or cause another paid turn.
+                    pass
+                self._save_run(db, chat_id, request_id, "completed", details)
+                result.update(status="completed", details=details)
+            return result
+
+    @staticmethod
+    def _save_run(db, chat_id, request_id, status, details):
+        try:
+            with db.transaction():
+                db.execute("UPDATE reply_runs SET status = %s, details = %s WHERE chat_id = %s AND request_id = %s",
+                           (status, json.dumps(details) if details is not None else None, chat_id, request_id))
+        except Exception as error:
+            print(f"Run details unavailable ({type(error).__name__}).", file=sys.stderr, flush=True)
 
     def reset(self, chat_id):
         self.validate_chat_id(chat_id)

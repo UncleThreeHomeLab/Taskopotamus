@@ -18,6 +18,52 @@ from database_support import isolated_database
 
 
 class ChatServiceTests(unittest.TestCase):
+    def test_console_details_replay_survives_restart_without_inference(self):
+        first = self.chat.reply("console:local", "hello", "100", include_details=True)
+        self.assertEqual(first["status"], "completed")
+        self.assertEqual(first["details"]["configured_parent_model"], "gpt-6-astra")
+        recreated = ChatService(self.codex_factory, self.database)
+        self.assertEqual(recreated.reply("console:local", "hello", "100", include_details=True), first)
+        self.turn.run.assert_called_once()
+
+    def test_console_failed_and_interrupted_replays_do_not_claim_success(self):
+        self.turn.run.side_effect = RuntimeError("synthetic")
+        with self.assertRaises(RuntimeError):
+            self.chat.reply("console:local", "hello", "100", include_details=True)
+        self.assertEqual(self.chat.reply("console:local", "hello", "100", include_details=True)["status"], "failed")
+        with self.database.connect() as db:
+            db.execute("UPDATE reply_runs SET status = 'pending' WHERE chat_id = 'console:local'")
+        self.assertEqual(self.chat.reply("console:local", "hello", "100", include_details=True)["status"], "uncertain")
+        self.turn.run.assert_called_once()
+
+    def test_console_metadata_failure_does_not_discard_reply_or_repeat_turn(self):
+        with self.database.connect() as db:
+            db.execute("ALTER TABLE reply_runs ADD CONSTRAINT reject_completed CHECK (status != 'completed')")
+        first = self.chat.reply("console:local", "hello", "100", include_details=True)
+        self.assertEqual(first["text"], "Hello")
+        replay = self.chat.reply("console:local", "hello", "100", include_details=True)
+        self.assertEqual(replay["text"], "Hello")
+        self.assertEqual(replay["status"], "uncertain")
+        self.turn.run.assert_called_once()
+
+    def test_console_http_identity_is_fixed_and_telegram_endpoint_remains_numeric(self):
+        token = "synthetic-service-token-for-tests-only"
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(Mock(), token, self.chat))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        client = AgentClient(f"http://127.0.0.1:{server.server_port}", token)
+        self.assertEqual(client.console_chat("hello", "100")["status"], "completed")
+        for path, payload in (("/console/chat", {"text": "hi", "request_id": "101", "chat_id": "42"}),
+                              ("/console/reset", {"chat_id": "42"}),
+                              ("/chat", {"chat_id": "console:local", "text": "hi", "request_id": "102"})):
+            with self.subTest(path=path), self.assertRaises(HTTPError) as caught:
+                urlopen(Request(client.base_url + path, data=json.dumps(payload).encode(),
+                                headers={"Authorization": f"Bearer {token}"}), timeout=3)
+            self.assertEqual(caught.exception.code, 400)
+            caught.exception.close()
+        self.turn.run.assert_called_once()
+
     def test_rpc_diagnostics_never_log_raw_messages_or_data(self):
         self.codex.thread_start.side_effect = InternalRpcError(
             -32603, "MCP required environment variable synthetic-private-token not found",

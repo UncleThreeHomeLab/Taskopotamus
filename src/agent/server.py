@@ -14,6 +14,7 @@ from .http_server import AgentHTTPServer
 from .profile_client import ProfileClient
 from src.runtime import read_secret
 from src.profiles.instructions import load_system_instructions
+from src.profiles.auth import CONSOLE_CHAT_ID, ProfileTokens
 from src.storage.database import Database
 from .worker_transport import configure_transport
 from .subagents import SubagentPolicy
@@ -57,7 +58,7 @@ def make_handler(auth, api_token, chat=None):
 
         def respond(self):
             try:
-                if not (self.command == "POST" and self.path in ("/chat", "/chat/reset")):
+                if not (self.command == "POST" and self.path in ("/chat", "/chat/reset", "/console/chat", "/console/reset")):
                     self.read_deadline.cancel()
                 if self.command == "GET" and self.path == "/health":
                     data, status = {"ok": True}, 200
@@ -71,7 +72,7 @@ def make_handler(auth, api_token, chat=None):
                     data, status = auth.login(), 200
                 elif self.command == "POST" and self.path == "/auth/login/retry":
                     data, status = auth.login(restart=True), 200
-                elif self.command == "POST" and self.path in ("/chat", "/chat/reset") and chat is not None:
+                elif self.command == "POST" and self.path in ("/chat", "/chat/reset", "/console/chat", "/console/reset") and chat is not None:
                     if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1:
                         raise ValueError("Invalid request framing.")
                     length = int(self.headers.get("Content-Length", "0"))
@@ -81,9 +82,19 @@ def make_handler(auth, api_token, chat=None):
                     self.read_deadline.cancel()
                     if not isinstance(payload, dict):
                         raise ValueError("Expected a JSON object.")
-                    chat_id = payload.get("chat_id")
-                    if self.path == "/chat/reset":
+                    console = self.path.startswith("/console/")
+                    if console:
+                        expected = {"text", "request_id"} if self.path == "/console/chat" else set()
+                        if set(payload) != expected:
+                            raise ValueError("Invalid console fields.")
+                        chat_id = CONSOLE_CHAT_ID
+                    else:
+                        chat_id = payload.get("chat_id")
+                        ProfileTokens.validate_telegram_chat(chat_id)
+                    if self.path in ("/chat/reset", "/console/reset"):
                         data = chat.reset(chat_id)
+                    elif console:
+                        data = chat.reply(chat_id, payload.get("text"), payload.get("request_id"), include_details=True)
                     else:
                         data = chat.reply(chat_id, payload.get("text"), payload.get("request_id"))
                     status = 200

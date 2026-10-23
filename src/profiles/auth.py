@@ -3,6 +3,8 @@ import time
 
 import jwt
 
+CONSOLE_CHAT_ID = "console:local"
+
 
 class ProfileTokens:
     def __init__(self, secret):
@@ -20,6 +22,12 @@ class ProfileTokens:
 
     @staticmethod
     def validate_chat(chat_id):
+        if chat_id == CONSOLE_CHAT_ID:
+            return
+        ProfileTokens.validate_telegram_chat(chat_id)
+
+    @staticmethod
+    def validate_telegram_chat(chat_id):
         if not isinstance(chat_id, str) or not re.fullmatch(r"[1-9][0-9]{0,19}", chat_id):
             raise ValueError("A numeric private chat ID is required.")
 

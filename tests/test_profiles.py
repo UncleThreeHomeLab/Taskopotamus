@@ -17,6 +17,15 @@ SECRET = "synthetic-test-profile-signing-key-only-12345678901234567890"
 
 
 class ProfileTests(unittest.TestCase):
+    def test_console_profile_is_separate_and_only_exact_console_subject_is_accepted(self):
+        self.store.update("console:local", 0, {"persona": "Synthetic local console preference"})
+        self.assertEqual(self.store.get("42")["version"], 0)
+        tokens = ProfileTokens(SECRET)
+        self.assertEqual(tokens.verify("Bearer " + tokens.issue("console:local")), "console:local")
+        for subject in ("console:42", "console:local/../42", "console:", "console:LOCAL"):
+            with self.assertRaises(ValueError):
+                tokens.issue(subject)
+
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
