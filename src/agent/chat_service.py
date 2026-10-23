@@ -1,4 +1,5 @@
 import hashlib
+import json
 import re
 import threading
 from concurrent.futures import Future, TimeoutError as FutureTimeout
@@ -7,17 +8,20 @@ from contextlib import ExitStack
 from openai_codex import ApprovalMode, Sandbox
 
 from src.runtime import private_database
+from src.profiles.instructions import load_system_instructions
 from .compaction_policy import CompactionPolicy
+from .instruction_refresh import refresh_instructions
 
 
 class ChatService:
-    def __init__(self, codex_factory, database, model="gpt-6-astra", effort="medium", turn_timeout=180, auto_compact_percent=None):
+    def __init__(self, codex_factory, database, model="gpt-6-astra", effort="medium", turn_timeout=180, auto_compact_percent=None, profiles=None):
         self.codex_factory = codex_factory
         self.database = database
         self.model = model
         self.effort = effort
         self.turn_timeout = turn_timeout
         self.compaction = CompactionPolicy(auto_compact_percent)
+        self.profiles = profiles
         self.lock = threading.Lock()
         with private_database(database) as db:
             db.execute("CREATE TABLE IF NOT EXISTS conversations (chat_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL)")
@@ -84,8 +88,17 @@ class ChatService:
                 return {"text": row[1] or "Previous request was interrupted. Please send your message again."}
             if cancelled.is_set():
                 raise TimeoutError("Request cancelled.")
+            instructions, profile_config = load_system_instructions(), {}
+            turn_input = text
+            if self.profiles is not None:
+                profile, profile_config, token = self.profiles.prepare(chat_id)
+                # Saved user text must never acquire developer authority.
+                turn_input = json.dumps({"profile": profile, "message": text}, ensure_ascii=False)
+                client = self.codex_factory(token)
+            else:
+                client = self.codex_factory()
             # Start after the replay check; loaded threads can ignore resume configuration changes.
-            codex = runtime.enter_context(self.codex_factory())
+            codex = runtime.enter_context(client)
             if codex.account().account is None:
                 raise PermissionError("Sign in to Codex first.")
             db.execute("INSERT INTO replies VALUES (?, ?, ?, NULL)", (chat_id, request_id, digest))
@@ -94,13 +107,12 @@ class ChatService:
                 row = db.execute("SELECT thread_id FROM conversations WHERE chat_id = ?", (chat_id,)).fetchone()
                 options = {
                     "model": self.model, "sandbox": Sandbox.read_only, "approval_mode": ApprovalMode.deny_all,
-                    "config": {"model_reasoning_effort": self.effort, "features.shell_tool": False, "web_search": "disabled"},
-                    "developer_instructions": (
-                        "You are Taskopotamus, a helpful conversational assistant in Telegram. "
-                        "Answer naturally and clearly. Keep replies concise unless detail is useful. "
-                        "Use the conversation history for follow-up questions. "
-                        "This is text chat only: do not run commands, inspect local files, or modify anything."
-                    ),
+                    "config": {
+                        "model_reasoning_effort": self.effort, "features.shell_tool": False,
+                        "features.multi_agent": False, "features.apps": False, "web_search": "disabled",
+                        **profile_config,
+                    },
+                    "developer_instructions": instructions,
                 }
                 if row:
                     context = db.execute(
@@ -112,6 +124,8 @@ class ChatService:
                     raise TimeoutError("Request cancelled.")
                 if row:
                     thread = codex.thread_resume(row[0], **options)
+                    if self.profiles is not None:
+                        refresh_instructions(thread, instructions)
                 else:
                     thread = codex.thread_start(**options)
                     db.execute("INSERT INTO conversations VALUES (?, ?)", (chat_id, thread.id))
@@ -119,7 +133,7 @@ class ChatService:
                 # Failed turns and model switches must not leave stale window metadata behind.
                 db.execute("DELETE FROM thread_context WHERE thread_id = ?", (thread.id,))
                 db.commit()
-                turn = thread.turn(text)
+                turn = thread.turn(turn_input)
                 active_turn.append(turn)
                 if cancelled.is_set():
                     self._interrupt(turn)
