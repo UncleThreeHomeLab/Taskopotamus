@@ -1,0 +1,26 @@
+Port 2222
+ListenAddress 0.0.0.0
+HostKey /run/sshd/host_key
+AuthorizedKeysFile /run/sshd/authorized_keys
+PidFile /run/sshd/sshd.pid
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+UsePAM no
+PermitTTY no
+AllowTcpForwarding no
+AllowStreamLocalForwarding no
+AllowAgentForwarding no
+X11Forwarding no
+PermitTunnel no
+GatewayPorts no
+PrintMotd no
+PrintLastLog no
+LogLevel ERROR
+MaxAuthTries 3
+MaxSessions 4
+MaxStartups 4:50:8
+AcceptEnv TASKOPOTAMUS_PROFILE_AUTH
+SetEnv CODEX_HOME=/home/agent/.codex HOME=/home/agent

@@ -1,19 +1,23 @@
 import hashlib
 import json
 import re
+import sys
 import threading
+import traceback
 from concurrent.futures import Future, TimeoutError as FutureTimeout
 from contextlib import ExitStack
 
 from openai_codex import ApprovalMode, Sandbox
+from openai_codex.errors import JsonRpcError
 
 from src.profiles.instructions import load_system_instructions
 from .compaction_policy import CompactionPolicy
 from .instruction_refresh import refresh_instructions
+from .subagents import SubagentPolicy
 
 
 class ChatService:
-    def __init__(self, codex_factory, database, model="gpt-6-astra", effort="medium", turn_timeout=180, auto_compact_percent=None, profiles=None):
+    def __init__(self, codex_factory, database, model="gpt-6-astra", effort="medium", turn_timeout=180, auto_compact_percent=None, profiles=None, subagents=None):
         self.codex_factory = codex_factory
         self.database = database
         self.model = model
@@ -21,6 +25,7 @@ class ChatService:
         self.turn_timeout = turn_timeout
         self.compaction = CompactionPolicy(auto_compact_percent)
         self.profiles = profiles
+        self.subagents = subagents or SubagentPolicy()
         self.lock = threading.Lock()
         with database.connect() as db:
             db.execute("CREATE TABLE IF NOT EXISTS conversations (chat_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL)")
@@ -51,6 +56,18 @@ class ChatService:
             try:
                 value = self._reply(chat_id, text, request_id, cancelled, active_turn)
             except Exception as error:
+                if isinstance(error, JsonRpcError):
+                    # Emit only fixed categories and code locations; RPC messages can contain credentials.
+                    hints = [hint for hint in (
+                        "mcp", "config", "environment variable", "not found", "no such file",
+                        "permission denied", "read-only file system", "rollout", "initialize",
+                        "required", "invalid", "expected", "authentication", "timeout",
+                    ) if hint in error.message.lower()]
+                    frames = traceback.extract_tb(error.__traceback__)
+                    location = next((str(frame.lineno) for frame in reversed(frames)
+                                     if frame.filename.endswith("chat_service.py")), "unknown")
+                    print(f"Codex RPC failed (code={error.code}; chat_service.py:{location}; categories={','.join(hints) or 'unclassified'}).",
+                          file=sys.stderr, flush=True)
                 self.lock.release()
                 result.set_exception(error)
             else:
@@ -105,10 +122,11 @@ class ChatService:
             try:
                 row = db.execute("SELECT thread_id FROM conversations WHERE chat_id = %s", (chat_id,)).fetchone()
                 options = {
-                    "model": self.model, "sandbox": Sandbox.read_only, "approval_mode": ApprovalMode.deny_all,
+                    "model": self.model, "sandbox": Sandbox.full_access, "approval_mode": ApprovalMode.deny_all,
+                    "cwd": "/workspace",
                     "config": {
-                        "model_reasoning_effort": self.effort, "features.shell_tool": False,
-                        "features.multi_agent": False, "features.apps": False, "web_search": "disabled",
+                        "model_reasoning_effort": self.effort, "features.shell_tool": True,
+                        "features.apps": False, "web_search": "disabled", **self.subagents.config(),
                         **profile_config,
                     },
                     "developer_instructions": instructions,

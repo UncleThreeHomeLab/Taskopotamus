@@ -24,7 +24,7 @@ class DeviceLogin:
         self.finished = threading.Event()
         self.success = False
         self.process = subprocess.Popen(
-            [str(bundled_codex_path()), "-c", 'cli_auth_credentials_store="file"', "login", "--device-auth"],
+            [os.environ.get("CODEX_BIN") or str(bundled_codex_path()), "-c", 'cli_auth_credentials_store="file"', "login", "--device-auth"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,

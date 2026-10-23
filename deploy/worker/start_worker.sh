@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+umask 077
+mkdir -p /run/sshd /home/agent/.codex /workspace
+chmod 755 /run/sshd
+cp /run/secrets/worker_host_key /run/sshd/host_key
+cp /run/secrets/worker_client_public /run/sshd/authorized_keys
+chmod 600 /run/sshd/host_key /run/sshd/authorized_keys
+python /usr/local/bin/worker-firewall "$WORKER_MCP_IP" "$WORKER_DNS_IP"
+# Drop the firewall capability before any SSH session or model-generated command can run.
+exec setpriv --bounding-set=-net_admin,-setpcap --inh-caps=-all --ambient-caps=-all \
+    /usr/sbin/sshd -D -e -f /etc/ssh/taskopotamus_config

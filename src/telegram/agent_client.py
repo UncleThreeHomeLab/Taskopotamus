@@ -1,5 +1,6 @@
 import json
 import sys
+import os
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -10,6 +11,7 @@ class AgentClient:
         if len(api_token) < 32 or not api_token.isascii():
             raise ValueError("Agent API token must contain at least 32 ASCII characters.")
         self.api_token = api_token
+        self.chat_timeout = int(os.environ.get("CODEX_TURN_TIMEOUT_SECONDS", "600")) + 20
 
     def request(self, path, method="GET", body=None):
         request = Request(
@@ -18,7 +20,7 @@ class AgentClient:
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.api_token}"},
         )
         try:
-            with urlopen(request, timeout=200 if path == "/chat" else 60) as response:
+            with urlopen(request, timeout=self.chat_timeout if path == "/chat" else 60) as response:
                 return json.load(response)
         except HTTPError as error:
             print(f"Agent HTTP request failed ({error.code}).", file=sys.stderr, flush=True)
