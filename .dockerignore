@@ -2,6 +2,10 @@
 !src/
 !src/**
 !requirements.txt
+!requirements-mcp.txt
+!config/
+!config/agent/
+!config/agent/system_instructions.md
 !deploy/
 !deploy/docker/
 !deploy/docker/*.Dockerfile

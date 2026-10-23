@@ -11,7 +11,9 @@ from openai_codex import Codex, CodexConfig
 from .codex_auth import CodexAuth
 from .chat_service import ChatService
 from .http_server import AgentHTTPServer
+from .profile_client import ProfileClient
 from src.runtime import private_directory, read_secret
+from src.profiles.instructions import load_system_instructions
 
 
 def make_handler(auth, api_token, chat=None):
@@ -84,7 +86,8 @@ def make_handler(auth, api_token, chat=None):
                     status = 200
                 else:
                     data, status = {"error": "Not found"}, 404
-            except (ValueError, UnicodeError):
+            except (ValueError, UnicodeError) as error:
+                print(f"Agent request rejected ({type(error).__name__}).", file=sys.stderr, flush=True)
                 data, status = {"error": "Invalid request"}, 400
             except PermissionError:
                 data, status = {"error": "Codex sign-in required"}, 401
@@ -92,7 +95,8 @@ def make_handler(auth, api_token, chat=None):
                 data, status = {"error": "Agent busy"}, 429
             except TimeoutError:
                 data, status = {"error": "Request timed out"}, 504
-            except Exception:
+            except Exception as error:
+                print(f"Agent request failed ({type(error).__name__}).", file=sys.stderr, flush=True)
                 data, status = {"error": "Agent request failed"}, 503
             body = json.dumps(data).encode("utf-8")
             self.send_response(status)
@@ -112,18 +116,24 @@ def make_handler(auth, api_token, chat=None):
 
 def main():
     os.umask(0o077)
+    load_system_instructions()
     state = private_directory(os.environ.get("CODEX_HOME", "/home/agent/.codex"))
     api_token = read_secret("AGENT_API_TOKEN")
     compact_percent = os.environ.get("CODEX_AUTO_COMPACT_PERCENT", "").strip()
+    profiles = ProfileClient(os.environ.get("PROFILE_SERVICE_URL", "http://mcp:8080"), read_secret("PROFILE_SIGNING_KEY"))
     codex_config = CodexConfig(config_overrides=('cli_auth_credentials_store="file"',))
     with Codex(codex_config) as codex:
         auth = CodexAuth(codex)
         chat = ChatService(
-            lambda: Codex(codex_config),
+            lambda token: Codex(CodexConfig(
+                config_overrides=codex_config.config_overrides,
+                env={"TASKOPOTAMUS_PROFILE_AUTH": f"Bearer {token}"},
+            )),
             state / "taskopotamus.sqlite3",
             model=os.environ.get("CODEX_MODEL", "gpt-6-astra"),
             effort=os.environ.get("CODEX_REASONING_EFFORT", "medium"),
             auto_compact_percent=int(compact_percent) if compact_percent else None,
+            profiles=profiles,
         )
         with AgentHTTPServer(("0.0.0.0", 8080), make_handler(auth, api_token, chat)) as server:
             print("Agent service ready.", flush=True)

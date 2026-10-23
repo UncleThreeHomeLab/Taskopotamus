@@ -1,1 +1,2 @@
 openai-codex==0.163.0
+PyJWT==2.15.1

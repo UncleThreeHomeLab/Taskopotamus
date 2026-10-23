@@ -1,4 +1,5 @@
 import json
+import sys
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -20,6 +21,7 @@ class AgentClient:
             with urlopen(request, timeout=200 if path == "/chat" else 60) as response:
                 return json.load(response)
         except HTTPError as error:
+            print(f"Agent HTTP request failed ({error.code}).", file=sys.stderr, flush=True)
             error.close()
             if error.code == 401:
                 raise RuntimeError("Codex is signed out. Send /codex_login.") from None
@@ -28,7 +30,8 @@ class AgentClient:
             if error.code == 504:
                 raise RuntimeError("Codex reply timed out. Please send your message again.") from None
             raise RuntimeError("Agent service unavailable. Check Codex account access and try again.") from None
-        except (URLError, OSError, ValueError):
+        except (URLError, OSError, ValueError) as error:
+            print(f"Agent connection failed ({type(error).__name__}).", file=sys.stderr, flush=True)
             raise RuntimeError("Agent service unavailable. Try again shortly.") from None
 
     def login(self, restart=False):

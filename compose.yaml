@@ -39,8 +39,17 @@ services:
       CODEX_REASONING_EFFORT: ${CODEX_REASONING_EFFORT:-medium}
       CODEX_AUTO_COMPACT_PERCENT: ${CODEX_AUTO_COMPACT_PERCENT:-}
       AGENT_API_TOKEN_FILE: /run/secrets/agent_api_token
+      PROFILE_SERVICE_URL: http://mcp:8080
+      PROFILE_SIGNING_KEY_FILE: /run/secrets/profile_signing_key
     secrets:
       - agent_api_token
+      - profile_signing_key
+    depends_on:
+      mcp:
+        condition: service_healthy
+    networks:
+      - default
+      - profiles
     init: true
     read_only: true
     mem_limit: 1g
@@ -48,8 +57,42 @@ services:
     pids_limit: 128
     volumes:
       - codex_data:/home/agent/.codex
+      - ${AGENT_INSTRUCTIONS_DIR:-./config/agent}:/app/config/agent:ro
     tmpfs:
       - /tmp:mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  mcp:
+    build:
+      context: .
+      dockerfile: deploy/docker/mcp.Dockerfile
+    environment:
+      PROFILE_SIGNING_KEY_FILE: /run/secrets/profile_signing_key
+    secrets:
+      - profile_signing_key
+    networks:
+      - profiles
+    volumes:
+      - profile_data:/home/mcp/data
+      - ${AGENT_INSTRUCTIONS_DIR:-./config/agent}:/app/config/agent:ro
+    init: true
+    read_only: true
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
     cap_drop:
       - ALL
     security_opt:
@@ -68,12 +111,20 @@ services:
 volumes:
   codex_data:
   telegram_data:
+  profile_data:
 
 secrets:
   agent_api_token:
     file: ${AGENT_API_TOKEN_PATH:-./credentials/agent_api_token}
+  profile_signing_key:
+    file: ${PROFILE_SIGNING_KEY_PATH:-./credentials/profile_signing_key}
 
 networks:
+  profiles:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${TASKOPOTAMUS_PROFILE_SUBNET:-10.203.17.16/28}
   default:
     ipam:
       config:

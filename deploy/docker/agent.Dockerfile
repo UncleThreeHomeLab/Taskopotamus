@@ -7,5 +7,6 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && chmod 700 /home/agent/.codex \
     && chown -R 10001:10001 /home/agent
 COPY src/ ./src/
+COPY config/agent/ ./config/agent/
 USER 10001:10001
 CMD ["python", "-m", "src.agent.server"]
