@@ -1,6 +1,4 @@
 import os
-import sqlite3
-from contextlib import closing, contextmanager
 from pathlib import Path
 
 
@@ -20,15 +18,3 @@ def private_directory(path):
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.chmod(0o700)
     return path
-
-
-@contextmanager
-def private_database(path):
-    path = Path(path)
-    private_directory(path.parent)
-    with closing(sqlite3.connect(path)) as db, db:
-        for suffix in ("", "-journal", "-wal", "-shm"):
-            state_file = Path(str(path) + suffix)
-            if state_file.exists():
-                state_file.chmod(0o600)
-        yield db

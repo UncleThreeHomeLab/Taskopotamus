@@ -1,7 +1,5 @@
 import logging
-import tempfile
 import unittest
-from pathlib import Path
 
 from starlette.testclient import TestClient
 
@@ -9,6 +7,7 @@ from src.mcp_server.server import make_app
 from src.profiles.auth import ProfileTokens
 from src.profiles.instructions import DEFAULT_PROFILE, load_system_instructions
 from src.profiles.store import ProfileStore
+from database_support import isolated_database
 
 
 SECRET = "synthetic-test-profile-signing-key-only-123456"
@@ -17,9 +16,7 @@ SECRET = "synthetic-test-profile-signing-key-only-123456"
 class MCPProfileTests(unittest.TestCase):
     def setUp(self):
         logging.disable(logging.CRITICAL)
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.store = ProfileStore(Path(directory.name) / "profiles.sqlite3")
+        self.store = ProfileStore(isolated_database(self))
         self.tokens = ProfileTokens(SECRET)
         self.client = TestClient(make_app(self.store, SECRET), base_url="http://mcp:8080")
         self.client.__enter__()

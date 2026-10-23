@@ -14,6 +14,7 @@ from .http_server import AgentHTTPServer
 from .profile_client import ProfileClient
 from src.runtime import private_directory, read_secret
 from src.profiles.instructions import load_system_instructions
+from src.storage.database import Database
 
 
 def make_handler(auth, api_token, chat=None):
@@ -117,7 +118,7 @@ def make_handler(auth, api_token, chat=None):
 def main():
     os.umask(0o077)
     load_system_instructions()
-    state = private_directory(os.environ.get("CODEX_HOME", "/home/agent/.codex"))
+    private_directory(os.environ.get("CODEX_HOME", "/home/agent/.codex"))
     api_token = read_secret("AGENT_API_TOKEN")
     compact_percent = os.environ.get("CODEX_AUTO_COMPACT_PERCENT", "").strip()
     profiles = ProfileClient(os.environ.get("PROFILE_SERVICE_URL", "http://mcp:8080"), read_secret("PROFILE_SIGNING_KEY"))
@@ -129,7 +130,7 @@ def main():
                 config_overrides=codex_config.config_overrides,
                 env={"TASKOPOTAMUS_PROFILE_AUTH": f"Bearer {token}"},
             )),
-            state / "taskopotamus.sqlite3",
+            Database.from_env(),
             model=os.environ.get("CODEX_MODEL", "gpt-6-astra"),
             effort=os.environ.get("CODEX_REASONING_EFFORT", "medium"),
             auto_compact_percent=int(compact_percent) if compact_percent else None,

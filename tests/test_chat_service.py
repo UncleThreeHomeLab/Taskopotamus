@@ -1,10 +1,8 @@
 import json
-import tempfile
 import threading
 import unittest
 from contextlib import contextmanager, nullcontext
 from http.server import ThreadingHTTPServer
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 from urllib.error import HTTPError
@@ -14,13 +12,12 @@ from src.agent.chat_service import ChatService
 from src.agent.server import make_handler
 from src.telegram.agent_client import AgentClient
 from src.profiles.instructions import DEFAULT_PROFILE, load_system_instructions
+from database_support import isolated_database
 
 
 class ChatServiceTests(unittest.TestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.database = Path(directory.name) / "chat.sqlite3"
+        self.database = isolated_database(self)
         self.codex = Mock()
         self.codex_factory = Mock(side_effect=lambda *_args: nullcontext(self.codex))
         self.codex.account.return_value = SimpleNamespace(account=object())
