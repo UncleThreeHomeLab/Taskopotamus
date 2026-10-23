@@ -100,8 +100,8 @@ services:
       <<: *database
       DATABASE_NAME: taskopotamus_telegram
       DATABASE_USER: taskopotamus_telegram
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}
-      TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS:?Set TELEGRAM_ALLOWED_USER_IDS in .env}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS:-}
       AGENT_URL: http://agent:8080
       AGENT_API_TOKEN_FILE: /run/secrets/agent_api_token
       CODEX_TURN_TIMEOUT_SECONDS: ${CODEX_TURN_TIMEOUT_SECONDS:-600}
@@ -115,6 +115,34 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 64
+
+  test-console:
+    <<: *security
+    profiles: [manual-test]
+    build:
+      context: .
+      dockerfile: deploy/docker/agent.Dockerfile
+    command: [python, -m, src.test_console.server]
+    environment:
+      AGENT_URL: http://agent:8080
+      AGENT_API_TOKEN_FILE: /run/secrets/agent_api_token
+      CODEX_TURN_TIMEOUT_SECONDS: ${CODEX_TURN_TIMEOUT_SECONDS:-600}
+    secrets: [agent_api_token]
+    networks: [execution, console_ingress]
+    ports: ["127.0.0.1:8088:8088"]
+    tmpfs:
+      - /tmp:mode=1777
+    depends_on:
+      agent:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/health', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 10
     mem_limit: 128m
     cpus: 0.5
     pids_limit: 64
@@ -267,6 +295,10 @@ secrets:
     file: ${CREDENTIALS_DIR:-./credentials}/worker_client_key.pub
 
 networks:
+  console_ingress:
+    ipam:
+      config:
+        - subnet: ${TASKOPOTAMUS_CONSOLE_SUBNET:-10.203.17.64/28}
   execution:
     internal: true
     ipam:
