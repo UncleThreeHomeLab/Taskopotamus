@@ -1,17 +1,14 @@
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import Mock, patch
 
 from src.telegram.bot import process_update
 from src.telegram.delivery_store import DeliveryStore
+from database_support import isolated_database
 
 
 class DeliveryTests(unittest.TestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.database = Path(directory.name) / "delivery.sqlite3"
+        self.database = isolated_database(self)
         self.store = DeliveryStore(self.database)
         self.agent = Mock()
         self.agent.chat.return_value = {"text": "x" * 3000}

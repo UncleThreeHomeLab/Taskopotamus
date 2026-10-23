@@ -10,7 +10,7 @@ import jwt
 from src.profiles.auth import ProfileTokens
 from src.profiles.instructions import DEFAULT_PROFILE, resolve_profile, load_system_instructions
 from src.profiles.store import ProfileStore
-from src.runtime import private_database
+from database_support import isolated_database
 
 
 SECRET = "synthetic-test-profile-signing-key-only-12345678901234567890"
@@ -20,7 +20,8 @@ class ProfileTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        self.database = Path(directory.name) / "profiles.sqlite3"
+        self.directory = Path(directory.name)
+        self.database = isolated_database(self)
         self.store = ProfileStore(self.database)
 
     def test_updates_survive_restart_and_are_isolated_by_chat(self):
@@ -43,7 +44,7 @@ class ProfileTests(unittest.TestCase):
             self.store.update("42", 0, {"persona": "Stale overwrite"})
         for version in range(1, 25):
             self.store.update("42", version, {"persona": f"Preference {version}"})
-        with private_database(self.database) as db:
+        with self.database.connect() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM profile_versions").fetchone()[0], 20)
             saved = db.execute("SELECT settings FROM profile_versions WHERE version = 24").fetchone()[0]
             self.assertEqual(json.loads(saved)["persona"], "Preference 23")
@@ -54,7 +55,7 @@ class ProfileTests(unittest.TestCase):
         self.assertNotIn(profile["behavior"], load_system_instructions())
 
     def test_owner_system_file_reloads_separately_from_all_four_user_fields(self):
-        path = self.database.parent / "system_instructions.md"
+        path = self.directory / "system_instructions.md"
         initial = "# Application instructions\nInitial application rules for MCP."
         path.write_text(initial, encoding="utf-8")
         with patch.dict("os.environ", {"AGENT_INSTRUCTIONS_FILE": str(path)}):
@@ -69,7 +70,7 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(load_system_instructions(), initial.replace("Initial", "Updated"))
 
     def test_missing_empty_invalid_and_oversized_system_files_fail_closed(self):
-        path = self.database.parent / "instructions.md"
+        path = self.directory / "instructions.md"
         with self.assertRaises(ValueError):
             load_system_instructions(path)
         for content in (b"", b" \n\t", b"\xff", b"x" * 16385):

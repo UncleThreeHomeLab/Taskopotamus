@@ -5,10 +5,12 @@ import sys
 import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from psycopg import Error as DatabaseError
 
 from .agent_client import AgentClient
 from .delivery_store import DeliveryStore
-from src.runtime import private_directory, read_secret
+from src.runtime import read_secret
+from src.storage.database import Database
 
 
 def read_config(env):
@@ -137,8 +139,7 @@ def main():
     os.umask(0o077)
     token, allowed_users = read_config(os.environ)
     agent = AgentClient(os.environ.get("AGENT_URL", "http://agent:8080"), read_secret("AGENT_API_TOKEN"))
-    state = private_directory(os.environ.get("TELEGRAM_STATE_DIR", "/home/telegram/data"))
-    store = DeliveryStore(state / "delivery.sqlite3")
+    store = DeliveryStore(Database.from_env())
     api(token, "getMe")
     webhook = api(token, "getWebhookInfo")
     if webhook.get("url"):
@@ -151,8 +152,9 @@ def main():
             })
             for update in updates:
                 process_update(update, allowed_users, agent, token, store)
-        except RuntimeError as error:
-            print(str(error), file=sys.stderr, flush=True)
+        except (RuntimeError, DatabaseError) as error:
+            message = str(error) if isinstance(error, RuntimeError) else "Telegram storage unavailable. Retrying."
+            print(message, file=sys.stderr, flush=True)
             time.sleep(5)
 
 
@@ -164,3 +166,6 @@ if __name__ == "__main__":
         sys.exit(1)
     except KeyboardInterrupt:
         pass
+    except Exception:
+        print("Telegram failed to start. Check configuration and storage.", file=sys.stderr)
+        sys.exit(1)

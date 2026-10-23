@@ -14,7 +14,8 @@ from starlette.responses import JSONResponse
 from src.profiles.auth import ProfileTokens
 from src.profiles.store import ProfileStore
 from src.profiles.instructions import load_system_instructions
-from src.runtime import private_directory, read_secret
+from src.runtime import read_secret
+from src.storage.database import Database
 
 
 class ProfileChanges(BaseModel):
@@ -136,8 +137,7 @@ def main():
     os.umask(0o077)
     load_system_instructions()
     logging.disable(logging.CRITICAL)
-    state = private_directory(os.environ.get("PROFILE_DATA_DIR", "/home/mcp/data"))
-    app = make_app(ProfileStore(state / "profiles.sqlite3"), read_secret("PROFILE_SIGNING_KEY"))
+    app = make_app(ProfileStore(Database.from_env()), read_secret("PROFILE_SIGNING_KEY"))
     uvicorn.run(app, host="0.0.0.0", port=8080, access_log=False, log_config=None, limit_concurrency=16, timeout_keep_alive=5)
 
 
@@ -146,6 +146,6 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         pass
-    except Exception:
-        print("Profile service failed to start. Check configuration and storage permissions.", file=sys.stderr)
+    except Exception as error:
+        print(f"Profile service failed to start ({type(error).__name__}). Check configuration and storage permissions.", file=sys.stderr)
         sys.exit(1)
