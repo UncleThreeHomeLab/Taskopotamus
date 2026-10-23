@@ -16,6 +16,60 @@ MAX_MARKDOWN_SOURCE = 65536
 MAX_RENDERED_TEXT = 262144
 
 
+class ChatInlineParser(mistune.InlineParser):
+    def finalize_tokens(self, tokens, depth):
+        if depth >= self.max_nested_level:
+            return super().finalize_tokens(tokens, depth)
+        # Relax only CJK-adjacent strong closers; escaped text and parsed code stay opaque.
+        parts, source, markers = [], [], []
+        offset = 0
+        for token in tokens:
+            raw = token.get("raw", "")
+            if token["type"] == "text" and token.get("_emphasis", True):
+                start = 0
+                for match in re.finditer(r"(?<!\*)\*\*(?!\*)", raw):
+                    if match.start() > start:
+                        parts.append({**token, "raw": raw[start:match.start()]})
+                    markers.append((len(parts), offset + match.start()))
+                    parts.append({**token, "raw": "**"})
+                    start = match.end()
+                if start < len(raw):
+                    parts.append({**token, "raw": raw[start:]})
+                source.append(raw)
+                offset += len(raw)
+            else:
+                parts.append(token)
+                source.append(raw if token["type"] == "text" else "\ufffc")
+                offset += len(source[-1])
+        text = "".join(source)
+        pairs, opener = {}, None
+        for index, pos in markers:
+            previous = text[pos - 1] if pos else "\n"
+            following = text[pos + 2] if pos + 2 < len(text) else "\n"
+            previous_punctuation = not previous.isspace() and not previous.isalnum()
+            following_punctuation = not following.isspace() and not following.isalnum()
+            can_open = not following.isspace() and (not following_punctuation or previous.isspace() or previous_punctuation)
+            can_close = not previous.isspace() and (not previous_punctuation or following.isspace() or following_punctuation)
+            cjk_close = previous_punctuation and following.isalnum() and unicodedata.east_asian_width(following) in ("W", "F")
+            if opener is not None and (can_close or cjk_close):
+                if cjk_close and not can_close:
+                    pairs[opener] = index
+                opener = None
+            elif can_open:
+                opener = index
+        result, index = [], 0
+        while index < len(parts):
+            end = pairs.get(index)
+            if end is None:
+                result.append(parts[index])
+                index += 1
+            else:
+                children = super().finalize_tokens(parts[index + 1:end], depth + 1)
+                result.append({"type": "strong", "children": children})
+                index = end + 1
+        return super().finalize_tokens(result, depth)
+
+
 def units(text):
     return len(text.encode("utf-16-le")) // 2
 
@@ -316,7 +370,9 @@ def format_reply(text):
     if len(text) > MAX_MARKDOWN_SOURCE:
         return _chunks([Run(text)], formatted=False)
     try:
-        parser = mistune.create_markdown(renderer="ast", plugins=["strikethrough", "table", "task_lists", "url"])
+        parser = mistune.Markdown(inline=ChatInlineParser(), plugins=[
+            mistune.plugins.import_plugin(name) for name in ("strikethrough", "table", "task_lists", "url")
+        ])
         # Repeated table headers and tiny inline nodes must not amplify a bounded reply without limit.
         renderer = Renderer(min(MAX_RENDERED_TEXT, max(16384, len(text) * 8)))
         renderer.blocks(parser(text))

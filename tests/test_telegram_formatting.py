@@ -59,6 +59,36 @@ class FormattingTests(unittest.TestCase):
             self.assertTrue(set(re.findall(r"&([A-Za-z]+);", chunk["text"])) <= {"amp", "lt", "gt", "quot"})
         return chunks
 
+    def test_cjk_adjacent_strong_closers_render_model_prose(self):
+        examples = (
+            ('\uff1b', '1 \u6708 20 \u65e5\uff08\u4e09\uff09', '\u4ea6\u6709\u4e00\u5834\u3002'),
+            ('\uff0c\u7fcc\u65e5 ', '2 \u6708 25 \u65e5\uff08\u56db\uff09', '\u4ea6\u6709\u4e00\u5834\u3002'),
+            ('FC \u6700\u65e9\u512a\u5148\u62bd\u7968\u7531 ', '2026 \u5e74 11 \u6708 20 \u65e5 18:00\uff08\u65e5\u672c\u6642\u9593\uff09',
+             '\u958b\u59cb\uff1b\u958b\u5834\u53ca\u958b\u6f14\u6642\u9593\u5c1a\u672a\u516c\u5e03\u3002'),
+        )
+        for prefix, bold, suffix in examples:
+            with self.subTest(bold=bold):
+                chunks = self.checked(prefix + '**' + bold + '**' + suffix)
+                self.assertEqual(''.join(map(visible, chunks)), prefix + bold + suffix)
+                self.assertIn('<b>' + bold + '</b>', ''.join(chunk['text'] for chunk in chunks))
+
+    def test_cjk_strong_preserves_inline_tokens_and_escaped_markers(self):
+        source = '**[\u65e5\u7a0b](https://example.com) `**literal** &amp;`\uff09**\u958b\u59cb'
+        chunks = self.checked(source)
+        output = ''.join(chunk['text'] for chunk in chunks)
+        self.assertIn('href="https://example.com"', output)
+        self.assertIn('<code>**literal** &amp;amp;</code>', output)
+        self.assertTrue(output.endswith('<b>\uff09</b>\u958b\u59cb'))
+        self.assertIn('https://example.com', ''.join(chunk['plain_text'] for chunk in chunks))
+        for literal in (r'\*\*' + '\u65e5\u7a0b\uff09' + r'\*\*' + '\u958b\u59cb', '**\u65e5\u7a0b\uff09' + r'\*\*' + '\u958b\u59cb',
+                        '`**\u65e5\u7a0b\uff09**\u958b\u59cb`', '**English)**word'):
+            chunks = self.checked(literal)
+            output = ''.join(chunk['text'] for chunk in chunks)
+            self.assertNotIn('<b>', output)
+            self.assertIn('**', ''.join(map(visible, chunks)))
+        ordinary = self.checked('**ordinary** and **\u65e5\u7a0b\uff09**\u958b\u59cb')
+        self.assertEqual(ordinary[0]['text'], '<b>ordinary</b> and <b>\u65e5\u7a0b\uff09</b>\u958b\u59cb')
+
     def test_event_reply_preserves_japanese_links_and_literal_group_name(self):
         source = ('For **=LOVE (イコラブ)** next appearance is **MTV VMAJ 2026**.\n\n'
                   '- **Date:** Thursday, October 29\n- **Venue:** Tokyo Dome\n\n'
@@ -151,7 +181,7 @@ class FormattingTests(unittest.TestCase):
     def test_unknown_malformed_and_format_only_source_never_disappears(self):
         for source in ('---', '###', '**unfinished', '```\nx < y', '<unknown>literal</unknown>'):
             self.assertTrue(''.join(visible(chunk) for chunk in self.checked(source)))
-        with patch('src.telegram.formatting.mistune.create_markdown', return_value=lambda _: [{'type': 'future_node'}]):
+        with patch('src.telegram.formatting.mistune.Markdown', return_value=lambda _: [{'type': 'future_node'}]):
             result = self.checked('**keep** [everything](https://example.com)')
         self.assertEqual(result[0]['text'], '**keep** [everything](https://example.com)')
         self.assertIsNone(result[0]['parse_mode'])
