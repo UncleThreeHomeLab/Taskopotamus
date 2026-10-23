@@ -16,5 +16,7 @@
 !deploy/postgres/**
 !deploy/testing/
 !deploy/testing/**
+!deploy/worker/
+!deploy/worker/**
 **/__pycache__/
 **/*.pyc

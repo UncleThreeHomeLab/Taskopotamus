@@ -47,6 +47,8 @@ def prepare(data_dir, credentials_dir=None, container=False):
                 # Bind-mounted Compose secrets retain host ownership; only mounted files are exposed to services.
                 os.chown(path, -1, 10001)
             path.chmod(0o640 if container else 0o600)
+        from src.agent.worker_keys import prepare_keys
+        prepare_keys(credentials, container)
 
 
 def main():

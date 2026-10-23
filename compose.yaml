@@ -104,6 +104,7 @@ services:
       TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS:?Set TELEGRAM_ALLOWED_USER_IDS in .env}
       AGENT_URL: http://agent:8080
       AGENT_API_TOKEN_FILE: /run/secrets/agent_api_token
+      CODEX_TURN_TIMEOUT_SECONDS: ${CODEX_TURN_TIMEOUT_SECONDS:-600}
     secrets:
       - agent_api_token
       - source: telegram_database_password
@@ -130,6 +131,13 @@ services:
       CODEX_MODEL: ${CODEX_MODEL:-gpt-6-astra}
       CODEX_REASONING_EFFORT: ${CODEX_REASONING_EFFORT:-medium}
       CODEX_AUTO_COMPACT_PERCENT: ${CODEX_AUTO_COMPACT_PERCENT:-}
+      CODEX_SUBAGENT_MODEL: ${CODEX_SUBAGENT_MODEL:-gpt-6-luna}
+      CODEX_SUBAGENT_REASONING_EFFORT: ${CODEX_SUBAGENT_REASONING_EFFORT:-high}
+      CODEX_SUBAGENT_MAX_THREADS: ${CODEX_SUBAGENT_MAX_THREADS:-2}
+      CODEX_TURN_TIMEOUT_SECONDS: ${CODEX_TURN_TIMEOUT_SECONDS:-600}
+      CODEX_BIN: /usr/local/bin/codex-worker
+      WORKER_CLIENT_KEY_FILE: /run/secrets/worker_client_key
+      WORKER_HOST_PUBLIC_KEY_FILE: /run/secrets/worker_host_public
       AGENT_API_TOKEN_FILE: /run/secrets/agent_api_token
       PROFILE_SERVICE_URL: http://mcp:8080
       PROFILE_SIGNING_KEY_FILE: /run/secrets/profile_signing_key
@@ -138,14 +146,17 @@ services:
       - profile_signing_key
       - source: agent_database_password
         target: database_password
+      - worker_client_key
+      - worker_host_public
     depends_on:
       mcp:
         condition: service_healthy
       postgres:
         condition: service_healthy
-    networks: [default, database]
+      worker:
+        condition: service_healthy
+    networks: [execution, database]
     volumes:
-      - ${DATA_DIR:-./storage}/codex:/home/agent/.codex
       - ${AGENT_INSTRUCTIONS_DIR:-./config/agent}:/app/config/agent:ro
     tmpfs:
       - /tmp:mode=1777
@@ -172,7 +183,10 @@ services:
       - profile_signing_key
       - source: profile_database_password
         target: database_password
-    networks: [database]
+    networks:
+      database:
+      execution:
+        ipv4_address: ${WORKER_MCP_IP:-10.203.17.18}
     volumes:
       - ${AGENT_INSTRUCTIONS_DIR:-./config/agent}:/app/config/agent:ro
     depends_on:
@@ -186,6 +200,47 @@ services:
     mem_limit: 256m
     cpus: 0.5
     pids_limit: 64
+
+  worker:
+    <<: *security
+    build:
+      context: .
+      dockerfile: deploy/docker/worker.Dockerfile
+    user: "0:0"
+    group_add: ["10001"]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, SYS_CHROOT, SETPCAP, NET_ADMIN]
+    environment:
+      WORKER_MCP_IP: ${WORKER_MCP_IP:-10.203.17.18}
+      WORKER_DNS_IP: ${WORKER_DNS_IP:-1.1.1.1}
+    dns: ["${WORKER_DNS_IP:-1.1.1.1}"]
+    secrets: [worker_host_key, worker_client_public]
+    networks: [execution, default]
+    volumes:
+      # Native session metadata stores absolute paths; preserve the original Codex home.
+      - worker_codex:/home/agent/.codex
+      - worker_workspace:/workspace
+    tmpfs:
+      - /tmp:mode=1777
+      - /run:mode=0755
+      - /root:mode=0700
+      - /home/agent:mode=0700
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+    depends_on:
+      mcp:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD-SHELL, "test -s /run/sshd/sshd.pid && /usr/sbin/sshd -t -f /etc/ssh/taskopotamus_config"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 256
+
+volumes:
+  worker_codex:
+  worker_workspace:
 
 secrets:
   agent_api_token:
@@ -202,8 +257,21 @@ secrets:
     file: ${TELEGRAM_DATABASE_PASSWORD_PATH:-${CREDENTIALS_DIR:-./credentials}/telegram_database_password}
   silo_root_password:
     file: ${SILO_ROOT_PASSWORD_PATH:-${CREDENTIALS_DIR:-./credentials}/silo_root_password}
+  worker_client_key:
+    file: ${CREDENTIALS_DIR:-./credentials}/worker_client_key
+  worker_host_public:
+    file: ${CREDENTIALS_DIR:-./credentials}/worker_host_key.pub
+  worker_host_key:
+    file: ${CREDENTIALS_DIR:-./credentials}/worker_host_key
+  worker_client_public:
+    file: ${CREDENTIALS_DIR:-./credentials}/worker_client_key.pub
 
 networks:
+  execution:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${TASKOPOTAMUS_EXECUTION_SUBNET:-10.203.17.16/28}
   database:
     internal: true
     ipam:

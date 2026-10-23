@@ -1,12 +1,14 @@
 import json
+import io
 import threading
 import unittest
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, redirect_stderr
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest.mock import Mock
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from openai_codex.errors import InternalRpcError
 
 from src.agent.chat_service import ChatService
 from src.agent.server import make_handler
@@ -16,6 +18,19 @@ from database_support import isolated_database
 
 
 class ChatServiceTests(unittest.TestCase):
+    def test_rpc_diagnostics_never_log_raw_messages_or_data(self):
+        self.codex.thread_start.side_effect = InternalRpcError(
+            -32603, "MCP required environment variable synthetic-private-token not found",
+            {"secret": "synthetic-private-data"},
+        )
+        output = io.StringIO()
+        with redirect_stderr(output), self.assertRaises(InternalRpcError):
+            self.chat.reply("42", "hello", "1")
+        self.assertIn("code=-32603", output.getvalue())
+        self.assertIn("mcp", output.getvalue())
+        self.assertIn("chat_service.py:", output.getvalue())
+        self.assertNotIn("synthetic-private", output.getvalue())
+
     def setUp(self):
         self.database = isolated_database(self)
         self.codex = Mock()
@@ -42,9 +57,13 @@ class ChatServiceTests(unittest.TestCase):
         options = self.codex.thread_start.call_args.kwargs
         self.assertEqual(options["model"], "gpt-6-astra")
         self.assertEqual(options["config"]["model_reasoning_effort"], "medium")
-        self.assertFalse(options["config"]["features.shell_tool"])
+        self.assertTrue(options["config"]["features.shell_tool"])
+        self.assertTrue(options["config"]["features.multi_agent"])
+        self.assertEqual(options["config"]["agents.default_subagent_model"], "gpt-6-luna")
+        self.assertEqual(options["config"]["agents.max_depth"], 1)
+        self.assertEqual(options["cwd"], "/workspace")
         self.assertNotIn("model_auto_compact_token_limit", options["config"])
-        self.assertEqual(options["sandbox"].value, "read-only")
+        self.assertEqual(options["sandbox"].value, "full-access")
 
     def test_compaction_learns_runtime_window_and_survives_restart(self):
         chat = ChatService(self.codex_factory, self.database, auto_compact_percent=50)

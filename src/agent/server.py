@@ -12,9 +12,11 @@ from .codex_auth import CodexAuth
 from .chat_service import ChatService
 from .http_server import AgentHTTPServer
 from .profile_client import ProfileClient
-from src.runtime import private_directory, read_secret
+from src.runtime import read_secret
 from src.profiles.instructions import load_system_instructions
 from src.storage.database import Database
+from .worker_transport import configure_transport
+from .subagents import SubagentPolicy
 
 
 def make_handler(auth, api_token, chat=None):
@@ -118,15 +120,25 @@ def make_handler(auth, api_token, chat=None):
 def main():
     os.umask(0o077)
     load_system_instructions()
-    private_directory(os.environ.get("CODEX_HOME", "/home/agent/.codex"))
+    if os.environ.get("CODEX_BIN") != "/usr/local/bin/codex-worker":
+        raise ValueError("Full-access execution requires the isolated worker transport.")
     api_token = read_secret("AGENT_API_TOKEN")
     compact_percent = os.environ.get("CODEX_AUTO_COMPACT_PERCENT", "").strip()
     profiles = ProfileClient(os.environ.get("PROFILE_SERVICE_URL", "http://mcp:8080"), read_secret("PROFILE_SIGNING_KEY"))
-    codex_config = CodexConfig(config_overrides=('cli_auth_credentials_store="file"',))
-    with Codex(codex_config) as codex:
+    subagents = SubagentPolicy(
+        os.environ.get("CODEX_SUBAGENT_MODEL", "gpt-6-luna"),
+        os.environ.get("CODEX_SUBAGENT_REASONING_EFFORT", "high"),
+        int(os.environ.get("CODEX_SUBAGENT_MAX_THREADS", "2")),
+    )
+    timeout = int(os.environ.get("CODEX_TURN_TIMEOUT_SECONDS", "600"))
+    if not 30 <= timeout <= 1800:
+        raise ValueError("Turn timeout must be between 30 and 1800 seconds.")
+    codex_config = CodexConfig(codex_bin=os.environ["CODEX_BIN"], config_overrides=('cli_auth_credentials_store="file"',))
+    with configure_transport(), Codex(codex_config) as codex:
         auth = CodexAuth(codex)
         chat = ChatService(
             lambda token: Codex(CodexConfig(
+                codex_bin=codex_config.codex_bin,
                 config_overrides=codex_config.config_overrides,
                 env={"TASKOPOTAMUS_PROFILE_AUTH": f"Bearer {token}"},
             )),
@@ -135,6 +147,7 @@ def main():
             effort=os.environ.get("CODEX_REASONING_EFFORT", "medium"),
             auto_compact_percent=int(compact_percent) if compact_percent else None,
             profiles=profiles,
+            subagents=subagents, turn_timeout=timeout,
         )
         with AgentHTTPServer(("0.0.0.0", 8080), make_handler(auth, api_token, chat)) as server:
             print("Agent service ready.", flush=True)
@@ -146,6 +159,6 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         pass
-    except Exception:
-        print("Agent service failed to start. Check Codex runtime and storage permissions.", file=sys.stderr)
+    except Exception as error:
+        print(f"Agent service failed to start ({type(error).__name__}). Check Codex runtime and storage permissions.", file=sys.stderr)
         sys.exit(1)

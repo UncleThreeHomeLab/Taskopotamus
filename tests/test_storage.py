@@ -38,7 +38,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual({path.name for path in data.iterdir()}, {"postgres", "objects", "codex", "legacy"})
         if os.name != "nt":
             self.assertEqual(data.stat().st_mode & 0o777, 0o700)
-            self.assertTrue(all(path.stat().st_mode & 0o777 == 0o600 for path in credentials.iterdir()))
+            self.assertTrue(all(path.stat().st_mode & 0o777 == 0o600 for path in credentials.iterdir() if path.suffix != ".pub"))
 
     @unittest.skipIf(os.name == "nt", "Symlinks require Windows privileges")
     def test_prepare_refuses_secret_symlinks_without_changing_the_target(self):
@@ -53,6 +53,7 @@ class StorageTests(unittest.TestCase):
 
     def test_container_preparation_limits_secret_access_to_the_service_group(self):
         data, credentials = self.root / "storage", self.root / "credentials"
+        prepare(data, credentials)
         with patch("src.storage.prepare.os.chown") as chown:
             prepare(data, credentials, container=True)
         for name in SECRET_NAMES:
