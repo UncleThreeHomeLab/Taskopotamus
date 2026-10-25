@@ -236,20 +236,27 @@ services:
       dockerfile: deploy/docker/worker.Dockerfile
     user: "0:0"
     group_add: ["10001"]
-    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, SYS_CHROOT, SETPCAP, NET_ADMIN]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, SYS_CHROOT, SETPCAP, NET_ADMIN, KILL]
     environment:
       WORKER_MCP_IP: ${WORKER_MCP_IP:-10.203.17.18}
       WORKER_DNS_IP: ${WORKER_DNS_IP:-1.1.1.1}
+      WORKSPACE_RETENTION_SECONDS: ${WORKSPACE_RETENTION_SECONDS:-604800}
+      WORKSPACE_SWEEP_SECONDS: ${WORKSPACE_SWEEP_SECONDS:-3600}
+      WORKSPACE_MAX_BYTES: ${WORKSPACE_MAX_BYTES:-1073741824}
     dns: ["${WORKER_DNS_IP:-1.1.1.1}"]
     secrets: [worker_host_key, worker_client_public]
     networks: [execution, default]
     volumes:
       # Native session metadata stores absolute paths; preserve the original Codex home.
       - worker_codex:/home/agent/.codex
-      - worker_workspace:/workspace
+      # Preserve pre-retention files without silently expiring them.
+      - worker_workspace:/legacy-workspace:ro
+      - worker_scratch:/workspace
+      - worker_saved:/saved
+      - worker_state:/var/lib/taskopotamus
     tmpfs:
-      - /tmp:mode=1777
-      - /run:mode=0755
+      - /tmp:mode=0700
+      - /run:mode=0700
       - /root:mode=0700
       - /home/agent:mode=0700
     sysctls:
@@ -269,6 +276,9 @@ services:
 volumes:
   worker_codex:
   worker_workspace:
+  worker_scratch:
+  worker_saved:
+  worker_state:
 
 secrets:
   agent_api_token:

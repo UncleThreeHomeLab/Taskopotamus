@@ -23,14 +23,16 @@ class DeviceLogin:
         self.ready = threading.Event()
         self.finished = threading.Event()
         self.success = False
+        self.cleanup_confirmed = False
+        self.cancel_lock = threading.Lock()
         self.process = subprocess.Popen(
             [os.environ.get("CODEX_BIN") or str(bundled_codex_path()), "-c", 'cli_auth_credentials_store="file"', "login", "--device-auth"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
             text=True,
             encoding="utf-8",
-            env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"},
+            env={**os.environ, "NO_COLOR": "1", "TERM": "dumb", "TASKOPOTAMUS_WORKER_MODE": "auth"},
         )
         threading.Thread(target=self._read, daemon=True).start()
 
@@ -45,10 +47,17 @@ class DeviceLogin:
                         self.user_code = code
                     if self.verification_url and self.user_code:
                         self.ready.set()
-            self.success = self.process.wait() == 0
+            code = self.process.wait()
+            self.cleanup_confirmed = code in (0, 76, 77)
+            self.success = code == 0
         except (OSError, UnicodeError):
-            self.cancel()
+            try:
+                self.cancel()
+            except RuntimeError:
+                pass
         finally:
+            if self.process.stdin and not self.process.stdin.closed:
+                self.process.stdin.close()
             self.finished.set()
             self.ready.set()
 
@@ -56,16 +65,28 @@ class DeviceLogin:
         if not self.finished.wait(timeout=16 * 60):
             self.cancel()
             return False
+        if not self.cleanup_confirmed:
+            raise RuntimeError("Device login cleanup could not be confirmed.")
         return self.success
 
     def cancel(self):
-        if self.process.poll() is None:
-            self.process.terminate()
+        with self.cancel_lock:
+            if self.process.stdin and not self.process.stdin.closed:
+                self.process.stdin.close()
             try:
-                self.process.wait(timeout=5)
+                code = self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
+                # Local SSH termination cannot prove that the remote lease was released.
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=5)
+                raise RuntimeError("Device login cancellation could not be confirmed.") from None
+            self.cleanup_confirmed = code in (0, 76, 77)
+            if not self.cleanup_confirmed:
+                raise RuntimeError("Device login cancellation could not be confirmed.")
 
 
 def start_device_login():

@@ -108,11 +108,12 @@ class ConsoleState:
         except Exception as error:
             with self.lock:
                 code = error.status if isinstance(error, AgentRequestError) else None
-                if action in ("chat", "replay") and code not in (400, 401, 429):
+                if action in ("chat", "replay") and code not in (400, 401, 429, 507):
                     self.uncertain = (request_id, text)
                     self.notice = "Agent unavailable or timed out; outcome uncertain. Check the same request before sending new work."
                 else:
-                    self.notice = {401: "Codex is signed out. Use Sign in.", 429: "Agent is busy. No work queued; try again when it finishes."}.get(
+                    self.notice = {401: "Codex is signed out. Use Sign in.", 429: "Agent is busy. No work queued; try again when it finishes.",
+                                   507: "Workspace storage limit reached. No work started; ask the deployment owner to free temporary or saved files."}.get(
                         code, "Action could not finish. Check agent status and retry explicitly.")
         finally:
             with self.lock:

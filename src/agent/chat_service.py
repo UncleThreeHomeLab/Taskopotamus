@@ -19,7 +19,7 @@ from .subagents import SubagentPolicy
 
 
 class ChatService:
-    def __init__(self, codex_factory, database, model="gpt-6-astra", effort="medium", turn_timeout=180, auto_compact_percent=None, profiles=None, subagents=None):
+    def __init__(self, codex_factory, database, model="gpt-6-astra", effort="medium", turn_timeout=180, auto_compact_percent=None, profiles=None, subagents=None, workspace_status=None):
         self.codex_factory = codex_factory
         self.database = database
         self.model = model
@@ -28,6 +28,7 @@ class ChatService:
         self.compaction = CompactionPolicy(auto_compact_percent)
         self.profiles = profiles
         self.subagents = subagents or SubagentPolicy()
+        self.workspace_status = workspace_status
         self.lock = threading.Lock()
         with database.connect() as db:
             db.execute("CREATE TABLE IF NOT EXISTS conversations (chat_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL)")
@@ -39,6 +40,8 @@ class ChatService:
             db.execute("""CREATE TABLE IF NOT EXISTS reply_runs (
                 chat_id TEXT, request_id TEXT, status TEXT NOT NULL, details TEXT,
                 PRIMARY KEY (chat_id, request_id))""")
+            db.execute("""CREATE TABLE IF NOT EXISTS conversation_workspace (
+                chat_id TEXT PRIMARY KEY, generation BIGINT NOT NULL)""")
 
     @staticmethod
     def validate_chat_id(chat_id):
@@ -125,6 +128,14 @@ class ChatService:
                 client = self.codex_factory()
             # Start after the replay check; loaded threads can ignore resume configuration changes.
             codex = runtime.enter_context(client)
+            workspace, expired = None, False
+            if self.workspace_status is not None:
+                workspace = self.workspace_status()
+                previous = db.execute("SELECT generation FROM conversation_workspace WHERE chat_id = %s", (chat_id,)).fetchone()
+                expired = previous is not None and previous[0] != workspace["generation"]
+                instructions += ("\n\nCurrent trusted workspace state: " + json.dumps(workspace) +
+                                 ". This replaces earlier workspace state. Files from earlier generations have expired. "
+                                 "Check file existence before reusing work. Conversation history is preserved.")
             if codex.account().account is None:
                 raise PermissionError("Sign in to Codex first.")
             db.execute("INSERT INTO replies VALUES (%s, %s, %s, NULL)", (chat_id, request_id, digest))
@@ -153,7 +164,7 @@ class ChatService:
                     raise TimeoutError("Request cancelled.")
                 if row:
                     thread = codex.thread_resume(row[0], **options)
-                    if self.profiles is not None:
+                    if self.profiles is not None or workspace is not None:
                         refresh_instructions(thread, instructions)
                 else:
                     thread = codex.thread_start(**options)
@@ -175,6 +186,8 @@ class ChatService:
                 if response.status.value != "completed" or not response.final_response:
                     raise RuntimeError("Codex did not complete its reply.")
                 reply = response.final_response
+                if expired:
+                    reply = "Temporary workspace files expired and were cleaned. Saved files and conversation history remain.\n\n" + reply
             except Exception:
                 db.rollback()
                 db.execute(
@@ -186,6 +199,9 @@ class ChatService:
                     self._save_run(db, chat_id, request_id, "failed", None)
                 raise
             db.execute("UPDATE replies SET reply = %s WHERE chat_id = %s AND request_id = %s", (reply, chat_id, request_id))
+            if workspace is not None:
+                db.execute("""INSERT INTO conversation_workspace VALUES (%s, %s)
+                    ON CONFLICT (chat_id) DO UPDATE SET generation = EXCLUDED.generation""", (chat_id, workspace["generation"]))
             db.commit()
             result = {"text": reply}
             if include_details:
@@ -219,6 +235,7 @@ class ChatService:
                     (chat_id,),
                 )
                 db.execute("DELETE FROM conversations WHERE chat_id = %s", (chat_id,))
+                db.execute("DELETE FROM conversation_workspace WHERE chat_id = %s", (chat_id,))
         finally:
             self.lock.release()
         return {"text": "New conversation started. What would you like to talk about?"}

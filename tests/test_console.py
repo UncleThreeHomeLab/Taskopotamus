@@ -118,6 +118,16 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(self.state.transcript, [])
         self.assertIn("could not finish", self.state.notice)
 
+    def test_storage_refusal_is_clear_and_never_marked_uncertain(self):
+        self.client.console_chat.side_effect = AgentRequestError("synthetic-private-detail", 507)
+        self.state.submit("chat", self.state.nonce, "hello")
+        finished(self.state)
+        self.assertIsNone(self.state.uncertain)
+        self.assertEqual(self.state.transcript, [])
+        self.assertIn("Workspace storage limit reached", self.state.notice)
+        self.assertIn("No work started", self.state.notice)
+        self.assertNotIn("synthetic-private", self.state.notice)
+
     def test_auth_link_validation_and_reset_only_on_success(self):
         self.client.login.return_value = {"state": "pending", "verification_url": "https://evil.example", "user_code": "TEST-0000"}
         self.state.submit("login", self.state.nonce)
