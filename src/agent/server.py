@@ -63,12 +63,15 @@ def make_handler(auth, api_token, chat=None, messaging=None):
             try:
                 if messaging is not None and messaging.dispatch(self, api_token):
                     return
-                if not (self.command == "POST" and self.path in ("/chat", "/chat/reset", "/console/chat", "/console/reset")):
+                if not (
+                    self.command == "POST" and self.path in ("/chat", "/chat/reset", "/console/chat", "/console/reset")
+                ):
                     self.read_deadline.cancel()
                 if self.command == "GET" and self.path == "/health":
                     data, status = {"ok": True}, 200
                 elif not secrets.compare_digest(
-                    self.headers.get("Authorization", "").encode(), f"Bearer {api_token}".encode(),
+                    self.headers.get("Authorization", "").encode(),
+                    f"Bearer {api_token}".encode(),
                 ):
                     data, status = {"error": "Unauthorized"}, 403
                 elif self.command == "GET" and self.path == "/auth/status":
@@ -77,11 +80,15 @@ def make_handler(auth, api_token, chat=None, messaging=None):
                     data, status = auth.login(), 200
                 elif self.command == "POST" and self.path == "/auth/login/retry":
                     data, status = auth.login(restart=True), 200
-                elif self.command == "POST" and self.path in ("/chat", "/chat/reset", "/console/chat", "/console/reset") and chat is not None:
+                elif (
+                    self.command == "POST"
+                    and self.path in ("/chat", "/chat/reset", "/console/chat", "/console/reset")
+                    and chat is not None
+                ):
                     if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1:
                         raise ValueError("Invalid request framing.")
                     length = int(self.headers.get("Content-Length", "0"))
-                    if not 0 < length <= 32768:
+                    if not 0 < length <= 131072:
                         raise ValueError("Invalid message size.")
                     payload = json.loads(self.rfile.read(length))
                     self.read_deadline.cancel()
@@ -90,7 +97,9 @@ def make_handler(auth, api_token, chat=None, messaging=None):
                     console = self.path.startswith("/console/")
                     if console:
                         expected = {"text", "request_id"} if self.path == "/console/chat" else set()
-                        if set(payload) != expected:
+                        if set(payload) != expected and not (
+                            self.path == "/console/chat" and set(payload) == expected | {"attachments"}
+                        ):
                             raise ValueError("Invalid console fields.")
                         chat_id = CONSOLE_CHAT_ID
                     else:
@@ -99,9 +108,13 @@ def make_handler(auth, api_token, chat=None, messaging=None):
                     if self.path in ("/chat/reset", "/console/reset"):
                         data = chat.reset(chat_id)
                     elif console:
-                        data = chat.reply(chat_id, payload.get("text"), payload.get("request_id"), include_details=True)
+                        options = {"attachments": payload["attachments"]} if "attachments" in payload else {}
+                        data = chat.reply(
+                            chat_id, payload.get("text"), payload.get("request_id"), include_details=True, **options
+                        )
                     else:
-                        data = chat.reply(chat_id, payload.get("text"), payload.get("request_id"))
+                        options = {"attachments": payload["attachments"]} if "attachments" in payload else {}
+                        data = chat.reply(chat_id, payload.get("text"), payload.get("request_id"), **options)
                     status = 200
                 else:
                     data, status = {"error": "Not found"}, 404

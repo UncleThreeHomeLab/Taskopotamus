@@ -56,9 +56,11 @@ button{{padding:.6rem .9rem;cursor:pointer}}nav{{display:flex;flex-wrap:wrap;gap
 <section><h2>Codex sign-in</h2><p>Status: {escape(auth.get("state", "unknown"))}</p>{signin}
 <nav>{form("status", "Refresh sign-in status")}{form("login", "Sign in")}{form("retry", "Retry sign-in")}{form("reset", "New conversation")}</nav></section>
 <p role="status">{escape(state["notice"])}</p>{replay}<div aria-live="polite">{transcript}</div>
-<form method="post" action="/chat"><input type="hidden" name="csrf" value="{escape(state["csrf"])}">
+<form method="post" action="/chat" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{escape(state["csrf"])}">
 <input type="hidden" name="nonce" value="{state["nonce"]}"><label for="message">Message</label>
-<textarea id="message" name="text" rows="5" maxlength="16000" required{disabled}>{escape(state["draft"])}</textarea>
+<textarea id="message" name="text" rows="5" maxlength="16000"{disabled}>{escape(state["draft"])}</textarea>
+<label for="files">Files (optional)</label><input id="files" type="file" name="files" multiple{disabled}>
+<p>Send text, files, or both. Maximum 10 files and 20 MB combined. PNG/JPEG images can be viewed directly; other files are available for inspection.</p>
 <p><button{disabled}>Send message</button></p></form>
 <section><h2>Latest run evidence</h2><p>Configured and requested models are not actual execution telemetry.
 Command exit codes do not independently verify tests. Child commands may be unavailable in the parent result.</p><pre>{evidence}</pre></section>

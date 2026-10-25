@@ -276,7 +276,7 @@ class WorkspaceLifecycle:
             print("Workspace cleanup completed.", file=sys.stderr, flush=True)
         used = self.usage()
         atomic_write(self.state / "admission.json", json.dumps({"usage_bytes": used,
-                     "admission_blocked": used >= self.max_bytes}).encode())
+                     "admission_blocked": used >= self.max_bytes or (self.state / 'input-refusal.json').exists()}).encode())
         if admission and used >= self.max_bytes:
             raise RuntimeError("Workspace storage limit reached; operator cleanup is required.")
 
@@ -331,20 +331,44 @@ class WorkspaceLifecycle:
             self.recover_credentials()
             stop_uid(self.auth_uid)
             if mode == "runtime":
+                (self.state / "input-refusal.json").unlink(missing_ok=True)
                 self.prepare(admission=True)
+                token = os.environ.get("TASKOPOTAMUS_ARTIFACT_AUTH")
+                if token:
+                    from taskopotamus_worker.input_files import fetch_inputs, materialize_inputs
+
+                    manifest, source = fetch_inputs(token, self.agent_ip)
+                    try:
+                        materialize_inputs(
+                            manifest, source, self.workspace, self.max_bytes - self.usage(), self.runtime_uid
+                        )
+                    except OverflowError:
+                        atomic_write(self.state / "input-refusal.json", b'{"blocked":true}')
+                        atomic_write(
+                            self.state / "admission.json",
+                            json.dumps({"usage_bytes": self.usage(), "admission_blocked": True}).encode(),
+                        )
+                        raise RuntimeError("Input exceeds workspace storage limit.") from None
                 self.begin_runtime_credentials()
             command, environment, cwd = self.child_command(mode, arguments)
             uid = self.runtime_uid if mode == "runtime" else self.auth_uid
             child = None
             previous = {}
+
             def interrupted(_signum, _frame):
                 raise InterruptedError("Worker operation interrupted.")
+
             try:
                 for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                     previous[signum] = signal.signal(signum, interrupted)
                 login = mode == "auth" and arguments[-2:] == ["login", "--device-auth"]
-                child = subprocess.Popen(command, env=environment, cwd=cwd, start_new_session=True,
-                                         stdin=subprocess.DEVNULL if login else None)
+                child = subprocess.Popen(
+                    command,
+                    env=environment,
+                    cwd=cwd,
+                    start_new_session=True,
+                    stdin=subprocess.DEVNULL if login else None,
+                )
                 result = wait_device_login(child, sys.stdin.fileno()) if login else child.wait()
             finally:
                 for signum, handler in previous.items():

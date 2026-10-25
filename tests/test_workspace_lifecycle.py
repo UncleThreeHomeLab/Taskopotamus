@@ -53,9 +53,31 @@ class WorkspacePolicyTests(unittest.TestCase):
                 lifecycle.parse_remote(value)
 
 
-@unittest.skipUnless(os.name != "nt" and getattr(os, "geteuid", lambda: -1)() == 0,
-                     "Run focused worker checks as root in an offline Linux test container")
+@unittest.skipUnless(
+    os.name != "nt" and getattr(os, "geteuid", lambda: -1)() == 0,
+    "Run focused worker checks as root in an offline Linux test container",
+)
 class WorkspaceLifecycleTests(unittest.TestCase):
+    def test_input_bytes_are_root_owned_read_only_and_capacity_refusal_survives_maintenance(self):
+        import hashlib
+        import io
+        from src.worker.input_files import materialize_inputs, input_name
+
+        content = b"synthetic-input"
+        info = {"artifact_id": "a" * 32, "size": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+        materialize_inputs(
+            {"request_tag": "b" * 64, "files": [info]},
+            lambda _: io.BytesIO(content),
+            self.worker.workspace,
+            self.worker.max_bytes,
+            runtime_gid=51001,
+        )
+        path = self.worker.workspace / ".incoming" / ("b" * 64) / input_name(info)
+        self.assertEqual((path.stat().st_uid, path.stat().st_gid, path.stat().st_mode & 0o777), (0, 51001, 0o440))
+        lifecycle.atomic_write(self.worker.state / "input-refusal.json", b'{"blocked":true}')
+        self.worker.prepare()
+        self.assertTrue(self.worker.status()["admission_blocked"])
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

@@ -7,7 +7,7 @@ import traceback
 from concurrent.futures import Future, TimeoutError as FutureTimeout
 from contextlib import ExitStack
 
-from openai_codex import ApprovalMode, Sandbox
+from openai_codex import ApprovalMode, Sandbox, TextInput, LocalImageInput
 from openai_codex.errors import JsonRpcError
 
 from src.profiles.instructions import load_system_instructions
@@ -51,9 +51,10 @@ class ChatService:
     def validate_chat_id(chat_id):
         ProfileTokens.validate_chat(chat_id)
 
-    def reply(self, chat_id, text, request_id, include_details=False):
+    def reply(self, chat_id, text, request_id, include_details=False, attachments=None):
         self.validate_chat_id(chat_id)
-        if not isinstance(text, str) or not text.strip() or len(text) > 16000:
+        attachments = [] if attachments is None else attachments
+        if not isinstance(text, str) or len(text) > 16000 or not text.strip() and not attachments:
             raise ValueError("Message must contain between 1 and 16000 characters.")
         if not isinstance(request_id, str) or not re.fullmatch(r"[0-9]{1,20}", request_id):
             raise ValueError("A numeric request ID is required.")
@@ -66,7 +67,7 @@ class ChatService:
 
         def run():
             try:
-                value = self._reply(chat_id, text, request_id, cancelled, active_turn, include_details, publication)
+                value = self._reply(chat_id, text, request_id, cancelled, active_turn, include_details, publication, attachments)
             except Exception as error:
                 if isinstance(error, JsonRpcError):
                     # Emit only fixed categories and code locations; RPC messages can contain credentials.
@@ -118,9 +119,15 @@ class ChatService:
         except Exception:
             print("Artifact scope cleanup unavailable.", file=sys.stderr, flush=True)
 
-    def _reply(self, chat_id, text, request_id, cancelled, active_turn, include_details=False, publication=None):
-        digest = hashlib.sha256(text.encode()).hexdigest()
+    def _reply(self, chat_id, text, request_id, cancelled, active_turn, include_details=False, publication=None, attachments=None):
+        attachments = [] if attachments is None else attachments
         with ExitStack() as runtime, self.database.connect() as db:
+            inputs = []
+            if attachments:
+                if self.artifacts is None:
+                    raise ValueError("File inputs are unavailable.")
+                inputs = self.artifacts.input_identity(chat_id, request_id, attachments, db=db)
+            digest = hashlib.sha256((text if not attachments else json.dumps([text,inputs],sort_keys=True,ensure_ascii=False)).encode()).hexdigest()
             row = db.execute(
                 "SELECT input_hash, reply FROM replies WHERE chat_id = %s AND request_id = %s", (chat_id, request_id),
             ).fetchone()
@@ -133,10 +140,18 @@ class ChatService:
                 result.update(manifest or {"items": [{"type": "text", "text": result["text"]}]})
                 self._artifact_metadata(result, chat_id, db)
                 if include_details:
-                    saved = db.execute("SELECT status, details FROM reply_runs WHERE chat_id = %s AND request_id = %s",
-                                       (chat_id, request_id)).fetchone()
-                    result.update(status=manifest["reply_status"] if manifest else saved[0] if saved and saved[0] != "pending" else "uncertain",
-                                  details=json.loads(saved[1]) if saved and saved[1] else None)
+                    saved = db.execute(
+                        "SELECT status, details FROM reply_runs WHERE chat_id = %s AND request_id = %s",
+                        (chat_id, request_id),
+                    ).fetchone()
+                    result.update(
+                        status=manifest["reply_status"]
+                        if manifest
+                        else saved[0]
+                        if saved and saved[0] != "pending"
+                        else "uncertain",
+                        details=json.loads(saved[1]) if saved and saved[1] else None,
+                    )
                 return result
             if cancelled.is_set():
                 raise TimeoutError("Request cancelled.")
@@ -147,6 +162,20 @@ class ChatService:
                 # Saved user text must never acquire developer authority.
                 turn_input = json.dumps({"profile": profile, "message": text}, ensure_ascii=False)
             if self.artifacts is not None:
+                accepted = self.artifacts.accept_inputs(chat_id, request_id, attachments, self.turn_timeout + 60)
+                if attachments:
+                    from src.worker.input_files import input_path
+
+                    information = [
+                        {**item, "path": input_path(accepted["request_tag"], item)} for item in accepted["files"]
+                    ]
+                    content = {"message": text, "attachments": information}
+                    if self.profiles is not None:
+                        content["profile"] = profile
+                    turn_input = [TextInput(json.dumps(content, ensure_ascii=False))]
+                    turn_input.extend(
+                        LocalImageInput(item["path"]) for item in information if item.get("presentation_mime")
+                    )
                 capability = self.artifacts.begin_run(chat_id, request_id, self.turn_timeout + 30)
                 runtime.callback(self._revoke_artifacts, chat_id, request_id)
                 if cancelled.is_set():
@@ -162,11 +191,16 @@ class ChatService:
             workspace, expired = None, False
             if self.workspace_status is not None:
                 workspace = self.workspace_status()
-                previous = db.execute("SELECT generation FROM conversation_workspace WHERE chat_id = %s", (chat_id,)).fetchone()
+                previous = db.execute(
+                    "SELECT generation FROM conversation_workspace WHERE chat_id = %s", (chat_id,)
+                ).fetchone()
                 expired = previous is not None and previous[0] != workspace["generation"]
-                instructions += ("\n\nCurrent trusted workspace state: " + json.dumps(workspace) +
-                                 ". This replaces earlier workspace state. Files from earlier generations have expired. "
-                                 "Check file existence before reusing work. Conversation history is preserved.")
+                instructions += (
+                    "\n\nCurrent trusted workspace state: "
+                    + json.dumps(workspace)
+                    + ". This replaces earlier workspace state. Files from earlier generations have expired. "
+                    "Check file existence before reusing work. Conversation history is preserved."
+                )
             if codex.account().account is None:
                 raise PermissionError("Sign in to Codex first.")
             db.execute("INSERT INTO replies VALUES (%s, %s, %s, NULL)", (chat_id, request_id, digest))

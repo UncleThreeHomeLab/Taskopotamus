@@ -43,6 +43,11 @@ class AgentClient:
         except HTTPError as error:
             print(f"Agent HTTP request failed ({error.code}).", file=sys.stderr, flush=True)
             error.close()
+            if error.code == 400:
+                raise AgentRequestError(
+                    "Message or files were rejected. Check valid PNG/JPEG images, file names and the 20 MB combined limit, then send again.",
+                    400,
+                ) from None
             if error.code == 401:
                 raise AgentRequestError("Codex is signed out. Send /codex_login.", 401) from None
             if error.code == 429:
@@ -63,14 +68,58 @@ class AgentClient:
     def status(self):
         return self.request("/auth/status")
 
-    def chat(self, chat_id, text, request_id):
-        return self.request("/chat", "POST", {"chat_id": str(chat_id), "text": text, "request_id": str(request_id)})
+    def chat(self, chat_id, text, request_id, attachments=None):
+        body = {"chat_id": str(chat_id), "text": text, "request_id": str(request_id)}
+        if attachments:
+            body["attachments"] = attachments
+        return self.request("/chat", "POST", body)
 
     def reset(self, chat_id):
         return self.request("/chat/reset", "POST", {"chat_id": str(chat_id)})
 
-    def console_chat(self, text, request_id):
-        return self.request("/console/chat", "POST", {"text": text, "request_id": request_id})
+    def console_chat(self, text, request_id, attachments=None):
+        body = {"text": text, "request_id": request_id}
+        if attachments:
+            body["attachments"] = attachments
+        return self.request("/console/chat", "POST", body)
+
+    def input_lookup(self, chat_id, request_id, operation):
+        return self.request(
+            "/messaging/input-lookup",
+            "POST",
+            {"chat_id": str(chat_id), "request_id": str(request_id), "operation": operation},
+        )["artifact"]
+
+    def upload_input(self, chat_id, request_id, operation, info, source):
+        previous = self.input_lookup(chat_id, request_id, operation)
+        if previous is not None:
+            if any(previous.get(key) != info[key] for key in ("filename", "mime", "size", "sha256")):
+                raise AgentRequestError("Input upload identity changed.", 400)
+            return previous
+        meta = {**info, "chat_id": str(chat_id), "request_id": str(request_id), "operation": operation}
+        request = Request(
+            self.base_url + "/messaging/upload",
+            data=source,
+            method="POST",
+            headers={
+                "Authorization": "Bearer " + self.api_token,
+                "Content-Type": "application/octet-stream",
+                "X-Artifact-Metadata": json.dumps(meta),
+                "Content-Length": str(info["size"]),
+            },
+        )
+        try:
+            with self.opener.open(request, timeout=30) as response:
+                body = response.read(65537)
+            if len(body) > 65536:
+                raise ValueError()
+            return json.loads(body)
+        except HTTPError as error:
+            code = error.code
+            error.close()
+            raise AgentRequestError("Input could not be accepted. Maximum 10 files and 20 MB combined.", code) from None
+        except (OSError, ValueError):
+            raise AgentRequestError("Input upload could not be confirmed.") from None
 
     def console_reset(self):
         return self.request("/console/reset", "POST", {})
@@ -82,7 +131,9 @@ class AgentClient:
         return self.request("/messaging/publish", "POST", body)
 
     def lookup_reply(self, chat_id, request_id):
-        return self.request("/messaging/lookup", "POST", {"chat_id": str(chat_id), "request_id": str(request_id)})["reply"]
+        return self.request("/messaging/lookup", "POST", {"chat_id": str(chat_id), "request_id": str(request_id)})[
+            "reply"
+        ]
 
     def reserve_command(self, chat_id, request_id, command):
         return self.request("/messaging/local-command", "POST", {"chat_id": str(chat_id), "request_id": str(request_id), "command": command})

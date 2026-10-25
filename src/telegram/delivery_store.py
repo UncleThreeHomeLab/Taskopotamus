@@ -40,6 +40,6 @@ class DeliveryStore:
 
     def finish(self, update_id):
         with self.database.connect() as db:
-            db.execute('UPDATE polling SET "offset" = %s WHERE id = 1', (update_id + 1,))
+            db.execute('UPDATE polling SET "offset" = GREATEST("offset", %s) WHERE id = 1', (update_id + 1,))
             db.execute("DELETE FROM pending WHERE update_id = %s", (update_id,))
             db.execute("DELETE FROM uncertain_updates WHERE update_id=%s", (update_id,))

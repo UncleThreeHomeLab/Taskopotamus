@@ -56,6 +56,9 @@ class MessagingAPI:
                 raise PermissionError()
             parts = urlsplit(handler.path)
             query = parse_qs(parts.query, strict_parsing=True)
+            if handler.command == 'GET' and parts.path == '/messaging/worker/inputs' and worker and not query:
+                handler.send_json(self.artifacts.input_manifest(credential),200)
+                return True
             if handler.command == "POST" and parts.path in ("/messaging/upload", "/messaging/worker/upload"):
                 metadata_headers = handler.headers.get_all("X-Artifact-Metadata", [])
                 if len(metadata_headers) != 1 or len(metadata_headers[0]) > 4096 or query:
@@ -82,6 +85,7 @@ class MessagingAPI:
                     info = self.artifacts.describe(artifact_id, chat_id, request_id)
                     if info["direction"] != "input":
                         raise PermissionError()
+                    self.artifacts.accepted_input(credential,artifact_id)
                     committed = False
                 else:
                     if set(query) != {"chat_id"} or len(query["chat_id"]) != 1:
@@ -134,6 +138,9 @@ class MessagingAPI:
                 elif path == "/messaging/lookup":
                     self.fields(payload, {"chat_id", "request_id"})
                     data = {"reply": self.deliveries.get(payload["chat_id"], payload["request_id"])}
+                elif path == '/messaging/input-lookup':
+                    self.fields(payload,{'chat_id','request_id','operation'})
+                    data = {'artifact':self.artifacts.lookup_input(payload['chat_id'],payload['request_id'],payload['operation'])}
                 elif path == "/messaging/local-command":
                     self.fields(payload, {"chat_id", "request_id", "command"})
                     data = self.deliveries.reserve_command(payload["chat_id"], payload["request_id"], payload["command"])
