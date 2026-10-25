@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 from contextlib import nullcontext
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -162,16 +163,32 @@ class MessagingTests(unittest.TestCase):
         # Keep the run budget valid while making only the caller wait expire quickly.
         chat, turn = self.chat()
         release = threading.Event()
+        entered = threading.Event()
         response = turn.run.return_value
-        turn.run.side_effect = lambda: release.wait(3) and response
+
+        def blocked_turn():
+            entered.set()
+            return release.wait(3) and response
+
+        turn.run.side_effect = blocked_turn
+
+        class InferenceFuture(Future):
+            def result(self, timeout=None):
+                if not entered.wait(3):
+                    raise AssertionError("Synthetic inference did not start.")
+                return super().result(timeout=0.01)
+
         original = self.artifacts.begin_run
         issued = []
+
         def begin(chat_id, request_id, seconds):
             token = original(chat_id, request_id, 60)
             issued.append(token)
             return token
-        with patch.object(self.artifacts, "begin_run", side_effect=begin):
-            chat.turn_timeout = 0.05
+
+        with patch.object(self.artifacts, "begin_run", side_effect=begin), patch(
+            "src.agent.chat_service.Future", InferenceFuture
+        ):
             with self.assertRaises(TimeoutError):
                 chat.reply("42", "hello", "1")
             self.assertTrue(issued)

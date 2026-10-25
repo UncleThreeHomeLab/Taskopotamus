@@ -81,6 +81,97 @@ class ArtifactStore:
             db.execute("ALTER TABLE attachment_batches ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1")
             db.execute("ALTER TABLE attachment_batches ADD COLUMN IF NOT EXISTS request_key TEXT")
             db.execute("ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS presentation_mime TEXT")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS accepted_inputs (chat_id TEXT, request_id TEXT, items TEXT NOT NULL, PRIMARY KEY(chat_id,request_id))"
+            )
+
+    def input_identity(self, chat_id, request_id, identifiers, available=False, db=None):
+        identity(chat_id, request_id)
+        if (
+            not isinstance(identifiers, list)
+            or len(identifiers) > self.policy.max_files
+            or any(not isinstance(item, str) for item in identifiers)
+            or len(set(identifiers)) != len(identifiers)
+        ):
+            raise ValueError("Supply up to ten distinct attachments.")
+        if db is None:
+            with self.database.connect() as connection:
+                return self.input_identity(chat_id, request_id, identifiers, available, connection)
+        result = []
+        for identifier in identifiers:
+            opaque_id(identifier)
+            row = db.execute(
+                "SELECT filename,mime,size,digest,state,expires FROM artifacts WHERE id=%s AND chat_id=%s AND request_id=%s AND direction='input'",
+                (identifier, chat_id, request_id),
+            ).fetchone()
+            if not row or available and (row[4] not in ("prepared", "committed") or row[5] <= self.clock()):
+                raise ValueError("Input attachment unavailable or expired.")
+            info = {"artifact_id": identifier, "filename": row[0], "mime": row[1], "size": row[2], "sha256": row[3]}
+            if available:
+                with (self.root / identifier).open("rb") as file:
+                    magic = file.read(8)
+                    detected = (
+                        "image/png"
+                        if magic == b"\x89PNG\r\n\x1a\n"
+                        else "image/jpeg"
+                        if magic.startswith(b"\xff\xd8\xff")
+                        else None
+                    )
+                    if detected or row[1] in ("image/png", "image/jpeg"):
+                        from .image_validation import validate_image
+
+                        info["presentation_mime"] = validate_image(file, detected or row[1])
+            result.append(info)
+        if sum(item["size"] for item in result) > self.policy.input_max_bytes:
+            raise ValueError("Attachments exceed the combined 20 MB limit.")
+        return result
+
+    def accept_inputs(self, chat_id, request_id, identifiers, seconds):
+        from src.worker.input_files import request_tag
+
+        with self.database.connect() as db:
+            db.execute("SELECT pg_advisory_xact_lock(hashtextextended('artifact-capacity',0))")
+            items = self.input_identity(chat_id, request_id, identifiers, True, db)
+            serialized = json.dumps(items, sort_keys=True)
+            previous = db.execute(
+                "SELECT items FROM accepted_inputs WHERE chat_id=%s AND request_id=%s FOR UPDATE", (chat_id, request_id)
+            ).fetchone()
+            if previous and previous[0] != serialized:
+                raise ValueError("Accepted inputs cannot change.")
+            db.execute(
+                "INSERT INTO accepted_inputs VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
+                (chat_id, request_id, serialized),
+            )
+            db.execute(
+                "UPDATE artifacts SET expires=GREATEST(expires,%s) WHERE id=ANY(%s)",
+                (self.clock() + seconds, identifiers),
+            )
+        return {"request_tag": request_tag(chat_id, request_id), "files": items}
+
+    def input_manifest(self, token):
+        from src.worker.input_files import request_tag
+
+        with self.database.connect() as db:
+            chat, request = self.authorize(db, token)
+            row = db.execute(
+                "SELECT items FROM accepted_inputs WHERE chat_id=%s AND request_id=%s", (chat, request)
+            ).fetchone()
+            return {"request_tag": request_tag(chat, request), "files": json.loads(row[0]) if row else []}
+
+    def accepted_input(self, token, identifier):
+        manifest = self.input_manifest(token)
+        if not any(item["artifact_id"] == identifier for item in manifest["files"]):
+            raise PermissionError("Input was not selected for this request.")
+
+    def lookup_input(self, chat_id, request_id, operation):
+        identity(chat_id, request_id)
+        operation_id(operation)
+        with self.database.connect() as db:
+            row = db.execute(
+                "SELECT id FROM artifacts WHERE chat_id=%s AND request_id=%s AND direction='input' AND operation=%s",
+                (chat_id, request_id, operation),
+            ).fetchone()
+            return self.describe(row[0], chat_id, request_id, db=db) if row else None
 
     def begin_run(self, chat_id, request_id, seconds):
         identity(chat_id, request_id)
@@ -88,10 +179,12 @@ class ArtifactStore:
             raise ValueError("Invalid run lifetime.")
         token = secrets.token_urlsafe(32)
         with self.database.connect() as db:
-            changed = db.execute("""INSERT INTO artifact_runs VALUES (%s,%s,'active',%s,%s)
+            changed = db.execute(
+                """INSERT INTO artifact_runs VALUES (%s,%s,'active',%s,%s)
                 ON CONFLICT(chat_id,request_id) DO UPDATE SET state='active',capability=EXCLUDED.capability,deadline=EXCLUDED.deadline
                 WHERE artifact_runs.state!='active' OR artifact_runs.deadline<=%s""",
-                       (chat_id, request_id, hashlib.sha256(token.encode()).hexdigest(), self.clock() + seconds, self.clock())).rowcount
+                (chat_id, request_id, hashlib.sha256(token.encode()).hexdigest(), self.clock() + seconds, self.clock()),
+            ).rowcount
             if changed != 1:
                 raise BlockingIOError("Artifact run is already active.")
         return token
@@ -99,8 +192,10 @@ class ArtifactStore:
     def authorize(self, db, token):
         if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
             raise PermissionError("Invalid artifact capability.")
-        row = db.execute("SELECT chat_id,request_id FROM artifact_runs WHERE capability=%s AND state='active' AND deadline>%s FOR UPDATE",
-                         (hashlib.sha256(token.encode()).hexdigest(), self.clock())).fetchone()
+        row = db.execute(
+            "SELECT chat_id,request_id FROM artifact_runs WHERE capability=%s AND state='active' AND deadline>%s FOR UPDATE",
+            (hashlib.sha256(token.encode()).hexdigest(), self.clock()),
+        ).fetchone()
         if row is None:
             raise PermissionError("Artifact capability expired or revoked.")
         return row

@@ -110,6 +110,8 @@ services:
       - source: telegram_database_password
         target: database_password
     networks: [default, database]
+    tmpfs:
+      - /tmp:mode=1777,size=32m
     depends_on:
       agent:
         condition: service_healthy
@@ -134,7 +136,7 @@ services:
     networks: [execution, console_ingress]
     ports: ["127.0.0.1:8088:8088"]
     tmpfs:
-      - /tmp:mode=1777
+      - /tmp:mode=1777,size=32m
     depends_on:
       agent:
         condition: service_healthy

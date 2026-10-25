@@ -11,6 +11,8 @@ from psycopg import Error as DatabaseError
 from .agent_client import AgentClient
 from .agent_client import AgentRequestError
 from .media import TelegramRejected, rejection, send_media
+from .inbox import Inbox
+from .input_files import InputRejected, download
 from .delivery_store import DeliveryStore
 from src.runtime import read_secret
 from src.storage.database import Database
@@ -136,9 +138,9 @@ def api(token, method, body=None, timeout=40):
     return data["result"]
 
 
-def process_update(update, allowed_users, agent, token, store, wake=None):
+def process_update(update, allowed_users, agent, token, store, wake=None, persisted=False):
     update_id = update["update_id"]
-    if update_id < store.offset:
+    if not persisted and update_id < store.offset:
         return
     message = update.get("message")
     if not allowed_message(message, allowed_users):
@@ -151,10 +153,11 @@ def process_update(update, allowed_users, agent, token, store, wake=None):
     else:
         command_attempt = None
         known_reply = None
+        previously_uncertain = store.uncertain(update_id)
         if isinstance(message.get("text"), str) and message["text"].startswith("/"):
             reservation = agent.reserve_command(message["chat"]["id"], str(update_id), message["text"])
             known_reply, command_attempt = reservation["reply"], reservation["attempt"]
-        elif store.uncertain(update_id):
+        elif previously_uncertain:
             known_reply = agent.lookup_reply(message["chat"]["id"], str(update_id))
         if known_reply is not None:
             store.finish(update_id)
@@ -168,9 +171,12 @@ def process_update(update, allowed_users, agent, token, store, wake=None):
             activity.start()
         try:
             try:
+                if isinstance(message.get("text"), str) and not message["text"].startswith("/"):
+                    # Persist intent before forwarding: a process crash may bypass every error handler.
+                    store.mark_uncertain(update_id)
                 result = reply_for(message, allowed_users, agent, request_id=str(update_id), _structured=True)
             except AgentRequestError as error:
-                if error.status in (400, 401, 429, 507) and not store.uncertain(update_id):
+                if error.status in (400, 401, 429, 507) and not previously_uncertain:
                     result = str(error)
                 else:
                     store.mark_uncertain(update_id)
@@ -261,28 +267,157 @@ def delivery_loop(agent, token, allowed_users, wake, stopped):
         wake.clear()
 
 
+def process_input(job, inbox, allowed_users, agent, token, store, wake):
+    identifier, chat = job["id"], job["chat_id"]
+    if chat not in allowed_users:
+        inbox.finish(identifier)
+        return
+    messages = job["messages"]
+    files = [file for message in messages for file in message["files"]]
+    text = "\n".join(message["text"] for message in messages if message["text"])
+    if len(messages) > 1:
+        text = "\n".join(
+            f'Attachment {index+1}: {message["text"]}' for index, message in enumerate(messages) if message["text"]
+        )
+    if not files and not job.get("error"):
+        update = {
+            "update_id": identifier,
+            "message": {"chat": {"id": int(chat), "type": "private"}, "from": {"id": int(chat)}, "text": text},
+        }
+        process_update(update, allowed_users, agent, token, store, wake, persisted=True)
+        inbox.finish(identifier)
+        return
+    stopped = threading.Event()
+    activity = None
+    if _activity_slot.acquire(blocking=False):
+        activity = threading.Thread(target=show_activity, args=(token, int(chat), stopped), daemon=True)
+        activity.start()
+    inference = False
+    try:
+        if agent.lookup_reply(chat, str(identifier)) is not None:
+            inbox.finish(identifier)
+            wake.set()
+            return
+        if job.get("error") or any(message.get("error") for message in messages):
+            raise InputRejected(
+                job.get("error") or next(message["error"] for message in messages if message.get("error"))
+            )
+        if len(text) > 16000 or len(files) > 10:
+            raise InputRejected("Maximum 16000 text characters, ten files and 20 MB combined.")
+        accepted = []
+        total = 0
+        for index, descriptor in enumerate(files):
+            info = job.get("uploads", {}).get(str(index)) or agent.input_lookup(chat, str(identifier), str(index))
+            if info is None:
+                meta, stream = download(token, descriptor, api, remaining=20000000 - total)
+                with stream:
+                    info = agent.upload_input(chat, str(identifier), str(index), meta, stream)
+                inbox.save_upload(identifier, index, info)
+            total += info["size"]
+            if total > 20000000:
+                raise InputRejected("Files exceed 20 MB combined.")
+            accepted.append(info["artifact_id"])
+        inbox.mark_inference(identifier)
+        inference = True
+        result = agent.chat(int(chat), text, str(identifier), accepted)
+        if not isinstance(result.get("delivery_id"), str):
+            agent.import_legacy_delivery(chat, str(identifier), reply_chunks(result["text"]), 0)
+        inbox.finish(identifier)
+        wake.set()
+    except InputRejected as error:
+        agent.publish_reply(chat, str(identifier), str(error))
+        inbox.finish(identifier)
+        wake.set()
+    except AgentRequestError as error:
+        if error.status in (400, 401, 403, 507) and not job.get("inference_started"):
+            agent.publish_reply(chat, str(identifier), str(error))
+            inbox.finish(identifier)
+            wake.set()
+        else:
+            inbox.finish(identifier, retry=True)
+            raise
+    except RuntimeError:
+        if not inference and inbox.failed_transfer(identifier) >= 3:
+            agent.publish_reply(
+                chat, str(identifier), "File transfer failed. No agent work started; please send the files again."
+            )
+            inbox.finish(identifier)
+            wake.set()
+        else:
+            inbox.finish(identifier, retry=True)
+            raise
+    finally:
+        stopped.set()
+        if activity is not None:
+            activity.join(timeout=0.1)
+
+
+def input_loop(inbox, agent, token, allowed, store, wake, stopped):
+    with inbox.database.connect() as connection:
+        owns = connection.execute(
+            "SELECT pg_try_advisory_lock(hashtextextended('telegram-input-dispatcher',0))"
+        ).fetchone()[0]
+        connection.commit()
+        if not owns:
+            return
+        inbox.recover()
+        dispatch_inputs(inbox, agent, token, allowed, store, wake, stopped)
+
+
+def dispatch_inputs(inbox, agent, token, allowed, store, wake, stopped):
+    while not stopped.is_set():
+        job = None
+        try:
+            job = inbox.claim()
+            if job is not None:
+                process_input(job, inbox, allowed, agent, token, store, wake)
+                continue
+        except Exception:
+            if job is not None:
+                inbox.finish(job["id"], retry=True)
+            print("Input processing unavailable; request identity is preserved.", file=sys.stderr, flush=True)
+        stopped.wait(1)
+
+
 def main():
     os.umask(0o077)
     token, allowed_users = read_config(os.environ)
     agent = AgentClient(os.environ.get("AGENT_URL", "http://agent:8080"), read_secret("AGENT_API_TOKEN"))
     store = DeliveryStore(Database.from_env())
+    inbox = Inbox(store.database)
     api(token, "getMe")
     webhook = api(token, "getWebhookInfo")
     if webhook.get("url"):
         raise RuntimeError("Webhook is enabled. Remove it before using long polling.")
+    with store.database.connect() as db:
+        legacy = db.execute("SELECT update_id,chat_id,chunks,next_chunk FROM pending ORDER BY update_id").fetchall()
+    for identifier, chat, chunks, next_chunk in legacy:
+        if str(chat) in allowed_users:
+            agent.import_legacy_delivery(chat, str(identifier), json.loads(chunks), next_chunk)
+        store.finish(identifier)
     print("Telegram connected. Ready for private messages from allowed users.", flush=True)
     wake, stopped = threading.Event(), threading.Event()
     sender = threading.Thread(target=delivery_loop, args=(agent, token, allowed_users, wake, stopped), daemon=True)
     sender.start()
+    dispatcher = threading.Thread(
+        target=input_loop, args=(inbox, agent, token, allowed_users, store, wake, stopped), daemon=True
+    )
+    dispatcher.start()
     try:
         while True:
             try:
-                updates = api(token, "getUpdates", {
-                    "offset": store.offset, "timeout": 25, "allowed_updates": ["message"],
-                })
+                updates = api(
+                    token,
+                    "getUpdates",
+                    {
+                        "offset": inbox.offset,
+                        "timeout": 25,
+                        "allowed_updates": ["message"],
+                    },
+                )
                 for update in updates:
-                    process_update(update, allowed_users, agent, token, store, wake)
-            except (RuntimeError, DatabaseError) as error:
+                    inbox.receive(update, allowed_users)
+            except (RuntimeError, DatabaseError, BlockingIOError) as error:
                 message = str(error) if isinstance(error, RuntimeError) else "Telegram storage unavailable. Retrying."
                 print(message, file=sys.stderr, flush=True)
                 time.sleep(5)
@@ -290,6 +425,7 @@ def main():
         stopped.set()
         wake.set()
         sender.join(timeout=2)
+        dispatcher.join(timeout=2)
 
 
 if __name__ == "__main__":
