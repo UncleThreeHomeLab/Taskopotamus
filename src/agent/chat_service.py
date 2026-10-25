@@ -16,10 +16,11 @@ from .run_details import summarize_run
 from .compaction_policy import CompactionPolicy
 from .instruction_refresh import refresh_instructions
 from .subagents import SubagentPolicy
+from src.messaging.delivery_store import DeliveryStore
 
 
 class ChatService:
-    def __init__(self, codex_factory, database, model="gpt-6-astra", effort="medium", turn_timeout=180, auto_compact_percent=None, profiles=None, subagents=None, workspace_status=None):
+    def __init__(self, codex_factory, database, model="gpt-6-astra", effort="medium", turn_timeout=180, auto_compact_percent=None, profiles=None, subagents=None, workspace_status=None, artifacts=None, deliveries=None):
         self.codex_factory = codex_factory
         self.database = database
         self.model = model
@@ -29,6 +30,8 @@ class ChatService:
         self.profiles = profiles
         self.subagents = subagents or SubagentPolicy()
         self.workspace_status = workspace_status
+        self.artifacts = artifacts
+        self.deliveries = deliveries or DeliveryStore(database)
         self.lock = threading.Lock()
         with database.connect() as db:
             db.execute("CREATE TABLE IF NOT EXISTS conversations (chat_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL)")
@@ -58,10 +61,11 @@ class ChatService:
         result = Future()
         cancelled = threading.Event()
         active_turn = []
+        publication = {"lock": threading.Lock(), "result": None}
 
         def run():
             try:
-                value = self._reply(chat_id, text, request_id, cancelled, active_turn, include_details)
+                value = self._reply(chat_id, text, request_id, cancelled, active_turn, include_details, publication)
             except Exception as error:
                 if isinstance(error, JsonRpcError):
                     # Emit only fixed categories and code locations; RPC messages can contain credentials.
@@ -85,7 +89,16 @@ class ChatService:
         try:
             return result.result(timeout=self.turn_timeout)
         except FutureTimeout:
-            cancelled.set()
+            with publication["lock"]:
+                if publication["result"] is not None:
+                    return dict(publication["result"])
+                cancelled.set()
+            if self.artifacts is not None:
+                try:
+                    self.artifacts.cancel_run(chat_id, request_id)
+                except Exception:
+                    # Database failure cannot authorize publication; capability also has a fixed deadline.
+                    print("Immediate artifact revocation unavailable.", file=sys.stderr, flush=True)
             if active_turn:
                 threading.Thread(target=self._interrupt, args=(active_turn[0],), daemon=True).start()
             # A stuck worker keeps the slot: never accumulate more paid turns behind it.
@@ -98,7 +111,7 @@ class ChatService:
         except Exception:
             pass
 
-    def _reply(self, chat_id, text, request_id, cancelled, active_turn, include_details=False):
+    def _reply(self, chat_id, text, request_id, cancelled, active_turn, include_details=False, publication=None):
         digest = hashlib.sha256(text.encode()).hexdigest()
         with ExitStack() as runtime, self.database.connect() as db:
             row = db.execute(
@@ -109,10 +122,12 @@ class ChatService:
                     raise ValueError("Request ID already used for another message.")
                 # A crash may leave uncertain work. Fail closed instead of charging for it again.
                 result = {"text": row[1] or "Previous request was interrupted. Please send your message again."}
+                manifest = self.deliveries.get(chat_id, request_id, db)
+                result.update(manifest or {"items": [{"type": "text", "text": result["text"]}]})
                 if include_details:
                     saved = db.execute("SELECT status, details FROM reply_runs WHERE chat_id = %s AND request_id = %s",
                                        (chat_id, request_id)).fetchone()
-                    result.update(status=saved[0] if saved and saved[0] != "pending" else "uncertain",
+                    result.update(status=manifest["reply_status"] if manifest else saved[0] if saved and saved[0] != "pending" else "uncertain",
                                   details=json.loads(saved[1]) if saved and saved[1] else None)
                 return result
             if cancelled.is_set():
@@ -142,7 +157,12 @@ class ChatService:
             if include_details:
                 db.execute("INSERT INTO reply_runs VALUES (%s, %s, 'pending', NULL)", (chat_id, request_id))
             db.commit()
+            capability = None
             try:
+                if self.artifacts is not None:
+                    capability = self.artifacts.begin_run(chat_id, request_id, self.turn_timeout + 30)
+                    if cancelled.is_set():
+                        raise TimeoutError("Request cancelled before worker access.")
                 row = db.execute("SELECT thread_id FROM conversations WHERE chat_id = %s", (chat_id,)).fetchone()
                 options = {
                     "model": self.model, "sandbox": Sandbox.full_access, "approval_mode": ApprovalMode.deny_all,
@@ -179,6 +199,8 @@ class ChatService:
                     self._interrupt(turn)
                     raise TimeoutError("Request cancelled.")
                 response = turn.run()
+                if cancelled.is_set():
+                    raise TimeoutError("Request cancelled before publication.")
                 # Learn from runtime usage, never from a model-name table or private catalog cache.
                 window = getattr(getattr(response, "usage", None), "model_context_window", None)
                 if type(window) is int and window > 0:
@@ -188,22 +210,40 @@ class ChatService:
                 reply = response.final_response
                 if expired:
                     reply = "Temporary workspace files expired and were cleaned. Saved files and conversation history remain.\n\n" + reply
+                db.execute("UPDATE replies SET reply = %s WHERE chat_id = %s AND request_id = %s", (reply, chat_id, request_id))
+                items = [{"type": "text", "text": reply}]
+                if self.artifacts is not None:
+                    items.extend(self.artifacts.publish(db, chat_id, request_id))
+                self.deliveries.publish(db, chat_id, request_id, items)
+                if workspace is not None:
+                    db.execute("""INSERT INTO conversation_workspace VALUES (%s, %s)
+                        ON CONFLICT (chat_id) DO UPDATE SET generation = EXCLUDED.generation""", (chat_id, workspace["generation"]))
+                result = {"text": reply}
+                result.update(self.deliveries.get(chat_id, request_id, db))
+                with publication["lock"]:
+                    if cancelled.is_set():
+                        raise TimeoutError("Request cancelled before publication.")
+                    db.commit()
+                    publication["result"] = {**result, **({"status": "completed", "details": None} if include_details else {})}
             except Exception:
                 db.rollback()
+                if self.artifacts is not None and capability is not None:
+                    self.artifacts.end_run(db, chat_id, request_id, "cancelled" if cancelled.is_set() else "failed")
+                failure_text = "Codex could not finish this request. Its effects may be incomplete; check before trying again."
                 db.execute(
                     "UPDATE replies SET reply = %s WHERE chat_id = %s AND request_id = %s",
-                    ("Codex could not finish this message. Please send your message again.", chat_id, request_id),
+                    (failure_text, chat_id, request_id),
                 )
+                try:
+                    with db.transaction():
+                        self.deliveries.publish(db, chat_id, request_id, [{"type": "text", "text": failure_text}], outcome="failed")
+                except Exception:
+                    # Preserve revocation and failure caching even if delivery storage is unavailable.
+                    print("Failure reply delivery unavailable.", file=sys.stderr, flush=True)
                 db.commit()
                 if include_details:
                     self._save_run(db, chat_id, request_id, "failed", None)
                 raise
-            db.execute("UPDATE replies SET reply = %s WHERE chat_id = %s AND request_id = %s", (reply, chat_id, request_id))
-            if workspace is not None:
-                db.execute("""INSERT INTO conversation_workspace VALUES (%s, %s)
-                    ON CONFLICT (chat_id) DO UPDATE SET generation = EXCLUDED.generation""", (chat_id, workspace["generation"]))
-            db.commit()
-            result = {"text": reply}
             if include_details:
                 details = None
                 try:
