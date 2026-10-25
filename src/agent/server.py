@@ -12,15 +12,18 @@ from .codex_auth import CodexAuth
 from .chat_service import ChatService
 from .http_server import AgentHTTPServer
 from .profile_client import ProfileClient
-from src.runtime import read_secret
+from src.runtime import MAX_JSON_RESPONSE_BYTES, read_secret
 from src.profiles.instructions import load_system_instructions
 from src.profiles.auth import CONSOLE_CHAT_ID, ProfileTokens
 from src.storage.database import Database
 from .worker_transport import configure_transport, workspace_status, WorkspaceStorageError
 from .subagents import SubagentPolicy
+from src.messaging.artifacts import ArtifactPolicy, ArtifactStore
+from src.messaging.delivery_store import DeliveryStore
+from src.messaging.http_api import MessagingAPI
 
 
-def make_handler(auth, api_token, chat=None):
+def make_handler(auth, api_token, chat=None, messaging=None):
     if len(api_token) < 32 or not api_token.isascii():
         raise ValueError("Agent API token must contain at least 32 ASCII characters.")
 
@@ -58,6 +61,8 @@ def make_handler(auth, api_token, chat=None):
 
         def respond(self):
             try:
+                if messaging is not None and messaging.dispatch(self, api_token):
+                    return
                 if not (self.command == "POST" and self.path in ("/chat", "/chat/reset", "/console/chat", "/console/reset")):
                     self.read_deadline.cancel()
                 if self.command == "GET" and self.path == "/health":
@@ -114,7 +119,15 @@ def make_handler(auth, api_token, chat=None):
             except Exception as error:
                 print(f"Agent request failed ({type(error).__name__}).", file=sys.stderr, flush=True)
                 data, status = {"error": "Agent request failed"}, 503
-            body = json.dumps(data).encode("utf-8")
+            self.send_json(data, status)
+
+        def send_json(self, data, status):
+            try:
+                body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                if len(body) > MAX_JSON_RESPONSE_BYTES:
+                    raise ValueError("Response exceeds supported envelope.")
+            except (ValueError, UnicodeError):
+                body, status = b'{"error":"Agent response unavailable"}', 503
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
@@ -163,18 +176,39 @@ def main():
                 if workspace_status()["admission_blocked"]:
                     raise WorkspaceStorageError("Workspace storage limit reached.") from None
                 raise
+        database = Database.from_env()
+        policy = ArtifactPolicy.from_env()
+        deliveries = DeliveryStore(database, retention=policy.retention_seconds)
+        artifacts = ArtifactStore(database, os.environ.get("ARTIFACT_DIRECTORY", "/var/lib/taskopotamus/artifacts"), policy)
         chat = ChatService(
             runtime_factory,
-            Database.from_env(),
+            database,
             model=os.environ.get("CODEX_MODEL", "gpt-6-astra"),
             effort=os.environ.get("CODEX_REASONING_EFFORT", "medium"),
             auto_compact_percent=int(compact_percent) if compact_percent else None,
             profiles=profiles,
             subagents=subagents, turn_timeout=timeout, workspace_status=workspace_status,
+            artifacts=artifacts, deliveries=deliveries,
         )
-        with AgentHTTPServer(("0.0.0.0", 8080), make_handler(auth, api_token, chat)) as server:
+        stopped = threading.Event()
+        def maintain():
+            while not stopped.is_set():
+                try:
+                    with database.connect() as db:
+                        deliveries.maintain(db)
+                    artifacts.maintain()
+                except Exception:
+                    print("Messaging maintenance failed; retry scheduled.", file=sys.stderr, flush=True)
+                stopped.wait(policy.sweep_seconds)
+        maintenance = threading.Thread(target=maintain, daemon=True)
+        maintenance.start()
+        with AgentHTTPServer(("0.0.0.0", 8080), make_handler(auth, api_token, chat, MessagingAPI(deliveries, artifacts))) as server:
             print("Agent service ready.", flush=True)
-            server.serve_forever()
+            try:
+                server.serve_forever()
+            finally:
+                stopped.set()
+                maintenance.join(timeout=10)
 
 
 if __name__ == "__main__":

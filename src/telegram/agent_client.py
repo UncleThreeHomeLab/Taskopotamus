@@ -4,6 +4,8 @@ import os
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, HTTPRedirectHandler, ProxyHandler, build_opener
 
+from src.runtime import MAX_JSON_RESPONSE_BYTES
+
 
 class NoRedirects(HTTPRedirectHandler):
     def redirect_request(self, *_args, **_kwargs):
@@ -28,13 +30,13 @@ class AgentClient:
     def request(self, path, method="GET", body=None):
         request = Request(
             f"{self.base_url}{path}", method=method,
-            data=json.dumps(body).encode("utf-8") if body is not None else None,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None,
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.api_token}"},
         )
         try:
             with self.opener.open(request, timeout=self.chat_timeout if path in ("/chat", "/console/chat") else 60) as response:
-                body = response.read(262145)
-            if len(body) > 262144:
+                body = response.read(MAX_JSON_RESPONSE_BYTES + 1)
+            if len(body) > MAX_JSON_RESPONSE_BYTES:
                 raise ValueError("Agent response too large.")
             return json.loads(body)
         except HTTPError as error:
@@ -71,3 +73,32 @@ class AgentClient:
 
     def console_reset(self):
         return self.request("/console/reset", "POST", {})
+
+    def publish_reply(self, chat_id, request_id, text, command_attempt=None):
+        body = {"chat_id": str(chat_id), "request_id": str(request_id), "text": text}
+        if command_attempt is not None:
+            body["command_attempt"] = command_attempt
+        return self.request("/messaging/publish", "POST", body)
+
+    def lookup_reply(self, chat_id, request_id):
+        return self.request("/messaging/lookup", "POST", {"chat_id": str(chat_id), "request_id": str(request_id)})["reply"]
+
+    def reserve_command(self, chat_id, request_id, command):
+        return self.request("/messaging/local-command", "POST", {"chat_id": str(chat_id), "request_id": str(request_id), "command": command})
+
+    def claim_delivery(self, allowed_chats):
+        return self.request("/messaging/claim", "POST", {"allowed_chats": sorted(allowed_chats)})["delivery"]
+
+    def acknowledge_delivery(self, delivery, state, receipt=None):
+        return self.request("/messaging/receipt", "POST", {
+            "delivery_id": delivery["delivery_id"], "sequence": delivery["sequence"], "attempt": delivery["attempt"],
+            "state": state, "receipt": receipt,
+        })
+
+    def delivery_status(self, chat_id):
+        return self.request("/messaging/status", "POST", {"chat_id": str(chat_id)})["items"]
+
+    def import_legacy_delivery(self, chat_id, request_id, chunks, next_chunk):
+        return self.request("/messaging/import-legacy", "POST", {
+            "chat_id": str(chat_id), "request_id": str(request_id), "chunks": chunks, "next_chunk": next_chunk,
+        })

@@ -169,6 +169,15 @@ services:
       AGENT_API_TOKEN_FILE: /run/secrets/agent_api_token
       PROFILE_SERVICE_URL: http://mcp:8080
       PROFILE_SIGNING_KEY_FILE: /run/secrets/profile_signing_key
+      ARTIFACT_DIRECTORY: /var/lib/taskopotamus/artifacts
+      ARTIFACT_MAX_FILES: ${ARTIFACT_MAX_FILES:-10}
+      ARTIFACT_INPUT_MAX_BYTES: ${ARTIFACT_INPUT_MAX_BYTES:-20000000}
+      ARTIFACT_OUTPUT_MAX_BYTES: ${ARTIFACT_OUTPUT_MAX_BYTES:-50000000}
+      ARTIFACT_IMAGE_MAX_BYTES: ${ARTIFACT_IMAGE_MAX_BYTES:-10000000}
+      ARTIFACT_CAPACITY_BYTES: ${ARTIFACT_CAPACITY_BYTES:-1073741824}
+      ARTIFACT_STAGING_SECONDS: ${ARTIFACT_STAGING_SECONDS:-3600}
+      ARTIFACT_RETENTION_SECONDS: ${ARTIFACT_RETENTION_SECONDS:-604800}
+      ARTIFACT_SWEEP_SECONDS: ${ARTIFACT_SWEEP_SECONDS:-60}
     secrets:
       - agent_api_token
       - profile_signing_key
@@ -186,6 +195,7 @@ services:
     networks: [execution, database]
     volumes:
       - ${AGENT_INSTRUCTIONS_DIR:-./config/agent}:/app/config/agent:ro
+      - ${DATA_DIR:-./storage}/artifacts:/var/lib/taskopotamus/artifacts
     tmpfs:
       - /tmp:mode=1777
     healthcheck:

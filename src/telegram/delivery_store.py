@@ -10,6 +10,15 @@ class DeliveryStore:
             db.execute("INSERT INTO polling VALUES (1, 0) ON CONFLICT (id) DO NOTHING")
             db.execute("""CREATE TABLE IF NOT EXISTS pending (
                 update_id BIGINT PRIMARY KEY, chat_id BIGINT, chunks TEXT NOT NULL, next_chunk INTEGER NOT NULL)""")
+            db.execute("CREATE TABLE IF NOT EXISTS uncertain_updates (update_id BIGINT PRIMARY KEY)")
+
+    def uncertain(self, update_id):
+        with self.database.connect() as db:
+            return db.execute("SELECT 1 FROM uncertain_updates WHERE update_id=%s", (update_id,)).fetchone() is not None
+
+    def mark_uncertain(self, update_id):
+        with self.database.connect() as db:
+            db.execute("INSERT INTO uncertain_updates VALUES (%s) ON CONFLICT DO NOTHING", (update_id,))
 
     @property
     def offset(self):
@@ -33,3 +42,4 @@ class DeliveryStore:
         with self.database.connect() as db:
             db.execute('UPDATE polling SET "offset" = %s WHERE id = 1', (update_id + 1,))
             db.execute("DELETE FROM pending WHERE update_id = %s", (update_id,))
+            db.execute("DELETE FROM uncertain_updates WHERE update_id=%s", (update_id,))
