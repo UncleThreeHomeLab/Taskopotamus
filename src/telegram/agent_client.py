@@ -46,6 +46,8 @@ class AgentClient:
                 raise AgentRequestError("Agent is busy. Please try again shortly.", 429) from None
             if error.code == 504:
                 raise AgentRequestError("Codex reply timed out. Please send your message again.", 504) from None
+            if error.code == 507:
+                raise AgentRequestError("Workspace storage limit reached. Ask the deployment owner to free temporary or saved files.", 507) from None
             raise AgentRequestError("Agent service unavailable. Check Codex account access and try again.", error.code) from None
         except (URLError, OSError, ValueError) as error:
             print(f"Agent connection failed ({type(error).__name__}).", file=sys.stderr, flush=True)

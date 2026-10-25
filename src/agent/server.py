@@ -16,7 +16,7 @@ from src.runtime import read_secret
 from src.profiles.instructions import load_system_instructions
 from src.profiles.auth import CONSOLE_CHAT_ID, ProfileTokens
 from src.storage.database import Database
-from .worker_transport import configure_transport
+from .worker_transport import configure_transport, workspace_status, WorkspaceStorageError
 from .subagents import SubagentPolicy
 
 
@@ -107,6 +107,8 @@ def make_handler(auth, api_token, chat=None):
                 data, status = {"error": "Codex sign-in required"}, 401
             except BlockingIOError:
                 data, status = {"error": "Agent busy"}, 429
+            except WorkspaceStorageError:
+                data, status = {"error": "Workspace storage limit reached"}, 507
             except TimeoutError:
                 data, status = {"error": "Request timed out"}, 504
             except Exception as error:
@@ -145,20 +147,30 @@ def main():
     if not 30 <= timeout <= 1800:
         raise ValueError("Turn timeout must be between 30 and 1800 seconds.")
     codex_config = CodexConfig(codex_bin=os.environ["CODEX_BIN"], config_overrides=('cli_auth_credentials_store="file"',))
-    with configure_transport(), Codex(codex_config) as codex:
-        auth = CodexAuth(codex)
+    with configure_transport():
+        auth = CodexAuth(lambda: Codex(CodexConfig(
+            codex_bin=codex_config.codex_bin, config_overrides=codex_config.config_overrides,
+            env={"TASKOPOTAMUS_WORKER_MODE": "auth"},
+        )))
+        def runtime_factory(token):
+            try:
+                return Codex(CodexConfig(
+                    codex_bin=codex_config.codex_bin,
+                    config_overrides=codex_config.config_overrides,
+                    env={"TASKOPOTAMUS_PROFILE_AUTH": f"Bearer {token}", "TASKOPOTAMUS_WORKER_MODE": "runtime"},
+                ))
+            except Exception:
+                if workspace_status()["admission_blocked"]:
+                    raise WorkspaceStorageError("Workspace storage limit reached.") from None
+                raise
         chat = ChatService(
-            lambda token: Codex(CodexConfig(
-                codex_bin=codex_config.codex_bin,
-                config_overrides=codex_config.config_overrides,
-                env={"TASKOPOTAMUS_PROFILE_AUTH": f"Bearer {token}"},
-            )),
+            runtime_factory,
             Database.from_env(),
             model=os.environ.get("CODEX_MODEL", "gpt-6-astra"),
             effort=os.environ.get("CODEX_REASONING_EFFORT", "medium"),
             auto_compact_percent=int(compact_percent) if compact_percent else None,
             profiles=profiles,
-            subagents=subagents, turn_timeout=timeout,
+            subagents=subagents, turn_timeout=timeout, workspace_status=workspace_status,
         )
         with AgentHTTPServer(("0.0.0.0", 8080), make_handler(auth, api_token, chat)) as server:
             print("Agent service ready.", flush=True)
