@@ -10,6 +10,7 @@ from psycopg import Error as DatabaseError
 
 from .agent_client import AgentClient
 from .agent_client import AgentRequestError
+from .media import TelegramRejected, rejection, send_media
 from .delivery_store import DeliveryStore
 from src.runtime import read_secret
 from src.storage.database import Database
@@ -103,10 +104,6 @@ def reply_chunks(text):
     return [text[start:start + 2000] for start in range(0, len(text), 2000)]
 
 
-class TelegramRejected(RuntimeError):
-    """A definitive API rejection, rather than an ambiguous transport failure."""
-
-
 def api(token, method, body=None, timeout=40):
     request = Request(
         f"https://api.telegram.org/bot{token}/{method}",
@@ -118,22 +115,22 @@ def api(token, method, body=None, timeout=40):
         with urlopen(request, timeout=timeout) as response:
             data = json.load(response)
     except HTTPError as error:
-        rejected = False
+        rejected = None
         try:
             body = error.read(65537) if error.fp is not None else b""
             if len(body) <= 65536:
                 response = json.loads(body)
-                rejected = isinstance(response, dict) and response.get("ok") is False and type(response.get("error_code")) is int
+                rejected = rejection(response)
         except (ValueError, OSError):
             pass
         error.close()
-        raise (TelegramRejected if rejected else RuntimeError)(f"Telegram {method} failed (HTTP {error.code}).") from None
+        raise rejected or RuntimeError(f"Telegram {method} failed (HTTP {error.code}).") from None
     except (URLError, TimeoutError, OSError):
         raise RuntimeError("Telegram network request failed.") from None
     except (ValueError, UnicodeError):
         raise RuntimeError("Telegram returned invalid JSON.") from None
     if isinstance(data, dict) and data.get("ok") is False and type(data.get("error_code")) is int:
-        raise TelegramRejected(f"Telegram {method} rejected the request.")
+        raise rejection(data)
     if not isinstance(data, dict) or not data.get("ok") or "result" not in data:
         raise RuntimeError(f"Telegram {method} failed.")
     return data["result"]
@@ -222,17 +219,24 @@ def deliver_one(agent, token, allowed_users):
     state, receipt = "uncertain", None
     try:
         item = delivery["item"]
-        if item.get("type") != "text":
-            state = "failed"
-        else:
+        if item.get("type") == "text":
             result = api(token, "sendMessage", {
                 "chat_id": delivery["chat_id"], "text": item["text"], "protect_content": True,
                 "link_preview_options": {"is_disabled": True},
             })
-            if isinstance(result, dict) and type(result.get("message_id")) is int and result["message_id"] > 0:
-                state, receipt = "delivered", {"message_id": result["message_id"]}
-    except TelegramRejected:
-        state = "failed"
+        elif item.get("type") in ("image", "file"):
+            info = delivery.get("artifact") or agent.artifact_info(delivery["chat_id"], item["artifact_id"])
+            with agent.artifact_stream(delivery["chat_id"], item["artifact_id"]) as source:
+                result = send_media(token, delivery["chat_id"], item, info, source)
+        else:
+            raise RuntimeError("Unsupported outgoing item.")
+        if isinstance(result, dict) and type(result.get("message_id")) is int and result["message_id"] > 0:
+            state, receipt = "delivered", {"message_id": result["message_id"]}
+            media = result.get("document") if item["type"] == "file" else (result.get("photo") or [{}])[-1] if item["type"] == "image" else None
+            if isinstance(media, dict) and isinstance(media.get("file_id"), str):
+                receipt["file_id"] = media["file_id"]
+    except TelegramRejected as error:
+        state, receipt = ("rate_limited", {"retry_after": error.retry_after}) if error.retry_after is not None else ("failed", None)
     except RuntimeError:
         pass
     # Retry only recording the same receipt. Never repeat the Telegram send here.

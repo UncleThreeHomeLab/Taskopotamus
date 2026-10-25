@@ -3,6 +3,7 @@ import json
 import socket
 import threading
 import time
+import io
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
@@ -64,6 +65,30 @@ class ConsoleTests(unittest.TestCase):
         self.client.assert_not_called()
         self.client.status.assert_not_called()
         self.client.console_chat.assert_not_called()
+
+    def test_attachment_preview_download_requires_session_and_streams_exact_bytes(self):
+        identifier = "a" * 32
+        content = b"synthetic attachment bytes"
+        self.client.console_chat.return_value = {"text": "ready", "status": "completed", "items": [
+            {"type": "image", "artifact_id": identifier, "caption": "Caption <script>private</script>"}],
+            "artifacts": {identifier: {"state": "committed", "filename": "chart.png", "presentation_mime": "image/png", "size": len(content)}}}
+        self.client.artifact_stream.side_effect = lambda *_: io.BytesIO(content)
+        self.state.submit("chat", self.state.nonce, "make a file")
+        finished(self.state)
+        body = self.request()[2]
+        self.assertIn(f'src="/artifact/{identifier}"', body)
+        self.assertIn("Caption &lt;script&gt;private&lt;/script&gt;", body)
+        self.assertIn(f'href="/artifact/{identifier}/download"', body)
+        self.assertEqual(self.request(path=f"/artifact/{identifier}")[0], 403)
+        cookie = {"Cookie": f"console_session={self.state.cookie}"}
+        status, headers, data = self.request(path=f"/artifact/{identifier}", headers=cookie)
+        self.assertEqual((status, headers["Content-Type"], data.encode()), (200, "image/png", content))
+        status, headers, _ = self.request(path=f"/artifact/{identifier}/download", headers=cookie)
+        self.assertEqual(status, 200)
+        self.assertIn("attachment;", headers["Content-Disposition"])
+        self.assertEqual(self.request(path=f"/artifact/{identifier}", headers={**cookie, "Origin": "https://evil.example"})[0], 403)
+        self.client.artifact_stream.side_effect = RuntimeError("expired")
+        self.assertEqual(self.request(path=f"/artifact/{identifier}", headers=cookie)[0], 410)
 
     def test_host_origin_csrf_cookie_and_identity_injection_fail_before_backend(self):
         cases = [({"Host": "evil.example:8088"}, self.fields("hi")),

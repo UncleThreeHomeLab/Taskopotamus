@@ -2,8 +2,10 @@
 """Trusted worker supervision; model processes never run with supervisor privileges."""
 import fcntl
 import json
+import ipaddress
 import math
 import os
+import re
 import select
 import shlex
 import shutil
@@ -142,11 +144,15 @@ def wait_device_login(child, descriptor):
 class WorkspaceLifecycle:
     def __init__(self, workspace=Path("/workspace"), saved=Path("/saved"), state=Path("/var/lib/taskopotamus/state"),
                  runtime_home=Path("/home/agent/.codex"), auth_home=Path("/var/lib/taskopotamus/auth/.codex"),
-                 retention=604800, sweep=3600, max_bytes=1073741824, runtime_uid=RUNTIME_UID, auth_uid=AUTH_UID):
+                 retention=604800, sweep=3600, max_bytes=1073741824, runtime_uid=RUNTIME_UID, auth_uid=AUTH_UID, agent_ip="10.203.17.30"):
         self.workspace, self.saved, self.state = Path(workspace), Path(saved), Path(state)
         self.runtime_home, self.auth_home = Path(runtime_home), Path(auth_home)
         self.retention, self.sweep, self.max_bytes = retention, sweep, max_bytes
         self.runtime_uid, self.auth_uid = runtime_uid, auth_uid
+        address = ipaddress.IPv4Address(agent_ip)
+        if not address.is_private or address.is_loopback or address.is_link_local or address.is_unspecified:
+            raise ValueError("Invalid private attachment service address.")
+        self.agent_ip = str(address)
         self.epoch_file = self.state / "workspace.json"
         self.pending = self.state / "runtime-credentials-pending.json"
 
@@ -154,7 +160,8 @@ class WorkspaceLifecycle:
     def configured(cls):
         return cls(retention=positive_setting(os.environ, "WORKSPACE_RETENTION_SECONDS", 604800),
                    sweep=positive_setting(os.environ, "WORKSPACE_SWEEP_SECONDS", 3600),
-                   max_bytes=positive_setting(os.environ, "WORKSPACE_MAX_BYTES", 1073741824))
+                   max_bytes=positive_setting(os.environ, "WORKSPACE_MAX_BYTES", 1073741824),
+                   agent_ip=os.environ.get("WORKER_AGENT_IP", "10.203.17.30"))
 
     @contextmanager
     def lock(self, name):
@@ -207,7 +214,7 @@ class WorkspaceLifecycle:
             self.recover_credentials()
             self.prepare()
             atomic_write(self.state / "policy.json", json.dumps({"retention": self.retention,
-                         "sweep": self.sweep, "max_bytes": self.max_bytes}).encode())
+                         "sweep": self.sweep, "max_bytes": self.max_bytes, "agent_ip": self.agent_ip}).encode())
 
     def copy_credentials(self, source, destination, uid):
         # Only this inert JSON file crosses identities. Never transfer configuration or hooks.
@@ -305,6 +312,12 @@ class WorkspaceLifecycle:
                        "NO_COLOR": "1", "TERM": "dumb"}
         if mode == "runtime" and os.environ.get("TASKOPOTAMUS_PROFILE_AUTH"):
             environment["TASKOPOTAMUS_PROFILE_AUTH"] = os.environ["TASKOPOTAMUS_PROFILE_AUTH"]
+        if mode == "runtime" and os.environ.get("TASKOPOTAMUS_ARTIFACT_AUTH"):
+            token = os.environ["TASKOPOTAMUS_ARTIFACT_AUTH"]
+            if not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+                raise ValueError("Invalid attachment capability.")
+            environment["TASKOPOTAMUS_ARTIFACT_AUTH"] = token
+            environment["TASKOPOTAMUS_AGENT_IP"] = self.agent_ip
         command = ["setpriv", f"--reuid={uid}", f"--regid={uid}", "--clear-groups", "--bounding-set=-all",
                    "--inh-caps=-all", "--ambient-caps=-all", "--no-new-privs", CODEX, *arguments]
         return command, environment, self.workspace if mode == "runtime" else home
@@ -395,7 +408,8 @@ def main():
         return serve(WorkspaceLifecycle.configured())
     # sshd creates a clean login environment; use the supervisor's validated deployment policy.
     policy = read_json(Path("/var/lib/taskopotamus/state/policy.json"))
-    if set(policy) != {"retention", "sweep", "max_bytes"} or any(type(value) is not int or value <= 0 for value in policy.values()):
+    if (set(policy) != {"retention", "sweep", "max_bytes", "agent_ip"}
+            or any(type(policy[name]) is not int or policy[name] <= 0 for name in ("retention", "sweep", "max_bytes"))):
         raise ValueError("Invalid persisted worker policy.")
     lifecycle = WorkspaceLifecycle(**policy)
     if sys.argv[1:] == ["status"] and "SSH_ORIGINAL_COMMAND" not in os.environ:

@@ -20,6 +20,18 @@ if os.name != "nt":
 
 @unittest.skipIf(os.name == "nt", "Worker lifecycle requires Linux")
 class WorkspacePolicyTests(unittest.TestCase):
+    def test_runtime_alone_receives_validated_attachment_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worker = lifecycle.WorkspaceLifecycle(workspace=root / "workspace", auth_home=root / "auth" / ".codex")
+            token = "s" * 43
+            with patch.object(lifecycle, "directory"), patch.dict(os.environ, {"TASKOPOTAMUS_ARTIFACT_AUTH": token}):
+                self.assertEqual(worker.child_command("runtime", ["--version"])[1]["TASKOPOTAMUS_ARTIFACT_AUTH"], token)
+                self.assertNotIn("TASKOPOTAMUS_ARTIFACT_AUTH", worker.child_command("auth", ["--version"])[1])
+            with patch.object(lifecycle, "directory"), patch.dict(os.environ, {"TASKOPOTAMUS_ARTIFACT_AUTH": "invalid"}):
+                with self.assertRaises(ValueError):
+                    worker.child_command("runtime", ["--version"])
+
     def test_production_defaults_and_invalid_settings(self):
         with patch.dict(os.environ, {}, clear=True):
             worker = lifecycle.WorkspaceLifecycle.configured()
@@ -154,7 +166,7 @@ class WorkspaceLifecycleTests(unittest.TestCase):
         self.worker.initialize()
         self.assertEqual(self.worker.read_state(), before)
         self.assertEqual(lifecycle.read_json(self.worker.state / "policy.json"),
-                         {"retention": 5, "sweep": 1, "max_bytes": 1073741824})
+                         {"retention": 5, "sweep": 1, "max_bytes": 1073741824, "agent_ip": "10.203.17.30"})
 
     def test_credential_retry_after_destination_commit_keeps_newest_copy(self):
         self.credential(self.worker.auth_home, "A")

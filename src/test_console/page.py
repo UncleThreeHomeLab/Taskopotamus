@@ -1,6 +1,7 @@
 """Server-rendered local console. All runtime and user strings remain plain text."""
 from html import escape
 import json
+import re
 
 
 def render(state):
@@ -9,7 +10,28 @@ def render(state):
         return (f'<form method="post" action="/{action}"><input type="hidden" name="csrf" value="{escape(state["csrf"])}">'
                 f'<input type="hidden" name="nonce" value="{state["nonce"]}"><button{disabled}>{label}</button></form>')
 
-    transcript = "".join(f'<article><strong>{escape(role)}</strong><pre>{escape(text)}</pre></article>'
+    def content(value):
+        if isinstance(value, str):
+            return f'<pre>{escape(value)}</pre>'
+        pieces = []
+        for item in value:
+            if item.get("type") == "text":
+                pieces.append(f'<pre>{escape(item["text"])}</pre>')
+            elif item.get("type") in ("image", "file"):
+                info = item.get("metadata", {})
+                caption = escape(item.get("caption", ""))
+                identifier = item.get("artifact_id", "")
+                filename = escape(info.get("filename", "Attachment unavailable or expired"))
+                if (info.get("state") != "committed" or not isinstance(identifier, str) or not re.fullmatch(r"[a-f0-9]{32}", identifier)
+                        or type(info.get("size")) is not int or info["size"] <= 0):
+                    pieces.append(f'<p>{filename}</p><pre>{caption}</pre>')
+                    continue
+                preview = f'<img src="/artifact/{identifier}" alt="{filename}" style="max-width:100%;height:auto">' if item["type"] == "image" and info.get("presentation_mime") in ("image/png", "image/jpeg") else ""
+                pieces.append(f'<figure>{preview}<figcaption><pre>{caption}</pre>'
+                              f'<a href="/artifact/{identifier}/download">Download {filename}</a> ({info["size"]} bytes)</figcaption></figure>')
+        return "".join(pieces)
+
+    transcript = "".join(f'<article><strong>{escape(role)}</strong>{content(text)}</article>'
                          for role, text in state["transcript"])
     refresh = '<meta http-equiv="refresh" content="2">' if state["pending"] else ""
     auth = state["auth"]

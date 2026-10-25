@@ -17,6 +17,7 @@ from .compaction_policy import CompactionPolicy
 from .instruction_refresh import refresh_instructions
 from .subagents import SubagentPolicy
 from src.messaging.delivery_store import DeliveryStore
+from .attachment_tools import attachment_config
 
 
 class ChatService:
@@ -111,6 +112,12 @@ class ChatService:
         except Exception:
             pass
 
+    def _revoke_artifacts(self, chat_id, request_id):
+        try:
+            self.artifacts.cancel_run(chat_id, request_id)
+        except Exception:
+            print("Artifact scope cleanup unavailable.", file=sys.stderr, flush=True)
+
     def _reply(self, chat_id, text, request_id, cancelled, active_turn, include_details=False, publication=None):
         digest = hashlib.sha256(text.encode()).hexdigest()
         with ExitStack() as runtime, self.database.connect() as db:
@@ -124,6 +131,7 @@ class ChatService:
                 result = {"text": row[1] or "Previous request was interrupted. Please send your message again."}
                 manifest = self.deliveries.get(chat_id, request_id, db)
                 result.update(manifest or {"items": [{"type": "text", "text": result["text"]}]})
+                self._artifact_metadata(result, chat_id, db)
                 if include_details:
                     saved = db.execute("SELECT status, details FROM reply_runs WHERE chat_id = %s AND request_id = %s",
                                        (chat_id, request_id)).fetchone()
@@ -133,11 +141,19 @@ class ChatService:
             if cancelled.is_set():
                 raise TimeoutError("Request cancelled.")
             instructions, profile_config = load_system_instructions(), {}
-            turn_input = text
+            turn_input, token, capability = text, None, None
             if self.profiles is not None:
                 profile, profile_config, token = self.profiles.prepare(chat_id)
                 # Saved user text must never acquire developer authority.
                 turn_input = json.dumps({"profile": profile, "message": text}, ensure_ascii=False)
+            if self.artifacts is not None:
+                capability = self.artifacts.begin_run(chat_id, request_id, self.turn_timeout + 30)
+                runtime.callback(self._revoke_artifacts, chat_id, request_id)
+                if cancelled.is_set():
+                    raise TimeoutError("Request cancelled before worker access.")
+                profile_config.update(attachment_config())
+                client = self.codex_factory(token, capability)
+            elif self.profiles is not None:
                 client = self.codex_factory(token)
             else:
                 client = self.codex_factory()
@@ -157,12 +173,7 @@ class ChatService:
             if include_details:
                 db.execute("INSERT INTO reply_runs VALUES (%s, %s, 'pending', NULL)", (chat_id, request_id))
             db.commit()
-            capability = None
             try:
-                if self.artifacts is not None:
-                    capability = self.artifacts.begin_run(chat_id, request_id, self.turn_timeout + 30)
-                    if cancelled.is_set():
-                        raise TimeoutError("Request cancelled before worker access.")
                 row = db.execute("SELECT thread_id FROM conversations WHERE chat_id = %s", (chat_id,)).fetchone()
                 options = {
                     "model": self.model, "sandbox": Sandbox.full_access, "approval_mode": ApprovalMode.deny_all,
@@ -220,6 +231,7 @@ class ChatService:
                         ON CONFLICT (chat_id) DO UPDATE SET generation = EXCLUDED.generation""", (chat_id, workspace["generation"]))
                 result = {"text": reply}
                 result.update(self.deliveries.get(chat_id, request_id, db))
+                self._artifact_metadata(result, chat_id, db)
                 with publication["lock"]:
                     if cancelled.is_set():
                         raise TimeoutError("Request cancelled before publication.")
@@ -254,6 +266,19 @@ class ChatService:
                 self._save_run(db, chat_id, request_id, "completed", details)
                 result.update(status="completed", details=details)
             return result
+
+    def _artifact_metadata(self, result, chat_id, db):
+        if self.artifacts is None:
+            return
+        information = {}
+        for item in result.get("items", []):
+            if item["type"] in ("image", "file"):
+                try:
+                    information[item["artifact_id"]] = self.artifacts.describe(item["artifact_id"], chat_id, db=db, committed=True)
+                except PermissionError:
+                    information[item["artifact_id"]] = {"artifact_id": item["artifact_id"], "available": False}
+        if information:
+            result["artifacts"] = information
 
     @staticmethod
     def _save_run(db, chat_id, request_id, status, details):

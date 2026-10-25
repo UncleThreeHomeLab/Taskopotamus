@@ -56,8 +56,8 @@ class MessagingTests(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 self.artifacts.describe(info["artifact_id"], chat, request)
         items = [{"type": "file", "artifact_id": info["artifact_id"], "caption": "Description"}]
-        self.assertEqual(self.artifacts.prepare_batch(capability, "batch", items), items)
-        self.assertEqual(self.artifacts.prepare_batch(capability, "batch", items), items)
+        self.assertEqual(self.artifacts.prepare_batch(capability, "batch", items)["items"], items)
+        self.assertEqual(self.artifacts.prepare_batch(capability, "batch", items)["version"], 1)
         with self.database.connect() as db:
             published = self.artifacts.publish(db, "42", "1")
             self.deliveries.publish(db, "42", "1", published)
@@ -108,11 +108,13 @@ class MessagingTests(unittest.TestCase):
         args = (first["delivery_id"], first["sequence"], first["attempt"], "delivered", {"message_id": 7})
         self.deliveries.acknowledge(*args)
         self.deliveries.acknowledge(*args)
+        self.now += 1
         second = self.deliveries.claim(["42"])
         self.now += 11
         self.assertIsNone(self.deliveries.claim(["42"]))
         self.assertEqual(self.deliveries.status("42")[1]["state"], "uncertain")
         self.deliveries.acknowledge(second["delivery_id"], second["sequence"], second["attempt"], "delivered", {"message_id": 8})
+        self.now += 1
         self.assertEqual(self.deliveries.claim(["42"])["sequence"], 2)
         self.assertEqual(self.deliveries.status("43"), [])
         with self.assertRaises(ValueError):
@@ -141,7 +143,7 @@ class MessagingTests(unittest.TestCase):
         thread.id = "synthetic-thread"
         thread.turn.return_value = turn
         turn.run.return_value = SimpleNamespace(status=SimpleNamespace(value="completed"), final_response="done", usage=None)
-        chat = ChatService(lambda: nullcontext(codex), self.database, turn_timeout=timeout, artifacts=self.artifacts, deliveries=self.deliveries)
+        chat = ChatService(lambda *_: nullcontext(codex), self.database, turn_timeout=timeout, artifacts=self.artifacts, deliveries=self.deliveries)
         return chat, turn
 
     def test_final_publication_failure_revokes_capability_and_leaves_no_manifest(self):

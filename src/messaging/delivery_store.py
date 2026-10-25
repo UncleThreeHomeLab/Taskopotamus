@@ -7,7 +7,7 @@ from .messages import delivery_items, identity, opaque_id, validate_items
 
 
 class DeliveryStore:
-    def __init__(self, database, retention=604800, attempt_timeout=120, clock=time.time):
+    def __init__(self, database, retention=604800, attempt_timeout=180, clock=time.time):
         if type(retention) is not int or retention <= 0 or type(attempt_timeout) is not int or attempt_timeout <= 0:
             raise ValueError("Invalid delivery policy.")
         self.database, self.retention, self.attempt_timeout, self.clock = database, retention, attempt_timeout, clock
@@ -22,6 +22,13 @@ class DeliveryStore:
                 receipt TEXT, PRIMARY KEY(reply_id, sequence))""")
             db.execute("CREATE INDEX IF NOT EXISTS outgoing_items_state ON outgoing_items(state)")
             db.execute("ALTER TABLE outgoing_replies ADD COLUMN IF NOT EXISTS outcome TEXT NOT NULL DEFAULT 'completed'")
+            db.execute("ALTER TABLE outgoing_items ADD COLUMN IF NOT EXISTS not_before DOUBLE PRECISION NOT NULL DEFAULT 0")
+            db.execute("ALTER TABLE outgoing_items ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0")
+            db.execute("CREATE TABLE IF NOT EXISTS delivery_pacing (chat_id TEXT PRIMARY KEY, not_before DOUBLE PRECISION NOT NULL)")
+            db.execute("""CREATE TABLE IF NOT EXISTS delivery_attempts (
+                attempt TEXT PRIMARY KEY, reply_id TEXT NOT NULL, sequence INTEGER NOT NULL, state TEXT NOT NULL, receipt TEXT)""")
+            db.execute("""INSERT INTO delivery_attempts SELECT attempt,reply_id,sequence,state,receipt FROM outgoing_items
+                WHERE attempt IS NOT NULL ON CONFLICT DO NOTHING""")
             db.execute("""CREATE TABLE IF NOT EXISTS local_commands (
                 chat_id TEXT, request_id TEXT, command TEXT NOT NULL, attempt TEXT NOT NULL,
                 state TEXT NOT NULL, PRIMARY KEY(chat_id,request_id))""")
@@ -79,14 +86,16 @@ class DeliveryStore:
                 raise ValueError("Reply identity already used.")
             return existing[0]
         reply_id, now = uuid.uuid4().hex, self.clock()
-        db.execute("INSERT INTO outgoing_replies VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+        db.execute("""INSERT INTO outgoing_replies (id,chat_id,request_id,channel,items,created,expires,outcome)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
                    (reply_id, chat_id, request_id, channel, serialized, now, now + self.retention, outcome))
         for sequence, item in enumerate(delivery_items(items)):
             state, receipt = ("available" if channel == "console" else "pending"), None
             if legacy_next is not None:
                 state = "delivered" if sequence < legacy_next else "uncertain" if sequence == legacy_next else "pending"
                 receipt = json.dumps({"legacy": True}) if sequence < legacy_next else None
-            db.execute("INSERT INTO outgoing_items VALUES (%s,%s,%s,%s,NULL,NULL,%s)",
+            db.execute("""INSERT INTO outgoing_items (reply_id,sequence,item,state,attempt,claimed,receipt)
+                VALUES (%s,%s,%s,%s,NULL,NULL,%s)""",
                        (reply_id, sequence, json.dumps(item, ensure_ascii=False), state, receipt))
         return reply_id
 
@@ -105,6 +114,8 @@ class DeliveryStore:
         now = self.clock()
         db.execute("UPDATE outgoing_items SET state='uncertain' WHERE state='inflight' AND claimed <= %s",
                    (now - self.attempt_timeout,))
+        db.execute("""UPDATE delivery_attempts a SET state='uncertain' WHERE a.state='inflight' AND EXISTS
+            (SELECT 1 FROM outgoing_items i WHERE i.attempt=a.attempt AND i.state='uncertain')""")
         db.execute("""UPDATE outgoing_items SET state='expired' WHERE state IN ('pending','available') AND reply_id IN
                    (SELECT id FROM outgoing_replies WHERE expires <= %s)""", (now,))
 
@@ -115,13 +126,18 @@ class DeliveryStore:
             if identity(chat, "0") != "telegram":
                 raise ValueError("Telegram recipient required.")
         with self.database.connect() as db:
+            db.execute("SELECT pg_advisory_xact_lock(hashtextextended('delivery-claims',0))")
             self.maintain(db)
             row = db.execute("""SELECT i.reply_id,i.sequence,i.item,r.chat_id,r.request_id FROM outgoing_items i
                 JOIN outgoing_replies r ON r.id=i.reply_id WHERE i.state='pending' AND r.channel='telegram'
-                AND r.chat_id=ANY(%s) AND r.expires>%s AND NOT EXISTS
+                AND r.chat_id=ANY(%s) AND r.expires>%s AND i.not_before<=%s
+                AND NOT EXISTS (SELECT 1 FROM delivery_pacing p WHERE p.chat_id=r.chat_id AND p.not_before>%s)
+                AND NOT EXISTS (SELECT 1 FROM outgoing_items busy JOIN outgoing_replies br ON br.id=busy.reply_id
+                                WHERE br.chat_id=r.chat_id AND busy.state='inflight') AND NOT EXISTS
                   (SELECT 1 FROM outgoing_items earlier WHERE earlier.reply_id=i.reply_id
                    AND earlier.sequence<i.sequence AND earlier.state!='delivered')
-                ORDER BY r.created,i.sequence LIMIT 1 FOR UPDATE OF i SKIP LOCKED""", (allowed_chats, self.clock())).fetchone()
+                ORDER BY r.created,i.sequence LIMIT 1 FOR UPDATE OF i SKIP LOCKED""",
+                (allowed_chats, self.clock(), self.clock(), self.clock())).fetchone()
             if row is None:
                 return None
             attempt = uuid.uuid4().hex
@@ -136,29 +152,55 @@ class DeliveryStore:
                     return None
             db.execute("UPDATE outgoing_items SET state='inflight',attempt=%s,claimed=%s WHERE reply_id=%s AND sequence=%s",
                        (attempt, self.clock(), row[0], row[1]))
+            db.execute("INSERT INTO delivery_attempts VALUES (%s,%s,%s,'inflight',NULL)", (attempt, row[0], row[1]))
+            db.execute("""INSERT INTO delivery_pacing VALUES (%s,%s) ON CONFLICT(chat_id)
+                DO UPDATE SET not_before=EXCLUDED.not_before""", (row[3], self.clock() + 1))
             return {"delivery_id": row[0], "sequence": row[1], "item": item,
                     "chat_id": row[3], "request_id": row[4], "attempt": attempt}
 
     def acknowledge(self, reply_id, sequence, attempt, state, receipt=None):
         opaque_id(reply_id)
         opaque_id(attempt)
-        if type(sequence) is not int or sequence < 0 or state not in ("delivered", "failed", "uncertain"):
+        if type(sequence) is not int or sequence < 0 or state not in ("delivered", "failed", "uncertain", "rate_limited"):
             raise ValueError("Invalid delivery receipt.")
         if receipt is not None and (not isinstance(receipt, dict) or len(json.dumps(receipt)) > 2048):
             raise ValueError("Invalid delivery receipt.")
         if state == "delivered" and (not receipt or type(receipt.get("message_id")) is not int or receipt["message_id"] <= 0):
             raise ValueError("Confirmed delivery needs a message receipt.")
+        if state == "rate_limited" and (not receipt or set(receipt) != {"retry_after"}
+                                       or type(receipt["retry_after"]) is not int or not 1 <= receipt["retry_after"] <= 300):
+            raise ValueError("Invalid retry delay.")
         with self.database.connect() as db:
-            row = db.execute("SELECT state,attempt,receipt FROM outgoing_items WHERE reply_id=%s AND sequence=%s FOR UPDATE",
+            row = db.execute("SELECT state,attempt,receipt,retry_count FROM outgoing_items WHERE reply_id=%s AND sequence=%s FOR UPDATE",
                              (reply_id, sequence)).fetchone()
-            if not row or row[1] != attempt:
+            if not row:
+                raise ValueError("Stale delivery attempt.")
+            history = db.execute("SELECT reply_id,sequence,state,receipt FROM delivery_attempts WHERE attempt=%s FOR UPDATE", (attempt,)).fetchone()
+            if not history or history[:2] != (reply_id, sequence):
+                raise ValueError("Stale delivery attempt.")
+            prior_receipt = json.loads(history[3]) if history[3] else None
+            if history[2] == state and prior_receipt == receipt:
+                return
+            if history[2] != "inflight" and not (history[2] == "uncertain" and prior_receipt is None and state == "delivered"):
+                raise ValueError("Delivery attempt already resolved.")
+            if row[1] != attempt:
                 raise ValueError("Stale delivery attempt.")
             if row[0] != "inflight" and not (row[0] == "uncertain" and row[2] is None and state == "delivered"):
                 if row[0] == state and (json.loads(row[2]) if row[2] else None) == receipt:
                     return
                 raise ValueError("Delivery attempt already resolved.")
-            db.execute("UPDATE outgoing_items SET state=%s,receipt=%s WHERE reply_id=%s AND sequence=%s",
-                       (state, json.dumps(receipt) if receipt else None, reply_id, sequence))
+            serialized = json.dumps(receipt) if receipt else None
+            db.execute("UPDATE delivery_attempts SET state=%s,receipt=%s WHERE attempt=%s", (state, serialized, attempt))
+            if state == "rate_limited" and row[3] < 3:
+                db.execute("""UPDATE outgoing_items SET state='pending',attempt=NULL,claimed=NULL,receipt=NULL,
+                    retry_count=retry_count+1,not_before=%s WHERE reply_id=%s AND sequence=%s""",
+                    (self.clock() + receipt["retry_after"], reply_id, sequence))
+            else:
+                db.execute("UPDATE outgoing_items SET state=%s,receipt=%s WHERE reply_id=%s AND sequence=%s",
+                           ("failed" if state == "rate_limited" else state, serialized, reply_id, sequence))
+            cooldown = receipt["retry_after"] if state == "rate_limited" else 1
+            db.execute("""UPDATE delivery_pacing SET not_before=GREATEST(not_before,%s) WHERE chat_id=
+                (SELECT chat_id FROM outgoing_replies WHERE id=%s)""", (self.clock() + cooldown, reply_id))
 
     def status(self, chat_id):
         identity(chat_id, "0")

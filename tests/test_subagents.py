@@ -83,8 +83,9 @@ class SubagentTests(unittest.TestCase):
                 SubagentPolicy(**settings)
 
     def test_pinned_native_runtime_accepts_config_without_starting_a_model_turn(self):
+        from src.agent.attachment_tools import attachment_config
         with tempfile.TemporaryDirectory() as directory:
-            config = SubagentPolicy().config()
+            config = {**SubagentPolicy().config(), **attachment_config()}
             Path(directory, "config.toml").write_text("\n".join(f"{key} = {json.dumps(value)}" for key, value in config.items()))
             result = subprocess.run([str(bundled_codex_path()), "app-server", "--strict-config"],
                                     input="", capture_output=True, text=True, timeout=20,
@@ -99,7 +100,8 @@ class SubagentTests(unittest.TestCase):
         self.assertIn("StrictHostKeyChecking=yes", result)
         self.assertIn("ClearAllForwardings=yes", result)
         self.assertIn("ForwardAgent=no", result)
-        self.assertEqual([value for value in result if value.startswith("SendEnv=")], ["SendEnv=TASKOPOTAMUS_PROFILE_AUTH"])
+        self.assertEqual([value for value in result if value.startswith("SendEnv=")],
+                         ["SendEnv=TASKOPOTAMUS_PROFILE_AUTH", "SendEnv=TASKOPOTAMUS_ARTIFACT_AUTH"])
         for mode in (None, "root", "runtime; evil"):
             with self.subTest(mode=mode), self.assertRaises(ValueError):
                 command([], {"TASKOPOTAMUS_WORKER_MODE": mode})

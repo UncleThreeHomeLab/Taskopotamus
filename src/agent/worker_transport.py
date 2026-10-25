@@ -42,7 +42,7 @@ def command(arguments, environment):
         "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
         "-o", "ClearAllForwardings=yes", "-o", "ForwardAgent=no", "-o", "LogLevel=ERROR",
         "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2",
-        "-o", "SendEnv=TASKOPOTAMUS_PROFILE_AUTH", "root@worker",
+        "-o", "SendEnv=TASKOPOTAMUS_PROFILE_AUTH", "-o", "SendEnv=TASKOPOTAMUS_ARTIFACT_AUTH", "root@worker",
         shlex.join(["/usr/local/bin/worker-codex", mode, *arguments]),
     ]
 
