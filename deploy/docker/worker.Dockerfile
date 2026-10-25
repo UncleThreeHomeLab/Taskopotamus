@@ -5,7 +5,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends openssh-server 
     && passwd -d root
 RUN groupadd --gid 10001 agent && useradd --uid 10001 --gid 10001 --no-create-home agent \
     && groupadd --gid 10002 codex-auth && useradd --uid 10002 --gid 10002 --no-create-home codex-auth
-RUN pip install --no-cache-dir openai-codex==0.163.0
+RUN pip install --no-cache-dir openai-codex==0.163.0 mcp==2.3.0
+COPY src/worker/ /usr/local/lib/python3.13/site-packages/taskopotamus_worker/
 COPY deploy/worker/sshd_config /etc/ssh/taskopotamus_config
 COPY deploy/worker/start_worker.sh /usr/local/bin/start-worker
 COPY deploy/worker/worker_codex.sh /usr/local/bin/worker-codex

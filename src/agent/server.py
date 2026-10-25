@@ -165,12 +165,13 @@ def main():
             codex_bin=codex_config.codex_bin, config_overrides=codex_config.config_overrides,
             env={"TASKOPOTAMUS_WORKER_MODE": "auth"},
         )))
-        def runtime_factory(token):
+        def runtime_factory(token, artifact_token):
             try:
                 return Codex(CodexConfig(
                     codex_bin=codex_config.codex_bin,
                     config_overrides=codex_config.config_overrides,
-                    env={"TASKOPOTAMUS_PROFILE_AUTH": f"Bearer {token}", "TASKOPOTAMUS_WORKER_MODE": "runtime"},
+                    env={"TASKOPOTAMUS_PROFILE_AUTH": f"Bearer {token}", "TASKOPOTAMUS_ARTIFACT_AUTH": artifact_token,
+                         "TASKOPOTAMUS_WORKER_MODE": "runtime"},
                 ))
             except Exception:
                 if workspace_status()["admission_blocked"]:

@@ -78,6 +78,9 @@ class ArtifactStore:
             db.execute("""CREATE TABLE IF NOT EXISTS attachment_batches (
                 chat_id TEXT, request_id TEXT, operation TEXT, items TEXT NOT NULL,
                 PRIMARY KEY(chat_id,request_id,operation))""")
+            db.execute("ALTER TABLE attachment_batches ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1")
+            db.execute("ALTER TABLE attachment_batches ADD COLUMN IF NOT EXISTS request_key TEXT")
+            db.execute("ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS presentation_mime TEXT")
 
     def begin_run(self, chat_id, request_id, seconds):
         identity(chat_id, request_id)
@@ -85,8 +88,12 @@ class ArtifactStore:
             raise ValueError("Invalid run lifetime.")
         token = secrets.token_urlsafe(32)
         with self.database.connect() as db:
-            db.execute("INSERT INTO artifact_runs VALUES (%s,%s,'active',%s,%s)",
-                       (chat_id, request_id, hashlib.sha256(token.encode()).hexdigest(), self.clock() + seconds))
+            changed = db.execute("""INSERT INTO artifact_runs VALUES (%s,%s,'active',%s,%s)
+                ON CONFLICT(chat_id,request_id) DO UPDATE SET state='active',capability=EXCLUDED.capability,deadline=EXCLUDED.deadline
+                WHERE artifact_runs.state!='active' OR artifact_runs.deadline<=%s""",
+                       (chat_id, request_id, hashlib.sha256(token.encode()).hexdigest(), self.clock() + seconds, self.clock())).rowcount
+            if changed != 1:
+                raise BlockingIOError("Artifact run is already active.")
         return token
 
     def authorize(self, db, token):
@@ -133,14 +140,24 @@ class ArtifactStore:
                 if existing[1:5] != (filename, mime, size, digest):
                     raise ValueError("Upload identity already used.")
                 if existing[5] not in ("prepared", "committed"):
+                    historical = db.execute("""SELECT 1 FROM attachment_batches WHERE chat_id=%s AND request_id=%s
+                        AND items::jsonb @> %s::jsonb AND version <
+                        (SELECT max(version) FROM attachment_batches WHERE chat_id=%s AND request_id=%s) LIMIT 1""",
+                        (chat_id, request_id, json.dumps([{"artifact_id": existing[0]}]), chat_id, request_id)).fetchone()
+                    if historical and existing[5] in ("discarded", "expired"):
+                        return {"artifact_id": existing[0], "state": "superseded"}
                     raise ValueError("Upload is incomplete or expired.")
                 return self.describe(existing[0], chat_id, request_id, db=db)
             count = db.execute("SELECT count(*) FROM artifacts WHERE chat_id=%s AND request_id=%s AND direction=%s AND state!='expired'",
                                (chat_id, request_id, direction)).fetchone()[0]
             used = db.execute("SELECT COALESCE(sum(size),0) FROM artifacts WHERE state!='expired'").fetchone()[0]
-            if count >= self.policy.max_files or used + size > self.policy.capacity_bytes:
+            # Replacement retains one current batch while one candidate batch uploads.
+            count_limit = self.policy.max_files * (2 if direction == "output" else 1)
+            if count >= count_limit or used + size > self.policy.capacity_bytes:
                 raise ArtifactCapacityError("Attachment storage limit reached.")
-            db.execute("INSERT INTO artifacts VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'uploading',%s,%s)",
+            db.execute("""INSERT INTO artifacts
+                (id,chat_id,request_id,direction,operation,filename,mime,size,digest,state,created,expires)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'uploading',%s,%s)""",
                        (artifact_id, chat_id, request_id, direction, operation, filename, mime, size, digest,
                         now, now + self.policy.staging_seconds))
         temporary, target = self.root / (artifact_id + ".upload"), self.root / artifact_id
@@ -194,13 +211,13 @@ class ArtifactStore:
         if db is None:
             with self.database.connect() as connection:
                 return self.describe(artifact_id, chat_id, request_id, connection, committed)
-        row = db.execute("SELECT request_id,direction,filename,mime,size,digest,state,expires FROM artifacts WHERE id=%s AND chat_id=%s",
+        row = db.execute("SELECT request_id,direction,filename,mime,size,digest,state,expires,presentation_mime FROM artifacts WHERE id=%s AND chat_id=%s",
                          (artifact_id, chat_id)).fetchone()
         if (not row or request_id is not None and row[0] != request_id or row[6] not in ("prepared", "committed")
                 or committed and row[6] != "committed" or row[7] <= self.clock()):
             raise PermissionError("Attachment unavailable or expired.")
         return {"artifact_id": artifact_id, "request_id": row[0], "direction": row[1], "filename": row[2], "mime": row[3],
-                "size": row[4], "sha256": row[5], "state": row[6], "expires_at": row[7]}
+                "size": row[4], "sha256": row[5], "state": row[6], "expires_at": row[7], "presentation_mime": row[8]}
 
     def open(self, artifact_id, chat_id, request_id=None, committed=False):
         info = self.describe(artifact_id, chat_id, request_id, committed=committed)
@@ -212,39 +229,66 @@ class ArtifactStore:
             raise ValueError("Attachment snapshot unavailable.")
         return info, file
 
-    def prepare_batch(self, capability, operation, items):
+    def batch_lookup(self, capability, expected_version, request_key):
+        operation_id(request_key)
+        if type(expected_version) is not int or expected_version < 0:
+            raise ValueError("Invalid batch version.")
+        with self.database.connect() as db:
+            chat_id, request_id = self.authorize(db, capability)
+            row = db.execute("""SELECT items,version FROM attachment_batches WHERE chat_id=%s AND request_id=%s
+                AND version=%s AND request_key=%s""", (chat_id, request_id, expected_version + 1, request_key)).fetchone()
+            if row is None:
+                return None
+            current = db.execute("SELECT max(version) FROM attachment_batches WHERE chat_id=%s AND request_id=%s", (chat_id, request_id)).fetchone()[0]
+            return {"state": "prepared" if row[1] == current else "superseded", "version": row[1], "current_version": current, "items": json.loads(row[0])}
+
+    def prepare_batch(self, capability, operation, items, expected_version=0, request_key=None):
         operation_id(operation)
-        items = validate_items(items)
+        if request_key is not None:
+            operation_id(request_key)
+        if type(expected_version) is not int or expected_version < 0 or not items and expected_version == 0:
+            raise ValueError("A current version is required to clear attachments.")
+        items = validate_items(items) if items else []
         if len(items) > self.policy.max_files or any(i["type"] == "text" for i in items):
             raise ValueError("Attachment batch required.")
         if len({i["artifact_id"] for i in items}) != len(items):
             raise ValueError("Duplicate attachment.")
         with self.database.connect() as db:
             chat_id, request_id = self.authorize(db, capability)
-            existing = db.execute("SELECT items FROM attachment_batches WHERE chat_id=%s AND request_id=%s AND operation=%s",
+            existing = db.execute("SELECT items,version FROM attachment_batches WHERE chat_id=%s AND request_id=%s AND operation=%s",
                                   (chat_id, request_id, operation)).fetchone()
+            current = db.execute("SELECT COALESCE(max(version),0) FROM attachment_batches WHERE chat_id=%s AND request_id=%s", (chat_id, request_id)).fetchone()[0]
             if existing:
-                if json.loads(existing[0]) != items:
+                if json.loads(existing[0]) != items or existing[1] != expected_version + 1:
                     raise ValueError("Batch identity already used.")
-                return items
-            count = db.execute("SELECT count(*) FROM attachment_batches WHERE chat_id=%s AND request_id=%s", (chat_id, request_id)).fetchone()[0]
-            if count:
-                raise ValueError("This reply already has an attachment batch.")
+                return {"state": "prepared" if existing[1] == current else "superseded", "version": existing[1], "current_version": current, "items": items}
+            if expected_version != current:
+                raise ValueError(f"Attachment version conflict; current version is {current}.")
             for item in items:
                 info = self.describe(item["artifact_id"], chat_id, request_id, db=db)
                 if info["direction"] != "output":
                     raise PermissionError("Output attachment required.")
-                if item["type"] == "image" and (info["size"] > self.policy.image_max_bytes or info["mime"] not in ("image/png", "image/jpeg", "image/webp", "image/gif")):
-                    raise ValueError("Unsupported image presentation.")
-            db.execute("INSERT INTO attachment_batches VALUES (%s,%s,%s,%s)",
-                       (chat_id, request_id, operation, json.dumps(items, ensure_ascii=False)))
-            return items
+                if item["type"] == "image":
+                    if info["size"] > self.policy.image_max_bytes:
+                        raise ValueError("Unsupported image size.")
+                    from .image_validation import validate_image
+                    descriptor = os.open(self.root / info["artifact_id"], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                    with os.fdopen(descriptor, "rb") as file:
+                        mime = validate_image(file, info["mime"])
+                    db.execute("UPDATE artifacts SET presentation_mime=%s WHERE id=%s", (mime, info["artifact_id"]))
+            db.execute("INSERT INTO attachment_batches (chat_id,request_id,operation,items,version,request_key) VALUES (%s,%s,%s,%s,%s,%s)",
+                       (chat_id, request_id, operation, json.dumps(items, ensure_ascii=False), current + 1, request_key))
+            active = [item["artifact_id"] for item in items]
+            # Discarded bytes remain charged until maintenance actually unlinks them.
+            db.execute("""UPDATE artifacts SET state='discarded',expires=%s WHERE chat_id=%s AND request_id=%s
+                AND direction='output' AND state='prepared' AND NOT (id=ANY(%s))""", (self.clock(), chat_id, request_id, active))
+            return {"state": "prepared", "version": current + 1, "current_version": current + 1, "items": items}
 
     def publish(self, db, chat_id, request_id):
         run = db.execute("SELECT state,deadline FROM artifact_runs WHERE chat_id=%s AND request_id=%s FOR UPDATE", (chat_id, request_id)).fetchone()
         if not run or run[0] != "active" or run[1] <= self.clock():
             raise PermissionError("Artifact run no longer active.")
-        rows = db.execute("SELECT items FROM attachment_batches WHERE chat_id=%s AND request_id=%s", (chat_id, request_id)).fetchall()
+        rows = db.execute("SELECT items FROM attachment_batches WHERE chat_id=%s AND request_id=%s ORDER BY version DESC LIMIT 1", (chat_id, request_id)).fetchall()
         items = json.loads(rows[0][0]) if rows else []
         for item in items:
             self.describe(item["artifact_id"], chat_id, request_id, db=db)

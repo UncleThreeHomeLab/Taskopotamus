@@ -9,7 +9,7 @@ chmod 755 /run/sshd
 cp /run/secrets/worker_host_key /run/sshd/host_key
 cp /run/secrets/worker_client_public /run/sshd/authorized_keys
 chmod 600 /run/sshd/host_key /run/sshd/authorized_keys
-python /usr/local/bin/worker-firewall "$WORKER_MCP_IP" "$WORKER_DNS_IP"
+python /usr/local/bin/worker-firewall "$WORKER_MCP_IP" "$WORKER_DNS_IP" "$WORKER_AGENT_IP"
 # Drop the firewall capability before any SSH session or model-generated command can run.
 exec setpriv --bounding-set=-net_admin --inh-caps=-all --ambient-caps=-all \
     python /usr/local/bin/worker-workspace serve

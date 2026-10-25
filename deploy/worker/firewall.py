@@ -10,10 +10,13 @@ BLOCKED_NETWORKS = (
 )
 
 
-def rules(mcp_ip, dns_ip):
+def rules(mcp_ip, dns_ip, agent_ip="10.203.17.30"):
     address = ipaddress.IPv4Address(mcp_ip)
     if not address.is_private or address.is_loopback or address.is_link_local or address.is_unspecified:
         raise ValueError("Worker MCP address must be a private service IPv4 address.")
+    agent = ipaddress.IPv4Address(agent_ip)
+    if not agent.is_private or agent.is_loopback or agent.is_link_local or agent.is_unspecified or agent == address:
+        raise ValueError("Worker attachment address must be a separate private service IPv4 address.")
     resolver = ipaddress.IPv4Address(dns_ip)
     if resolver.is_multicast or resolver.is_unspecified or resolver.is_reserved or resolver.is_link_local or resolver.is_loopback:
         raise ValueError("Worker DNS resolver must be a unicast service IPv4 address.")
@@ -23,6 +26,7 @@ def rules(mcp_ip, dns_ip):
         ["iptables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"],
         ["iptables", "-A", "OUTPUT", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
         ["iptables", "-A", "OUTPUT", "-p", "tcp", "-d", str(address), "--dport", "8080", "-j", "ACCEPT"],
+        ["iptables", "-A", "OUTPUT", "-p", "tcp", "-d", str(agent), "--dport", "8080", "-j", "ACCEPT"],
     ]
     commands.extend(["iptables", "-A", "OUTPUT", "-d", str(resolver), "-p", protocol,
                      "--dport", "53", "-j", "ACCEPT"] for protocol in ("udp", "tcp"))
@@ -33,5 +37,5 @@ def rules(mcp_ip, dns_ip):
 
 
 if __name__ == "__main__":
-    for command in rules(sys.argv[1], sys.argv[2]):
+    for command in rules(sys.argv[1], sys.argv[2], sys.argv[3]):
         subprocess.run(command, check=True, stdout=subprocess.DEVNULL)

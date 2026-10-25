@@ -192,7 +192,10 @@ services:
         condition: service_healthy
       worker:
         condition: service_healthy
-    networks: [execution, database]
+    networks:
+      execution:
+        ipv4_address: ${WORKER_AGENT_IP:-10.203.17.30}
+      database:
     volumes:
       - ${AGENT_INSTRUCTIONS_DIR:-./config/agent}:/app/config/agent:ro
       - ${DATA_DIR:-./storage}/artifacts:/var/lib/taskopotamus/artifacts
@@ -249,6 +252,7 @@ services:
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, SYS_CHROOT, SETPCAP, NET_ADMIN, KILL]
     environment:
       WORKER_MCP_IP: ${WORKER_MCP_IP:-10.203.17.18}
+      WORKER_AGENT_IP: ${WORKER_AGENT_IP:-10.203.17.30}
       WORKER_DNS_IP: ${WORKER_DNS_IP:-1.1.1.1}
       WORKSPACE_RETENTION_SECONDS: ${WORKSPACE_RETENTION_SECONDS:-604800}
       WORKSPACE_SWEEP_SECONDS: ${WORKSPACE_SWEEP_SECONDS:-3600}

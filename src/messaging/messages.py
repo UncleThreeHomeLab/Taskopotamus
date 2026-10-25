@@ -54,5 +54,14 @@ def delivery_items(items):
             result.extend({"type": "text", "text": item["text"][i:i + 2000]}
                           for i in range(0, len(item["text"]), 2000))
         else:
-            result.append(item)
+            caption, units, boundary = item["caption"], 0, 0
+            for character in caption:
+                width = 2 if ord(character) > 0xFFFF else 1
+                if units + width > 1024:
+                    break
+                units += width
+                boundary += 1
+            result.append({**item, "caption": caption[:boundary]})
+            result.extend({"type": "text", "text": caption[i:i + 2000]}
+                          for i in range(boundary, len(caption), 2000))
     return result

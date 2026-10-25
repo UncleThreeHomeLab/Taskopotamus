@@ -1,6 +1,7 @@
 """Bounded byte transport and delivery control; worker tokens only stage output."""
 import json
 import secrets
+import threading
 from urllib.parse import parse_qs, urlsplit
 
 from .artifacts import ArtifactCapacityError
@@ -20,8 +21,8 @@ class MessagingAPI:
             raise ValueError("Invalid request size.")
         return int(value)
 
-    def json_body(self, handler):
-        length = self.body(handler)
+    def json_body(self, handler, maximum=65536):
+        length = self.body(handler, maximum)
         value = json.loads(handler.rfile.read(length))
         if not isinstance(value, dict):
             raise ValueError("Expected an object.")
@@ -31,6 +32,13 @@ class MessagingAPI:
     def fields(payload, expected):
         if set(payload) != set(expected):
             raise ValueError("Invalid request fields.")
+
+    @staticmethod
+    def transfer_deadline(handler):
+        handler.read_deadline.cancel()
+        handler.read_deadline = threading.Timer(90, handler.expire_request)
+        handler.read_deadline.daemon = True
+        handler.read_deadline.start()
 
     def dispatch(self, handler, api_token):
         if not handler.path.startswith("/messaging/"):
@@ -63,9 +71,10 @@ class MessagingAPI:
                 length = self.body(handler, self.artifacts.policy.output_max_bytes if worker else self.artifacts.policy.input_max_bytes)
                 if length != meta["size"]:
                     raise ValueError("Attachment size mismatch.")
+                self.transfer_deadline(handler)
                 data = self.artifacts.upload(chat_id, request_id, direction, meta["operation"], meta["filename"], meta["mime"],
                                              meta["size"], meta["sha256"], handler.rfile, credential if worker else None)
-            elif handler.command == "GET" and parts.path.startswith(("/messaging/artifact/", "/messaging/worker/artifact/")):
+            elif handler.command == "GET" and parts.path.startswith(("/messaging/artifact/", "/messaging/worker/artifact/", "/messaging/metadata/")):
                 artifact_id = opaque_id(parts.path.rsplit("/", 1)[-1])
                 if worker:
                     if query:
@@ -78,8 +87,12 @@ class MessagingAPI:
                     if set(query) != {"chat_id"} or len(query["chat_id"]) != 1:
                         raise ValueError("A conversation is required.")
                     chat_id, request_id, committed = query["chat_id"][0], None, True
+                if parts.path.startswith("/messaging/metadata/"):
+                    handler.send_json(self.artifacts.describe(artifact_id, chat_id, committed=True), 200)
+                    return True
                 info, file = self.artifacts.open(artifact_id, chat_id, request_id, committed)
                 with file:
+                    self.transfer_deadline(handler)
                     streaming = True
                     handler.send_response(200)
                     handler.send_header("Content-Type", "application/octet-stream")
@@ -93,16 +106,24 @@ class MessagingAPI:
                         handler.wfile.write(chunk)
                 return True
             elif handler.command == "POST" and not query:
-                payload = self.json_body(handler)
+                payload = self.json_body(handler, 2 * 1024 * 1024 if worker else 65536)
                 path = parts.path
                 if worker:
-                    if path != "/messaging/worker/batch":
+                    if path == "/messaging/worker/batch-lookup":
+                        self.fields(payload, {"expected_version", "request_key"})
+                        data = {"batch": self.artifacts.batch_lookup(credential, payload["expected_version"], payload["request_key"])}
+                    elif path == "/messaging/worker/batch":
+                        self.fields(payload, {"operation", "items", "expected_version", "request_key"})
+                        data = self.artifacts.prepare_batch(credential, payload["operation"], payload["items"], payload["expected_version"], payload["request_key"])
+                        self.artifacts.maintain()
+                    else:
                         raise PermissionError()
-                    self.fields(payload, {"operation", "items"})
-                    data = {"state": "prepared", "items": self.artifacts.prepare_batch(credential, payload["operation"], payload["items"])}
                 elif path == "/messaging/claim":
                     self.fields(payload, {"allowed_chats"})
                     data = {"delivery": self.deliveries.claim(payload["allowed_chats"])}
+                    delivery = data["delivery"]
+                    if delivery and delivery["item"]["type"] in ("image", "file"):
+                        delivery["artifact"] = self.artifacts.describe(delivery["item"]["artifact_id"], delivery["chat_id"], committed=True)
                 elif path == "/messaging/receipt":
                     self.fields(payload, {"delivery_id", "sequence", "attempt", "state", "receipt"})
                     self.deliveries.acknowledge(payload["delivery_id"], payload["sequence"], payload["attempt"], payload["state"], payload["receipt"])

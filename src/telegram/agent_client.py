@@ -3,6 +3,7 @@ import sys
 import os
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, HTTPRedirectHandler, ProxyHandler, build_opener
+from urllib.parse import quote
 
 from src.runtime import MAX_JSON_RESPONSE_BYTES
 
@@ -102,3 +103,16 @@ class AgentClient:
         return self.request("/messaging/import-legacy", "POST", {
             "chat_id": str(chat_id), "request_id": str(request_id), "chunks": chunks, "next_chunk": next_chunk,
         })
+
+    def artifact_info(self, chat_id, artifact_id):
+        return self.request("/messaging/metadata/" + quote(artifact_id, safe="") + "?chat_id=" + quote(str(chat_id), safe=""))
+
+    def artifact_stream(self, chat_id, artifact_id):
+        request = Request(self.base_url + "/messaging/artifact/" + quote(artifact_id, safe="") + "?chat_id=" + quote(str(chat_id), safe=""),
+                          headers={"Authorization": "Bearer " + self.api_token})
+        try:
+            return self.opener.open(request, timeout=10)
+        except (HTTPError, URLError, OSError) as error:
+            if isinstance(error, HTTPError):
+                error.close()
+            raise AgentRequestError("Attachment unavailable or expired.") from None

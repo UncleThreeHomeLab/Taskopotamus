@@ -6,7 +6,7 @@ import socket
 import threading
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 
 from src.agent.http_server import AgentHTTPServer
 from src.runtime import read_secret
@@ -29,6 +29,7 @@ class ConsoleState:
         self.draft = ""
         self.details = None
         self.uncertain = None
+        self.attachments = {}
 
     def snapshot(self):
         with self.lock:
@@ -87,7 +88,20 @@ class ConsoleState:
                 with self.lock:
                     self.details = result.get("details")
                     if status == "completed":
-                        self.transcript = (self.transcript + [("You", text), ("Agent", result["text"][:32000])])[-20:]
+                        items = result.get("items") if isinstance(result.get("items"), list) else [{"type": "text", "text": result["text"]}]
+                        metadata = result.get("artifacts", {})
+                        rendered = []
+                        for item in items:
+                            if item.get("type") in ("image", "file"):
+                                info = metadata.get(item.get("artifact_id"), {}) if isinstance(metadata, dict) else {}
+                                if info.get("state") == "committed":
+                                    self.attachments[item["artifact_id"]] = info
+                                rendered.append({**item, "metadata": info})
+                            else:
+                                rendered.append(item)
+                        self.transcript = (self.transcript + [("You", text), ("Agent", rendered)])[-20:]
+                        visible = {item.get("artifact_id") for _, entry in self.transcript if isinstance(entry, list) for item in entry}
+                        self.attachments = {key: value for key, value in self.attachments.items() if key in visible}
                         self.draft, self.uncertain = "", None
                         self.notice = "Reply completed."
                     elif status == "failed":
@@ -100,6 +114,7 @@ class ConsoleState:
                 self.client.console_reset()
                 with self.lock:
                     self.transcript, self.details, self.uncertain, self.draft = [], None, None, ""
+                    self.attachments = {}
                     self.notice = "New conversation started. Personal profile is preserved."
             else:
                 self._auth(self.client.login(restart=action == "retry"))
@@ -150,7 +165,7 @@ def make_handler(state):
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+            self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
             self.send_header("X-Frame-Options", "DENY")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "same-origin")
@@ -180,9 +195,62 @@ def make_handler(state):
                 return self.send(403)
             if self.path == "/health":
                 return self.send(200, b"Ready")
+            if self.path.startswith("/artifact/"):
+                return self.artifact()
             if self.path != "/":
                 return self.send(404)
             self.send(200, render(state.snapshot()).encode(), cookie=True)
+
+        def authenticated(self):
+            cookies = SimpleCookie()
+            values = self.headers.get_all("Cookie", [])
+            if len(values) != 1:
+                return False
+            try:
+                cookies.load(values[0])
+                value = cookies.get("console_session")
+                return value is not None and secrets.compare_digest(value.value, state.cookie)
+            except Exception:
+                return False
+
+        def artifact(self):
+            if not self.authenticated():
+                return self.send(403)
+            match = re.fullmatch(r"/artifact/([a-f0-9]{32})(/download)?", self.path)
+            if match is None:
+                return self.send(404)
+            with state.lock:
+                info = state.attachments.get(match[1])
+            if not info:
+                return self.send(404, b"Attachment unavailable or expired.")
+            started = False
+            try:
+                with state.client.artifact_stream("console:local", match[1]) as source:
+                    self.deadline = threading.Timer(90, self.expire)
+                    self.deadline.daemon = True
+                    self.deadline.start()
+                    inline = not match[2] and info.get("presentation_mime") in ("image/png", "image/jpeg")
+                    self.send_response(200)
+                    self.send_header("Content-Type", info["presentation_mime"] if inline else "application/octet-stream")
+                    self.send_header("Content-Disposition", ("inline" if inline else "attachment") + "; filename=\"attachment\"; filename*=UTF-8''" + quote(info["filename"], safe=""))
+                    self.send_header("Content-Length", str(info["size"]))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+                    self.send_header("Connection", "close")
+                    self.close_connection = True
+                    self.end_headers()
+                    started = True
+                    remaining = info["size"]
+                    while remaining:
+                        chunk = source.read(min(65536, remaining))
+                        if not chunk:
+                            raise OSError("Incomplete attachment stream")
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+            except Exception:
+                if not started:
+                    self.send(410, b"Attachment unavailable or expired.")
 
         def do_POST(self):
             try:

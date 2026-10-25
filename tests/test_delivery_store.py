@@ -1,4 +1,5 @@
 import unittest
+import time
 from unittest.mock import Mock, patch
 
 from src.telegram.bot import process_update, deliver_one
@@ -35,6 +36,8 @@ class DeliveryTests(unittest.TestCase):
         self.assertTrue(all(call.args[1] == "sendChatAction" for call in activity.call_args_list))
         with patch("src.telegram.bot.api", side_effect=[{"message_id": 1}, RuntimeError("lost acknowledgement")]) as send:
             self.assertTrue(deliver_one(self.agent, "synthetic-token", {"42"}))
+            with self.database.connect() as db:
+                db.execute("UPDATE delivery_pacing SET not_before=0")
             self.assertTrue(deliver_one(self.agent, "synthetic-token", {"42"}))
             self.assertEqual(send.call_count, 2)
         restarted = Outbox(self.database)
