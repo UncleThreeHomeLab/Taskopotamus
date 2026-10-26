@@ -263,6 +263,111 @@ class InboxTests(unittest.TestCase):
         agent.chat.assert_called_once_with(42, "hello", "10")
         self.assertEqual(self.polling.offset, 101)
 
+    def test_reply_context_survives_restart_and_reaches_text_and_file_requests(self):
+        for identifier, attached in ((10, False), (11, True)):
+            update = self.update(identifier, text="Explain this")
+            if not attached:
+                update["message"].pop("document")
+                update["message"]["text"] = update["message"].pop("caption")
+            update["message"]["reply_to_message"] = {
+                "message_id": 77, "chat": {"id": 42}, "from": {"is_bot": True},
+                "text": "Earlier result", "photo": [{"file_id": "must-not-download"}],
+            }
+            self.inbox.receive(update, {"42"})
+            restarted = Inbox(self.database, clock=lambda: self.now)
+            job = restarted.claim()
+            restarted.finish(identifier, retry=True)
+            job = restarted.claim()
+            agent = Mock()
+            agent.lookup_reply.return_value = None
+            agent.chat.return_value = {"text": "done", "delivery_id": "a" * 32}
+            if attached:
+                job["uploads"] = {"0": {"artifact_id": "b" * 32, "size": 3}}
+            with patch("src.telegram.bot.api", return_value=True), patch("src.telegram.bot.download") as download:
+                process_input(job, restarted, {"42"}, agent, "synthetic", self.polling, threading.Event())
+            download.assert_not_called()
+            arguments = agent.chat.call_args.args
+            self.assertIn('"message_id": 77', arguments[1])
+            self.assertIn("Earlier result", arguments[1])
+            self.assertTrue(arguments[1].endswith("Current user message:\nExplain this"))
+            self.assertEqual(arguments[2], str(identifier))
+            self.assertEqual(arguments[3:] if attached else (), (["b" * 32],) if attached else ())
+
+    def test_album_reference_association_deduplication_and_selected_quotes_survive_restart(self):
+        for identifier, quote in ((10, "First selected part"), (11, "Second selected part"), (12, "First selected part")):
+            update = self.update(identifier, album="references", text=f"caption {identifier}")
+            update["message"]["reply_to_message"] = {
+                "message_id": 77, "chat": {"id": 42}, "text": "Earlier answer",
+                "document": {"file_id": "old-file-never-fetch", "file_name": "private-name"},
+            }
+            update["message"]["quote"] = {"text": quote}
+            self.inbox.receive(update, {"42"})
+        self.now += 2
+        restarted = Inbox(self.database, clock=lambda: self.now)
+        for index in range(3):
+            restarted.save_upload(10, index, {"artifact_id": str(index) * 32, "size": 3})
+        job = restarted.claim()
+        original_messages = json.dumps(job["messages"])
+        agent = Mock()
+        agent.lookup_reply.return_value = None
+        agent.chat.return_value = {"text": "done", "delivery_id": "a" * 32}
+        with patch("src.telegram.bot.api", return_value=True), patch("src.telegram.bot.download") as download:
+            process_input(job, restarted, {"42"}, agent, "synthetic", self.polling, threading.Event())
+        download.assert_not_called()
+        prompt = agent.chat.call_args.args[1]
+        contexts = json.loads(prompt.split("\n", 1)[1].split("\n\nCurrent user message:")[0])
+        self.assertEqual([(item["quote"], item["source_attachments"]) for item in contexts],
+                         [("First selected part", [1, 3]), ("Second selected part", [2])])
+        self.assertTrue(prompt.endswith("Attachment 1: caption 10\nAttachment 2: caption 11\nAttachment 3: caption 12"))
+        self.assertNotIn("old-file-never-fetch", prompt)
+        self.assertNotIn("private-name", prompt)
+        self.assertEqual(json.dumps(job["messages"]), original_messages)
+        self.assertEqual(agent.chat.call_args.args[3], [str(index) * 32 for index in range(3)])
+
+    def test_reference_prompt_and_request_identity_are_identical_after_uncertain_retry(self):
+        for identifier, attached in ((10, False), (11, True)):
+            update = self.update(identifier, text="Explain")
+            if not attached:
+                update["message"].pop("document")
+                update["message"]["text"] = update["message"].pop("caption")
+            update["message"]["reply_to_message"] = {"message_id": 77, "chat": {"id": 42}, "text": "Earlier"}
+            self.inbox.receive(update, {"42"})
+            if attached:
+                self.inbox.save_upload(identifier, 0, {"artifact_id": "b" * 32, "size": 3})
+            agent = Mock()
+            agent.lookup_reply.return_value = None
+            agent.chat.side_effect = [AgentRequestError("uncertain", 503), {"text": "done", "delivery_id": "a" * 32}]
+            with patch("src.telegram.bot.api", return_value=True), patch("src.telegram.bot.download") as download:
+                with self.assertRaises(AgentRequestError):
+                    process_input(self.inbox.claim(), self.inbox, {"42"}, agent, "synthetic", self.polling, threading.Event())
+                restarted = Inbox(self.database, clock=lambda: self.now)
+                restarted.recover()
+                process_input(restarted.claim(), restarted, {"42"}, agent, "synthetic", self.polling, threading.Event())
+                self.assertEqual(agent.chat.call_args_list[0], agent.chat.call_args_list[1])
+                self.assertEqual(agent.chat.call_args.args[2], str(identifier))
+                # A recovered uncertain request with a confirmed cached result must not infer again.
+                restarted.finish(identifier, retry=True)
+                self.polling.mark_uncertain(identifier)
+                agent.lookup_reply.return_value = {"delivery_id": "a" * 32}
+                process_input(restarted.claim(), restarted, {"42"}, agent, "synthetic", self.polling, threading.Event())
+            download.assert_not_called()
+            self.assertEqual(agent.chat.call_count, 2)
+
+    def test_persisted_text_album_keeps_all_references(self):
+        for identifier in (10, 11):
+            update = self.update(identifier, album="text-references", text=f"part {identifier}")
+            update["message"].pop("document")
+            update["message"]["reply_to_message"] = {"message_id": identifier, "chat": {"id": 42}, "text": "Earlier"}
+            self.inbox.receive(update, {"42"})
+        self.now += 2
+        agent = Mock()
+        agent.chat.return_value = {"text": "done", "delivery_id": "a" * 32}
+        with patch("src.telegram.bot.api", return_value=True):
+            process_input(self.inbox.claim(), self.inbox, {"42"}, agent, "synthetic", self.polling, threading.Event())
+        prompt = agent.chat.call_args.args[1]
+        self.assertIn('"message_id": 10', prompt)
+        self.assertIn('"message_id": 11', prompt)
+
     def test_text_crash_intent_survives_restart_and_busy_cannot_replace_original_success(self):
         from src.messaging.delivery_store import DeliveryStore as Outbox
 
