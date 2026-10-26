@@ -1,6 +1,7 @@
 """Private immutable file snapshots and revocable request-scoped worker access."""
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -173,17 +174,22 @@ class ArtifactStore:
             ).fetchone()
             return self.describe(row[0], chat_id, request_id, db=db) if row else None
 
-    def begin_run(self, chat_id, request_id, seconds):
+    def begin_run(self, chat_id, request_id, seconds, deadline=None):
         identity(chat_id, request_id)
-        if type(seconds) is not int or not 1 <= seconds <= 1830:
+        if type(seconds) not in (int, float) or not math.isfinite(seconds) or not 0 < seconds <= 1830:
             raise ValueError("Invalid run lifetime.")
+        expires = self.clock() + seconds
+        if deadline is not None:
+            if type(deadline) not in (int, float) or not math.isfinite(deadline):
+                raise ValueError("Invalid run deadline.")
+            expires = min(expires, deadline)
         token = secrets.token_urlsafe(32)
         with self.database.connect() as db:
             changed = db.execute(
                 """INSERT INTO artifact_runs VALUES (%s,%s,'active',%s,%s)
                 ON CONFLICT(chat_id,request_id) DO UPDATE SET state='active',capability=EXCLUDED.capability,deadline=EXCLUDED.deadline
                 WHERE artifact_runs.state!='active' OR artifact_runs.deadline<=%s""",
-                (chat_id, request_id, hashlib.sha256(token.encode()).hexdigest(), self.clock() + seconds, self.clock()),
+                (chat_id, request_id, hashlib.sha256(token.encode()).hexdigest(), expires, self.clock()),
             ).rowcount
             if changed != 1:
                 raise BlockingIOError("Artifact run is already active.")
@@ -193,12 +199,19 @@ class ArtifactStore:
         if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
             raise PermissionError("Invalid artifact capability.")
         row = db.execute(
-            "SELECT chat_id,request_id FROM artifact_runs WHERE capability=%s AND state='active' AND deadline>%s FOR UPDATE",
-            (hashlib.sha256(token.encode()).hexdigest(), self.clock()),
+            "SELECT chat_id,request_id,deadline FROM artifact_runs WHERE capability=%s AND state='active' FOR UPDATE",
+            (hashlib.sha256(token.encode()).hexdigest(),),
         ).fetchone()
-        if row is None:
+        if row is None or row[2] <= self.clock():
             raise PermissionError("Artifact capability expired or revoked.")
-        return row
+        return row[:2]
+
+    def active_run(self, db, chat_id, request_id):
+        row = db.execute("SELECT state,deadline FROM artifact_runs WHERE chat_id=%s AND request_id=%s FOR UPDATE",
+                         (chat_id, request_id)).fetchone()
+        if row is None or row[0] != "active" or row[1] <= self.clock():
+            raise PermissionError("Artifact run no longer active.")
+        return row[1]
 
     def scope(self, token):
         with self.database.connect() as db:
@@ -380,16 +393,28 @@ class ArtifactStore:
             return {"state": "prepared", "version": current + 1, "current_version": current + 1, "items": items}
 
     def publish(self, db, chat_id, request_id):
-        run = db.execute("SELECT state,deadline FROM artifact_runs WHERE chat_id=%s AND request_id=%s FOR UPDATE", (chat_id, request_id)).fetchone()
-        if not run or run[0] != "active" or run[1] <= self.clock():
-            raise PermissionError("Artifact run no longer active.")
+        self.active_run(db, chat_id, request_id)
         rows = db.execute("SELECT items FROM attachment_batches WHERE chat_id=%s AND request_id=%s ORDER BY version DESC LIMIT 1", (chat_id, request_id)).fetchall()
         items = json.loads(rows[0][0]) if rows else []
-        for item in items:
-            self.describe(item["artifact_id"], chat_id, request_id, db=db)
-            db.execute("UPDATE artifacts SET state='committed',expires=%s WHERE id=%s", (self.clock() + self.policy.retention_seconds, item["artifact_id"]))
+        self.commit_outputs(db, chat_id, request_id, items)
+        self.active_run(db, chat_id, request_id)
         self.end_run(db, chat_id, request_id, "completed")
         return items
+
+    def commit_outputs(self, db, chat_id, request_id, items, images=None):
+        identifiers = sorted({item["artifact_id"] for item in items if item["type"] != "text"})
+        if identifiers:
+            # Maintenance updates metadata before unlinking bytes. Lock first, then read fresh state and time.
+            db.execute("SELECT id FROM artifacts WHERE id=ANY(%s) ORDER BY id FOR UPDATE", (identifiers,)).fetchall()
+        for item in items:
+            if item["type"] == "text":
+                continue
+            info = self.describe(item["artifact_id"], chat_id, request_id, db=db)
+            if info["direction"] != "output":
+                raise PermissionError("Output attachment required.")
+            db.execute("""UPDATE artifacts SET state='committed',expires=GREATEST(expires,%s),
+                presentation_mime=COALESCE(%s,presentation_mime) WHERE id=%s""",
+                (self.clock() + self.policy.retention_seconds, (images or {}).get(item["artifact_id"]), item["artifact_id"]))
 
     def maintain(self):
         now = self.clock()

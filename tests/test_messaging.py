@@ -19,6 +19,7 @@ from src.agent.server import make_handler
 from src.messaging.artifacts import ArtifactCapacityError, ArtifactPolicy, ArtifactStore
 from src.messaging.delivery_store import DeliveryStore
 from src.messaging.http_api import MessagingAPI
+from src.messaging.message_publication import MessagePublication
 from src.telegram.agent_client import AgentClient
 from src.telegram.bot import process_update
 from src.telegram.delivery_store import DeliveryStore as PollingStore
@@ -278,7 +279,7 @@ class MessagingTests(unittest.TestCase):
         self.assertEqual(chat.reply("42", "hello", "1", include_details=True), result)
         turn.run.assert_not_called()
 
-    def test_oversized_terminal_after_full_progress_commits_failure_and_preserves_updates(self):
+    def test_native_final_is_ignored_after_full_queued_progress(self):
         chat, turn = self.chat()
         response = turn.run.return_value
         response.final_response = "x" * 1025
@@ -290,13 +291,337 @@ class MessagingTests(unittest.TestCase):
             return response
 
         turn.run.side_effect = run
-        with self.assertRaises(ValueError):
-            chat.reply("42", "hello", "1")
         result = chat.reply("42", "hello", "1", include_details=True)
-        self.assertEqual((result["status"], len(result["items"])), ("failed", 32))
-        self.assertEqual(result["items"][:31], progress)
-        self.assertIn("could not finish", result["items"][-1]["text"])
+        self.assertEqual((result["status"], len(result["items"])), ("completed", 31))
+        self.assertEqual(result["items"], progress)
+        self.assertEqual(chat.reply("42", "hello", "1", include_details=True), result)
         turn.run.assert_called_once()
+
+    def test_scoped_messages_hide_native_final_and_replay_visible_text(self):
+        chat, turn = self.chat()
+        response = turn.run.return_value
+        response.final_response = "INTERNAL FINAL MUST NEVER LEAK"
+        publisher = MessagePublication(self.artifacts, self.deliveries)
+
+        def run():
+            cap = issued[0]
+            publisher.send(cap, "progress", "a" * 64, [{"type": "text", "text": "Working"}])
+            self.assertIsNone(self.deliveries.get("42", "1"))
+            self.assertEqual(self.deliveries.claim(["42"])["item"]["text"], "Working")
+            publisher.send(cap, "result", "b" * 64, [{"type": "text", "text": "Answer"}])
+            return response
+
+        issued = []
+        original = self.artifacts.begin_run
+
+        def begin(*args, **kwargs):
+            token = original(*args, **kwargs)
+            issued.append(token)
+            return token
+
+        turn.run.side_effect = run
+        with patch.object(self.artifacts, "begin_run", side_effect=begin):
+            result = chat.reply("42", "hello", "1", include_details=True)
+        self.assertEqual(result["text"], "Working\n\nAnswer")
+        self.assertEqual([i["text"] for i in result["items"]], ["Working", "Answer"])
+        self.assertNotIn("INTERNAL", json.dumps(result))
+        self.assertEqual(chat.reply("42", "hello", "1", include_details=True), result)
+        turn.run.assert_called_once()
+
+    def test_image_only_empty_native_final_and_legacy_mixed_suppression(self):
+        from PIL import Image
+
+        self.artifacts.policy = ArtifactPolicy(output_max_bytes=10000, image_max_bytes=10000, capacity_bytes=100000)
+        chat, turn = self.chat()
+        response = turn.run.return_value
+        response.final_response = ""
+        content = io.BytesIO()
+        Image.new("RGB", (2, 2), "red").save(content, format="PNG")
+        image = content.getvalue()
+
+        def run():
+            cap = issued[0]
+            legacy = self.upload(b"legacy", operation="legacy", capability=cap)
+            self.artifacts.prepare_batch(cap, "legacy", [{"type": "file", "artifact_id": legacy["artifact_id"]}])
+            info = self.artifacts.upload("42", "1", "output", "image", "image.png", "image/png", len(image),
+                                         hashlib.sha256(image).hexdigest(), io.BytesIO(image), cap)
+            MessagePublication(self.artifacts, self.deliveries).send(cap, "photo", "c" * 64,
+                [{"type": "image", "artifact_id": info["artifact_id"], "caption": "Only this image"}])
+            return response
+
+        issued, original = [], self.artifacts.begin_run
+
+        def begin(*args, **kwargs):
+            cap = original(*args, **kwargs)
+            issued.append(cap)
+            return cap
+
+        turn.run.side_effect = run
+        with patch.object(self.artifacts, "begin_run", side_effect=begin):
+            result = chat.reply("42", "hello", "1", include_details=True)
+        self.assertEqual((result["text"], len(result["items"]), result["items"][0]["type"]), ("", 1, "image"))
+        self.assertEqual(chat.reply("42", "hello", "1", include_details=True), result)
+        with self.assertRaises(PermissionError):
+            self.artifacts.scope(issued[0])
+
+    def test_zero_message_empty_final_has_bounded_fallback(self):
+        chat, turn = self.chat()
+        turn.run.return_value.final_response = ""
+        result = chat.reply("42", "hello", "1")
+        self.assertEqual(result["reply_status"], "completed")
+        self.assertEqual(len(result["items"]), 1)
+        self.assertTrue(result["text"])
+        self.assertLess(len(result["text"]), 1024)
+
+    def test_caller_timeout_finalizes_while_worker_remains_blocked(self):
+        chat, turn = self.chat(timeout=1)
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        response = turn.run.return_value
+        response.final_response = "LATE INTERNAL SUCCESS"
+
+        def run():
+            with self.database.connect() as db:
+                self.deliveries.append(db, "42", "1", "progress", [{"type": "text", "text": "Working"}])
+            entered.set()
+            release.wait(5)
+            return response
+
+        turn.run.side_effect = run
+        with self.assertRaises(TimeoutError):
+            chat.reply("42", "hello", "1", include_details=True)
+        self.assertTrue(entered.is_set())
+        failed = self.deliveries.get("42", "1")
+        self.assertEqual(failed["reply_status"], "failed")
+        self.assertEqual(len(failed["items"]), 2)
+        self.assertIn("could not finish", failed["items"][-1]["text"])
+        self.assertTrue(chat.lock.locked())
+        with self.assertRaises(BlockingIOError):
+            chat.reply("42", "new", "2")
+        with self.database.connect() as db:
+            self.assertEqual(db.execute("SELECT state,capability FROM artifact_runs").fetchone(), ("failed", None))
+            self.assertEqual(db.execute("SELECT status FROM reply_runs").fetchone()[0], "failed")
+        release.set()
+        self.assertTrue(chat.lock.acquire(timeout=3))
+        chat.lock.release()
+        result = chat.reply("42", "hello", "1", include_details=True)
+        self.assertEqual(result["items"], failed["items"])
+        self.assertNotIn("LATE INTERNAL", json.dumps(result))
+        with self.assertRaises(ValueError):
+            chat.reply("42", "changed", "1")
+        turn.run.assert_called_once()
+
+    def test_timeout_before_request_row_exists_persists_failed_identity(self):
+        chat, turn = self.chat(timeout=0.3)
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        original = chat.codex_factory
+
+        def delayed(*args):
+            entered.set()
+            release.wait(4)
+            return original(*args)
+
+        chat.codex_factory = delayed
+        with self.assertRaises(TimeoutError):
+            chat.reply("42", "hello", "1")
+        self.assertTrue(entered.is_set())
+        self.assertEqual(self.deliveries.get("42", "1")["reply_status"], "failed")
+        release.set()
+        self.assertTrue(chat.lock.acquire(timeout=3))
+        chat.lock.release()
+        self.assertEqual(chat.reply("42", "hello", "1")["reply_status"], "failed")
+        with self.assertRaises(ValueError):
+            chat.reply("42", "different", "1")
+        turn.run.assert_not_called()
+
+    def test_http_worker_message_retry_survives_source_deletion_and_preserves_order(self):
+        from src.worker.message_mcp import MessageClient
+        from src.worker.attachment_mcp import open_output, RequestUncertain
+
+        cap = self.artifacts.begin_run("42", "1", 60)
+        server = self.server()
+        client = MessageClient(cap, "10.203.17.30")
+        client.url = f"http://127.0.0.1:{server.server_port}/messaging/worker"
+        original_request = client.request
+        lost = [True]
+
+        def lost_ack(path, data, headers=None):
+            result = original_request(path, data, headers)
+            if path == "/send" and lost:
+                lost.pop()
+                raise RequestUncertain("Synthetic lost acknowledgement")
+            return result
+
+        client.request = lost_ack
+        with tempfile.TemporaryDirectory() as directory:
+            file = Path(directory) / "report.txt"
+            file.write_bytes(b"result-bytes")
+            parts = [{"type": "text", "text": "Before"}, {"type": "file", "path": str(file), "caption": "Report"},
+                     {"type": "text", "text": "After"}]
+            with patch("src.worker.message_mcp.open_output", side_effect=lambda path: open_output(path, (directory,))):
+                with self.assertRaises(RequestUncertain):
+                    client.send("answer", parts)
+                file.unlink()
+                first = client.send("answer", parts)
+                self.assertEqual(client.send("answer", parts), first)
+                with self.assertRaises(RuntimeError):
+                    client.send("answer", [{"type": "text", "text": "Changed"}])
+        self.assertEqual(first["state"], "queued")
+        snapshot = self.deliveries.snapshot("42", "1")
+        self.assertEqual([i["type"] for i in snapshot["items"]], ["text", "file", "text"])
+        self.assertIsNone(self.deliveries.get("42", "1"))
+        self.assertEqual(self.deliveries.claim(["42"])["item"]["text"], "Before")
+        with self.assertRaises(RuntimeError):
+            client.request("/send", json.dumps({"message_id": "injected", "request_signature": "a" * 64,
+                "items": [{"type": "text", "text": "no"}], "chat_id": "43"}).encode(), {"Content-Type": "application/json"})
+        self.assertIsNone(self.deliveries.snapshot("43", "1"))
+        self.artifacts.cancel_run("42", "1")
+        with self.assertRaises(RuntimeError):
+            client.send("later", [{"type": "text", "text": "No late send"}])
+
+    def test_message_batch_rejects_foreign_artifacts_and_rolls_back_late_expiry(self):
+        cap = self.artifacts.begin_run("42", "1", 10)
+        first = self.upload(capability=cap)
+        foreign = self.upload(chat="43", operation="foreign")
+        publisher = MessagePublication(self.artifacts, self.deliveries)
+        with self.assertRaises(PermissionError):
+            publisher.send(cap, "foreign", "a" * 64, [{"type": "file", "artifact_id": first["artifact_id"]},
+                                                     {"type": "file", "artifact_id": foreign["artifact_id"]}])
+        self.assertEqual(self.artifacts.describe(first["artifact_id"], "42", "1")["state"], "prepared")
+        original = self.deliveries.append
+
+        def expired_after_mutation(*args, **kwargs):
+            result = original(*args, **kwargs)
+            self.now += 11
+            return result
+
+        with patch.object(self.deliveries, "append", side_effect=expired_after_mutation), self.assertRaises(PermissionError):
+            publisher.send(cap, "late", "b" * 64, [{"type": "file", "artifact_id": first["artifact_id"]}])
+        self.assertIsNone(self.deliveries.snapshot("42", "1"))
+        self.assertEqual(self.artifacts.describe(first["artifact_id"], "42", "1")["state"], "prepared")
+
+    def test_send_waiting_on_run_or_request_lock_rejects_expired_authority(self):
+        for request, kind in (("1", "run"), ("2", "outgoing")):
+            cap = self.artifacts.begin_run("42", request, 10)
+            publisher = MessagePublication(self.artifacts, self.deliveries)
+            errors, started = [], threading.Event()
+
+            def send():
+                started.set()
+                try:
+                    publisher.send(cap, "answer", "d" * 64, [{"type": "text", "text": "Too late"}])
+                except Exception as error:
+                    errors.append(error)
+
+            with self.database.connect() as held:
+                if kind == "run":
+                    held.execute("SELECT state FROM artifact_runs WHERE chat_id='42' AND request_id=%s FOR UPDATE", (request,))
+                else:
+                    self.deliveries._lock(held, "42", request)
+                thread = threading.Thread(target=send)
+                thread.start()
+                self.assertTrue(started.wait(1))
+                # Inspect PostgreSQL's actual waiter, rather than trusting a scheduling delay.
+                until = time.monotonic() + 2
+                while time.monotonic() < until:
+                    with self.database.connect() as check:
+                        waiting = check.execute("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock'").fetchone()[0]
+                    if waiting:
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(waiting)
+                self.now += 11
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], PermissionError)
+            self.assertIsNone(self.deliveries.snapshot("42", request))
+
+    def test_capability_creation_does_not_renew_deadline_after_connection_wait(self):
+        from contextlib import contextmanager
+
+        connect = self.database.connect
+        deadline = self.now + 2
+
+        @contextmanager
+        def delayed_connect():
+            with connect() as db:
+                self.now += 3
+                yield db
+
+        with patch.object(self.database, "connect", side_effect=delayed_connect):
+            cap = self.artifacts.begin_run("42", "1", 10, deadline=deadline)
+        with self.database.connect() as db:
+            self.assertEqual(db.execute("SELECT deadline FROM artifact_runs").fetchone()[0], deadline)
+        with self.assertRaises(PermissionError):
+            self.artifacts.scope(cap)
+
+    def test_artifact_lock_wait_cannot_revive_expired_unlinked_outputs(self):
+        from PIL import Image
+
+        self.artifacts.policy = ArtifactPolicy(staging_seconds=10, retention_seconds=1000,
+            output_max_bytes=10000, image_max_bytes=10000, capacity_bytes=100000)
+        for request, kind in (("1", "file"), ("2", "image"), ("3", "legacy")):
+            with self.subTest(kind=kind):
+                cap = self.artifacts.begin_run("42", request, 60)
+                content = io.BytesIO()
+                Image.new("RGB", (2, 2), "blue").save(content, format="PNG")
+                data = content.getvalue()
+                info = self.artifacts.upload("42", request, "output", "source", "picture.png", "image/png", len(data),
+                    hashlib.sha256(data).hexdigest(), io.BytesIO(data), cap)
+                part = {"type": "image" if kind == "image" else "file", "artifact_id": info["artifact_id"], "caption": "Output"}
+                stable = self.artifacts.upload("42", request, "output", "stable", "first.txt", "text/plain", 5,
+                    hashlib.sha256(b"first").hexdigest(), io.BytesIO(b"first"), cap)
+                with self.database.connect() as db:
+                    db.execute("UPDATE artifacts SET expires=%s WHERE id=%s", (self.now + 100, stable["artifact_id"]))
+                parts = [{"type": "file", "artifact_id": stable["artifact_id"]}, part]
+                if kind == "legacy":
+                    self.artifacts.prepare_batch(cap, "legacy", parts)
+                with self.database.connect() as db:
+                    self.deliveries.append(db, "42", request, "progress", [{"type": "text", "text": "Earlier update"}])
+                before = self.deliveries.snapshot("42", request)
+                expires = info["expires_at"]
+                errors = []
+
+                def publish(kind=kind, request=request, cap=cap, parts=parts, errors=errors):
+                    try:
+                        if kind == "legacy":
+                            with self.database.connect() as db:
+                                self.artifacts.publish(db, "42", request)
+                        else:
+                            MessagePublication(self.artifacts, self.deliveries).send(cap, "output", "e" * 64, parts)
+                    except Exception as error:
+                        errors.append(error)
+
+                with self.database.connect() as maintenance:
+                    maintenance.execute("SELECT id FROM artifacts WHERE id=%s FOR UPDATE", (info["artifact_id"],))
+                    sender = threading.Thread(target=publish)
+                    sender.start()
+                    self.addCleanup(sender.join, 3)
+                    until, waiting = time.monotonic() + 2, 0
+                    while time.monotonic() < until:
+                        with self.database.connect() as check:
+                            waiting = check.execute("""SELECT count(*) FROM pg_stat_activity WHERE datname=current_database()
+                                AND wait_event_type='Lock' AND query LIKE 'SELECT id FROM artifacts WHERE id=ANY%%'""").fetchone()[0]
+                        if waiting:
+                            break
+                        time.sleep(0.01)
+                    self.assertTrue(waiting, "Sender must be waiting on the selected artifact row")
+                    self.now = expires + 1
+                    maintenance.execute("UPDATE artifacts SET state='expired' WHERE id=%s", (info["artifact_id"],))
+                    (self.artifacts.root / info["artifact_id"]).unlink()
+                sender.join(3)
+                self.assertFalse(sender.is_alive())
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], PermissionError)
+                self.assertEqual(self.deliveries.snapshot("42", request), before)
+                with self.database.connect() as db:
+                    self.assertEqual(db.execute("SELECT state,expires FROM artifacts WHERE id=%s", (info["artifact_id"],)).fetchone(),
+                                     ("expired", expires))
+                self.assertFalse((self.artifacts.root / info["artifact_id"]).exists())
+                self.assertEqual(self.artifacts.describe(stable["artifact_id"], "42", request)["state"], "prepared")
+                self.assertEqual(self.artifacts.scope(cap), ("42", request))
 
     def test_final_publication_failure_revokes_capability_and_leaves_no_manifest(self):
         chat, turn = self.chat()
@@ -305,7 +630,7 @@ class MessagingTests(unittest.TestCase):
                 chat.reply("42", "hello", "1")
         self.assertIsNone(self.deliveries.get("42", "1"))
         with self.database.connect() as db:
-            self.assertEqual(db.execute("SELECT state,capability FROM artifact_runs").fetchone(), ("failed", None))
+            self.assertEqual(db.execute("SELECT state,capability FROM artifact_runs").fetchone(), ("cancelled", None))
         replay = chat.reply("42", "hello", "1")
         self.assertIn("could not finish", replay["text"])
         turn.run.assert_called_once()
@@ -332,7 +657,7 @@ class MessagingTests(unittest.TestCase):
         original = self.artifacts.begin_run
         issued = []
 
-        def begin(chat_id, request_id, seconds):
+        def begin(chat_id, request_id, seconds, **kwargs):
             token = original(chat_id, request_id, 60)
             issued.append(token)
             return token
@@ -354,7 +679,7 @@ class MessagingTests(unittest.TestCase):
         self.assertEqual(failure["reply_status"], "failed")
         self.assertTrue(all(item["type"] == "text" for item in failure["items"]))
         with self.database.connect() as db:
-            self.assertEqual(db.execute("SELECT state,capability FROM artifact_runs").fetchone(), ("cancelled", None))
+            self.assertEqual(db.execute("SELECT state,capability FROM artifact_runs").fetchone(), ("failed", None))
 
     def server(self, chat=None):
         handler = make_handler(Mock(), TOKEN, chat=chat, messaging=MessagingAPI(self.deliveries, self.artifacts))

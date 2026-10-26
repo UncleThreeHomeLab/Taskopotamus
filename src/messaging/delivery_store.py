@@ -36,6 +36,7 @@ class DeliveryStore:
             db.execute("""CREATE TABLE IF NOT EXISTS outgoing_batches (
                 reply_id TEXT REFERENCES outgoing_replies(id), message_key TEXT NOT NULL, items TEXT NOT NULL,
                 PRIMARY KEY(reply_id,message_key))""")
+            db.execute("ALTER TABLE outgoing_batches ADD COLUMN IF NOT EXISTS request_signature TEXT")
 
     def reserve_command(self, chat_id, request_id, command):
         identity(chat_id, request_id)
@@ -83,20 +84,20 @@ class DeliveryStore:
         identity(chat_id, request_id)
         db.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", ("outgoing:" + chat_id + ":" + request_id,))
 
-    def append(self, db, chat_id, request_id, message_key, items):
+    def append(self, db, chat_id, request_id, message_key, items, request_signature=None):
         if not isinstance(message_key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", message_key):
             raise ValueError("Invalid message identity.")
-        return self._append(db, chat_id, request_id, message_key, items)
+        return self._append(db, chat_id, request_id, message_key, items, request_signature=request_signature)
 
-    def _append(self, db, chat_id, request_id, message_key, items, terminal=False, legacy_next=None):
+    def _append(self, db, chat_id, request_id, message_key, items, terminal=False, legacy_next=None, request_signature=None):
         channel, items = identity(chat_id, request_id), validate_items(items)
         self._lock(db, chat_id, request_id)
         existing = self.snapshot(chat_id, request_id, db)
         if existing:
-            prior = db.execute("SELECT items FROM outgoing_batches WHERE reply_id=%s AND message_key=%s",
+            prior = db.execute("SELECT items,request_signature FROM outgoing_batches WHERE reply_id=%s AND message_key=%s",
                                (existing["delivery_id"], message_key)).fetchone()
             if prior:
-                if json.loads(prior[0]) != items:
+                if json.loads(prior[0]) != items or prior[1] != request_signature:
                     raise ValueError("Message identity already used.")
                 return existing["delivery_id"]
             if existing["reply_status"] != "pending" or existing["expires_at"] <= self.clock() and not terminal:
@@ -130,8 +131,19 @@ class DeliveryStore:
             db.execute("""INSERT INTO outgoing_items (reply_id,sequence,item,state,attempt,claimed,receipt)
                 VALUES (%s,%s,%s,%s,NULL,NULL,%s)""",
                        (reply_id, sequence, json.dumps(item, ensure_ascii=False), state, receipt))
-        db.execute("INSERT INTO outgoing_batches VALUES (%s,%s,%s)", (reply_id, message_key, serialized))
+        db.execute("INSERT INTO outgoing_batches (reply_id,message_key,items,request_signature) VALUES (%s,%s,%s,%s)",
+                   (reply_id, message_key, serialized, request_signature))
         return reply_id
+
+    def message_lookup(self, db, chat_id, request_id, message_key, request_signature):
+        row = db.execute("""SELECT r.id,b.items,b.request_signature FROM outgoing_batches b JOIN outgoing_replies r
+            ON r.id=b.reply_id WHERE r.chat_id=%s AND r.request_id=%s AND b.message_key=%s""",
+            (chat_id, request_id, message_key)).fetchone()
+        if row is None:
+            return None
+        if row[2] != request_signature:
+            raise ValueError("Message identity already used for different arguments.")
+        return {"state": "queued", "delivery_id": row[0], "items": json.loads(row[1])}
 
     def finish(self, db, chat_id, request_id, outcome="completed", items=None, legacy_next=None):
         if outcome not in ("completed", "failed"):
