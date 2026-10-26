@@ -1,5 +1,6 @@
 """One durable owner of outgoing replies and external-send uncertainty."""
 import json
+import re
 import time
 import uuid
 
@@ -32,6 +33,9 @@ class DeliveryStore:
             db.execute("""CREATE TABLE IF NOT EXISTS local_commands (
                 chat_id TEXT, request_id TEXT, command TEXT NOT NULL, attempt TEXT NOT NULL,
                 state TEXT NOT NULL, PRIMARY KEY(chat_id,request_id))""")
+            db.execute("""CREATE TABLE IF NOT EXISTS outgoing_batches (
+                reply_id TEXT REFERENCES outgoing_replies(id), message_key TEXT NOT NULL, items TEXT NOT NULL,
+                PRIMARY KEY(reply_id,message_key))""")
 
     def reserve_command(self, chat_id, request_id, command):
         identity(chat_id, request_id)
@@ -74,22 +78,51 @@ class DeliveryStore:
             db.execute("UPDATE local_commands SET state='completed' WHERE chat_id=%s AND request_id=%s", (chat_id, request_id))
             return self.get(chat_id, request_id, db)
 
-    def publish(self, db, chat_id, request_id, items, legacy_next=None, outcome="completed"):
+    @staticmethod
+    def _lock(db, chat_id, request_id):
+        identity(chat_id, request_id)
+        db.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", ("outgoing:" + chat_id + ":" + request_id,))
+
+    def append(self, db, chat_id, request_id, message_key, items):
+        if not isinstance(message_key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", message_key):
+            raise ValueError("Invalid message identity.")
+        return self._append(db, chat_id, request_id, message_key, items)
+
+    def _append(self, db, chat_id, request_id, message_key, items, terminal=False, legacy_next=None):
         channel, items = identity(chat_id, request_id), validate_items(items)
-        if outcome not in ("completed", "failed"):
-            raise ValueError("Invalid reply outcome.")
-        serialized = json.dumps(items, ensure_ascii=False)
-        existing = db.execute("SELECT id, items FROM outgoing_replies WHERE chat_id=%s AND request_id=%s FOR UPDATE",
-                              (chat_id, request_id)).fetchone()
+        self._lock(db, chat_id, request_id)
+        existing = self.snapshot(chat_id, request_id, db)
         if existing:
-            if json.loads(existing[1]) != items:
-                raise ValueError("Reply identity already used.")
-            return existing[0]
-        reply_id, now = uuid.uuid4().hex, self.clock()
-        db.execute("""INSERT INTO outgoing_replies (id,chat_id,request_id,channel,items,created,expires,outcome)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
-                   (reply_id, chat_id, request_id, channel, serialized, now, now + self.retention, outcome))
-        for sequence, item in enumerate(delivery_items(items)):
+            prior = db.execute("SELECT items FROM outgoing_batches WHERE reply_id=%s AND message_key=%s",
+                               (existing["delivery_id"], message_key)).fetchone()
+            if prior:
+                if json.loads(prior[0]) != items:
+                    raise ValueError("Message identity already used.")
+                return existing["delivery_id"]
+            if existing["reply_status"] != "pending" or existing["expires_at"] <= self.clock() and not terminal:
+                raise ValueError("Reply is closed or expired.")
+        combined = validate_items((existing["items"] if existing else []) + items)
+        # Leave one application-only text item available for a truthful failure or interruption notice.
+        if not terminal and (len(combined) > 31 or sum(len(i["text"]) for i in combined if i["type"] == "text") > 62976):
+            raise ValueError("Message limit reached; terminal notice capacity is reserved.")
+        for item in items:
+            if item["type"] in ("image", "file"):
+                available = db.execute("""SELECT 1 FROM artifacts WHERE id=%s AND chat_id=%s AND request_id=%s
+                    AND direction='output' AND state='committed' AND expires>%s""",
+                    (item["artifact_id"], chat_id, request_id, self.clock())).fetchone()
+                if not available:
+                    raise ValueError("Committed output attachment required.")
+        serialized = json.dumps(items, ensure_ascii=False)
+        if existing:
+            reply_id = existing["delivery_id"]
+            db.execute("UPDATE outgoing_replies SET items=%s WHERE id=%s", (json.dumps(combined, ensure_ascii=False), reply_id))
+        else:
+            reply_id, now = uuid.uuid4().hex, self.clock()
+            db.execute("""INSERT INTO outgoing_replies (id,chat_id,request_id,channel,items,created,expires,outcome)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,'pending')""",
+                (reply_id, chat_id, request_id, channel, serialized, now, now + self.retention))
+        offset = db.execute("SELECT COALESCE(max(sequence)+1,0) FROM outgoing_items WHERE reply_id=%s", (reply_id,)).fetchone()[0]
+        for sequence, item in enumerate(delivery_items(items), offset):
             state, receipt = ("available" if channel == "console" else "pending"), None
             if legacy_next is not None:
                 state = "delivered" if sequence < legacy_next else "uncertain" if sequence == legacy_next else "pending"
@@ -97,13 +130,49 @@ class DeliveryStore:
             db.execute("""INSERT INTO outgoing_items (reply_id,sequence,item,state,attempt,claimed,receipt)
                 VALUES (%s,%s,%s,%s,NULL,NULL,%s)""",
                        (reply_id, sequence, json.dumps(item, ensure_ascii=False), state, receipt))
+        db.execute("INSERT INTO outgoing_batches VALUES (%s,%s,%s)", (reply_id, message_key, serialized))
         return reply_id
 
+    def finish(self, db, chat_id, request_id, outcome="completed", items=None, legacy_next=None):
+        if outcome not in ("completed", "failed"):
+            raise ValueError("Invalid reply outcome.")
+        self._lock(db, chat_id, request_id)
+        existing = self.snapshot(chat_id, request_id, db)
+        if existing and existing["reply_status"] != "pending":
+            prior = db.execute("SELECT items FROM outgoing_batches WHERE reply_id=%s AND message_key='application:terminal'",
+                               (existing["delivery_id"],)).fetchone()
+            expected = json.loads(prior[0]) if prior else existing["items"]
+            if existing["reply_status"] != outcome or items is not None and validate_items(items) != expected:
+                raise ValueError("Reply identity already used.")
+            return existing["delivery_id"]
+        expired = existing is not None and existing["expires_at"] <= self.clock()
+        if expired and outcome != "failed":
+            raise ValueError("Expired requests must finish as failed.")
+        if items is not None:
+            reply_id = self._append(db, chat_id, request_id, "application:terminal", items, terminal=True, legacy_next=legacy_next)
+        elif existing:
+            reply_id = existing["delivery_id"]
+        else:
+            raise ValueError("A reply must contain a message.")
+        db.execute("UPDATE outgoing_replies SET outcome=%s WHERE id=%s", (outcome, reply_id))
+        if expired:
+            # Record the failure without renewing expired messages or changing existing send receipts.
+            db.execute("UPDATE outgoing_items SET state='expired' WHERE reply_id=%s AND state IN ('pending','available')",
+                       (reply_id,))
+        return reply_id
+
+    def publish(self, db, chat_id, request_id, items, legacy_next=None, outcome="completed"):
+        return self.finish(db, chat_id, request_id, outcome, items, legacy_next)
+
     def get(self, chat_id, request_id, db=None):
+        result = self.snapshot(chat_id, request_id, db)
+        return result if result and result["reply_status"] != "pending" else None
+
+    def snapshot(self, chat_id, request_id, db=None):
         identity(chat_id, request_id)
         if db is None:
             with self.database.connect() as connection:
-                return self.get(chat_id, request_id, connection)
+                return self.snapshot(chat_id, request_id, connection)
         row = db.execute("SELECT id,items,expires,outcome FROM outgoing_replies WHERE chat_id=%s AND request_id=%s",
                          (chat_id, request_id)).fetchone()
         if row is None:

@@ -137,6 +137,13 @@ class ChatService:
                 # A crash may leave uncertain work. Fail closed instead of charging for it again.
                 result = {"text": row[1] or "Previous request was interrupted. Please send your message again."}
                 manifest = self.deliveries.get(chat_id, request_id, db)
+                if row[1] is None and manifest is None and self.deliveries.snapshot(chat_id, request_id, db):
+                    notice = "Previous request was interrupted. Its effects may be incomplete; check before trying again."
+                    self.deliveries.publish(db, chat_id, request_id, [{"type": "text", "text": notice}], outcome="failed")
+                    db.execute("UPDATE replies SET reply=%s WHERE chat_id=%s AND request_id=%s", (notice, chat_id, request_id))
+                    db.commit()
+                    result["text"] = notice
+                    manifest = self.deliveries.get(chat_id, request_id, db)
                 result.update(manifest or {"items": [{"type": "text", "text": result["text"]}]})
                 self._artifact_metadata(result, chat_id, db)
                 if include_details:

@@ -138,6 +138,20 @@ class MessagingAPI:
                 elif path == "/messaging/lookup":
                     self.fields(payload, {"chat_id", "request_id"})
                     data = {"reply": self.deliveries.get(payload["chat_id"], payload["request_id"])}
+                elif path == "/messaging/snapshot":
+                    self.fields(payload, {"chat_id", "request_id"})
+                    reply = self.deliveries.snapshot(payload["chat_id"], payload["request_id"])
+                    if reply:
+                        reply["artifacts"] = {}
+                        for item in reply["items"]:
+                            if item["type"] in ("image", "file"):
+                                try:
+                                    reply["artifacts"][item["artifact_id"]] = self.artifacts.describe(
+                                        item["artifact_id"], payload["chat_id"], committed=True
+                                    )
+                                except PermissionError:
+                                    reply["artifacts"][item["artifact_id"]] = {"available": False}
+                    data = {"reply": reply}
                 elif path == '/messaging/input-lookup':
                     self.fields(payload,{'chat_id','request_id','operation'})
                     data = {'artifact':self.artifacts.lookup_input(payload['chat_id'],payload['request_id'],payload['operation'])}

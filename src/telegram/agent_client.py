@@ -135,6 +135,9 @@ class AgentClient:
             "reply"
         ]
 
+    def snapshot_reply(self, chat_id, request_id):
+        return self.request("/messaging/snapshot", "POST", {"chat_id": str(chat_id), "request_id": str(request_id)})["reply"]
+
     def reserve_command(self, chat_id, request_id, command):
         return self.request("/messaging/local-command", "POST", {"chat_id": str(chat_id), "request_id": str(request_id), "command": command})
 

@@ -103,6 +103,53 @@ class ConsoleTests(unittest.TestCase):
         self.client.console_chat.assert_not_called()
         self.assertEqual(self.request(headers={"Origin": "null"})[0], 403)
 
+    def test_pending_http_refresh_shows_early_items_once_and_final_replaces_same_view(self):
+        release, entered = threading.Event(), threading.Event()
+        identifier = "b" * 32
+        items = [{"type": "text", "text": "Progress <script>"},
+                 {"type": "file", "artifact_id": identifier, "caption": "Early document"}]
+        info = {"state": "committed", "filename": "early.txt", "size": 5}
+        self.client.snapshot_reply.return_value = {"reply_status": "pending", "items": items, "artifacts": {identifier: info}}
+        self.client.artifact_stream.side_effect = lambda *_: io.BytesIO(b"early")
+
+        def blocked(*_):
+            entered.set()
+            if not release.wait(3):
+                raise AssertionError("Synthetic inference did not resume")
+            return {"text": "Done", "status": "completed", "items": items + [{"type": "text", "text": "Done"}],
+                    "artifacts": {identifier: info}}
+
+        self.client.console_chat.side_effect = blocked
+        self.addCleanup(release.set)
+        self.state.submit("chat", self.state.nonce, "work")
+        self.assertTrue(entered.wait(2))
+        cookie = {"Cookie": f"console_session={self.state.cookie}"}
+        self.request()
+        self.client.snapshot_reply.assert_not_called()
+        body = self.request(headers=cookie)[2]
+        self.assertIn("Progress &lt;script&gt;", body)
+        self.assertTrue(self.state.pending)
+        self.assertEqual(self.request(path=f"/artifact/{identifier}/download", headers=cookie)[2], "early")
+        self.assertEqual(self.request(path=f"/artifact/{identifier}/download")[0], 403)
+        self.request(headers=cookie)
+        self.assertEqual(len(self.state.transcript), 2)
+        release.set()
+        finished(self.state)
+        self.assertEqual(len(self.state.transcript), 2)
+        self.assertEqual([i.get("text") for i in self.state.transcript[-1][1]], ["Progress <script>", None, "Done"])
+        self.assertEqual(self.state.notice, "Reply completed.")
+
+    def test_failed_request_keeps_queued_progress_and_terminal_notice_visible(self):
+        items = [{"type": "text", "text": "Started"}, {"type": "text", "text": "Work could not finish."}]
+        self.client.snapshot_reply.return_value = {"reply_status": "failed", "items": items}
+        self.client.console_chat.side_effect = AgentRequestError("synthetic-private-error", 500)
+        self.state.submit("chat", self.state.nonce, "work")
+        finished(self.state)
+        self.assertEqual(self.state.transcript, [("You", "work"), ("Agent", items)])
+        self.assertIsNone(self.state.uncertain)
+        self.assertIn("could not finish", self.state.notice)
+        self.assertNotIn("synthetic-private", self.request()[2])
+
     def test_duplicate_send_and_refresh_run_one_turn_and_escape_output(self):
         fields = self.fields("<script>input</script>")
         self.assertEqual(self.request("POST", "/chat", fields)[0], 303)
