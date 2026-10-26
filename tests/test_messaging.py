@@ -137,6 +137,59 @@ class MessagingTests(unittest.TestCase):
                 raise RuntimeError("synthetic commit failure")
         self.assertIsNone(self.deliveries.get("42", "1"))
 
+    def test_pending_appends_deliver_early_and_preserve_operation_and_receipt_identity(self):
+        first_items = [{"type": "text", "text": "Working"}]
+        with self.database.connect() as db:
+            identifier = self.deliveries.append(db, "42", "1", "update-1", first_items)
+        self.assertIsNone(self.deliveries.get("42", "1"))
+        self.assertEqual(self.deliveries.snapshot("42", "1")["reply_status"], "pending")
+        first = self.deliveries.claim(["42"])
+        self.assertEqual(first["item"], first_items[0])
+        self.deliveries.acknowledge(identifier, first["sequence"], first["attempt"], "delivered", {"message_id": 1})
+        with self.database.connect() as db:
+            self.deliveries.append(db, "42", "1", "update-2", [{"type": "text", "text": "Result"}])
+            self.assertEqual(self.deliveries.append(db, "42", "1", "update-1", first_items), identifier)
+            self.deliveries.finish(db, "42", "1")
+        self.now += 2
+        second = self.deliveries.claim(["42"])
+        self.assertEqual((second["delivery_id"], second["sequence"], second["item"]["text"]), (identifier, 1, "Result"))
+        with self.database.connect() as db:
+            self.assertEqual(self.deliveries.append(db, "42", "1", "update-1", first_items), identifier)
+        for key, items in (("update-1", [{"type": "text", "text": "changed"}]),
+                           ("update-3", first_items), ("application:terminal", first_items)):
+            with self.assertRaises(ValueError), self.database.connect() as db:
+                self.deliveries.append(db, "42", "1", key, items)
+        self.assertIsNone(self.deliveries.snapshot("43", "1"))
+        self.assertEqual(self.deliveries.status("42")[0]["state"], "delivered")
+
+    def test_pending_limits_reserve_atomic_terminal_failure_and_expired_envelope_stays_closed(self):
+        progress = [{"type": "text", "text": "x" * 62946}] + [{"type": "text", "text": "x"}] * 30
+        with self.assertRaises(ValueError), self.database.connect() as db:
+            self.deliveries.append(db, "42", "3", "oversized", [{"type": "text", "text": "x" * 62977}])
+        self.assertIsNone(self.deliveries.snapshot("42", "3"))
+        with self.database.connect() as db:
+            self.deliveries.append(db, "42", "1", "progress", progress)
+        for key, items in (("extra", [{"type": "text", "text": "more"}]),
+                           ("extra", [{"type": "text", "text": "x" * 1025}])):
+            with self.assertRaises(ValueError), self.database.connect() as db:
+                self.deliveries.append(db, "42", "1", key, items)
+        with self.assertRaises(ValueError), self.database.connect() as db:
+            self.deliveries.publish(db, "42", "1", [{"type": "text", "text": "x" * 1025}])
+        notice = [{"type": "text", "text": "Application could not complete this request."}]
+        with self.database.connect() as db:
+            self.deliveries.publish(db, "42", "1", notice, outcome="failed")
+        with self.database.connect() as db:
+            self.deliveries.publish(db, "42", "1", notice, outcome="failed")
+        reply = self.deliveries.get("42", "1")
+        self.assertEqual((reply["reply_status"], len(reply["items"])), ("failed", 32))
+        self.assertLessEqual(sum(len(i["text"]) for i in reply["items"]), 64000)
+        with self.database.connect() as db:
+            self.deliveries.append(db, "42", "2", "first", [{"type": "text", "text": "pending"}])
+        self.now += 1001
+        with self.assertRaises(ValueError), self.database.connect() as db:
+            self.deliveries.append(db, "42", "2", "second", notice)
+        self.assertEqual(self.deliveries.snapshot("42", "2")["items"], [{"type": "text", "text": "pending"}])
+
     def chat(self, timeout=180):
         codex, thread, turn = Mock(), Mock(), Mock()
         codex.account.return_value = SimpleNamespace(account={"synthetic": True})
@@ -146,6 +199,104 @@ class MessagingTests(unittest.TestCase):
         turn.run.return_value = SimpleNamespace(status=SimpleNamespace(value="completed"), final_response="done", usage=None)
         chat = ChatService(lambda *_: nullcontext(codex), self.database, turn_timeout=timeout, artifacts=self.artifacts, deliveries=self.deliveries)
         return chat, turn
+
+    def test_expired_pending_failure_closes_without_reviving_messages_or_receipts(self):
+        progress = [{"type": "text", "text": "Already sent"}]
+        with self.database.connect() as db:
+            identifier = self.deliveries.append(db, "42", "1", "first", progress)
+        first = self.deliveries.claim(["42"])
+        receipt = {"message_id": 11}
+        self.deliveries.acknowledge(identifier, 0, first["attempt"], "delivered", receipt)
+        with self.database.connect() as db:
+            self.deliveries.append(db, "42", "1", "second", [{"type": "text", "text": "Unsent update"}])
+        expires = self.deliveries.snapshot("42", "1")["expires_at"]
+        self.now += 1001
+        with self.assertRaises(ValueError), self.database.connect() as db:
+            self.deliveries.finish(db, "42", "1")
+        notice = [{"type": "text", "text": "Work could not finish before the messages expired."}]
+        for _ in range(2):
+            with self.database.connect() as db:
+                self.assertEqual(self.deliveries.publish(db, "42", "1", notice, outcome="failed"), identifier)
+        reply = self.deliveries.get("42", "1")
+        self.assertEqual((reply["reply_status"], reply["expires_at"], len(reply["items"])), ("failed", expires, 3))
+        with self.database.connect() as db:
+            rows = db.execute("SELECT state,receipt FROM outgoing_items WHERE reply_id=%s ORDER BY sequence", (identifier,)).fetchall()
+            self.assertEqual(rows, [("delivered", json.dumps(receipt)), ("expired", None), ("expired", None)])
+            self.assertEqual(self.deliveries.append(db, "42", "1", "first", progress), identifier)
+        with self.assertRaises(ValueError), self.database.connect() as db:
+            self.deliveries.append(db, "42", "1", "late", notice)
+        self.assertIsNone(self.deliveries.claim(["42"]))
+
+    def test_expired_abandoned_progress_reconciles_once_without_inference(self):
+        chat, turn = self.chat()
+        with self.database.connect() as db:
+            db.execute("INSERT INTO replies VALUES ('42','1',%s,NULL)", (hashlib.sha256(b"hello").hexdigest(),))
+            identifier = self.deliveries.append(db, "42", "1", "progress", [{"type": "text", "text": "Working"}])
+        expires = self.deliveries.snapshot("42", "1")["expires_at"]
+        self.now += 1001
+        chat.deliveries = DeliveryStore(self.database, retention=1000, clock=self.clock)
+        result = chat.reply("42", "hello", "1", include_details=True)
+        self.assertEqual((result["status"], result["delivery_id"], result["expires_at"]), ("failed", identifier, expires))
+        self.assertIn("interrupted", result["items"][-1]["text"])
+        self.assertEqual(chat.reply("42", "hello", "1", include_details=True), result)
+        self.assertEqual([i["state"] for i in chat.deliveries.status("42")], ["expired", "expired"])
+        self.assertIsNone(chat.deliveries.claim(["42"]))
+        turn.run.assert_not_called()
+
+    def test_failure_after_progress_expiry_finalizes_without_repeating_inference(self):
+        chat, turn = self.chat()
+        expires = []
+
+        def run():
+            with self.database.connect() as db:
+                self.deliveries.append(db, "42", "1", "progress", [{"type": "text", "text": "Working"}])
+            expires.append(self.deliveries.snapshot("42", "1")["expires_at"])
+            self.now += 1001
+            raise RuntimeError("Synthetic inference failure")
+
+        turn.run.side_effect = run
+        with self.assertRaises(RuntimeError):
+            chat.reply("42", "hello", "1")
+        result = chat.reply("42", "hello", "1", include_details=True)
+        self.assertEqual((result["status"], result["expires_at"]), ("failed", expires[0]))
+        self.assertIn("could not finish", result["items"][-1]["text"])
+        self.assertEqual(chat.reply("42", "hello", "1", include_details=True), result)
+        self.assertEqual([i["state"] for i in self.deliveries.status("42")], ["expired", "expired"])
+        self.assertIsNone(self.deliveries.claim(["42"]))
+        turn.run.assert_called_once()
+
+    def test_abandoned_full_progress_is_finalized_without_another_inference(self):
+        chat, turn = self.chat()
+        progress = [{"type": "text", "text": "x" * 62946}] + [{"type": "text", "text": "x"}] * 30
+        with self.database.connect() as db:
+            db.execute("INSERT INTO replies VALUES ('42','1',%s,NULL)", (hashlib.sha256(b"hello").hexdigest(),))
+            self.deliveries.append(db, "42", "1", "progress", progress)
+        result = chat.reply("42", "hello", "1", include_details=True)
+        self.assertEqual((result["status"], len(result["items"])), ("failed", 32))
+        self.assertEqual(result["items"][:31], progress)
+        self.assertIn("interrupted", result["items"][-1]["text"])
+        self.assertEqual(chat.reply("42", "hello", "1", include_details=True), result)
+        turn.run.assert_not_called()
+
+    def test_oversized_terminal_after_full_progress_commits_failure_and_preserves_updates(self):
+        chat, turn = self.chat()
+        response = turn.run.return_value
+        response.final_response = "x" * 1025
+        progress = [{"type": "text", "text": "x" * 62946}] + [{"type": "text", "text": "x"}] * 30
+
+        def run():
+            with self.database.connect() as db:
+                self.deliveries.append(db, "42", "1", "progress", progress)
+            return response
+
+        turn.run.side_effect = run
+        with self.assertRaises(ValueError):
+            chat.reply("42", "hello", "1")
+        result = chat.reply("42", "hello", "1", include_details=True)
+        self.assertEqual((result["status"], len(result["items"])), ("failed", 32))
+        self.assertEqual(result["items"][:31], progress)
+        self.assertIn("could not finish", result["items"][-1]["text"])
+        turn.run.assert_called_once()
 
     def test_final_publication_failure_revokes_capability_and_leaves_no_manifest(self):
         chat, turn = self.chat()
@@ -247,6 +398,12 @@ class MessagingTests(unittest.TestCase):
         self.assertEqual(response["size"], len(body))
         self.assertEqual(request("/messaging/worker/batch", cap, json.dumps({"operation": "batch", "items": [], "chat_id": "43"}).encode())[0], 400)
         self.assertEqual(request("/messaging/claim", cap, b'{}')[0], 403)
+        with self.database.connect() as db:
+            self.deliveries.append(db, "42", "1", "early", [{"type": "text", "text": "Still working"}])
+        client = AgentClient(f"http://127.0.0.1:{server.server_port}", TOKEN)
+        self.assertIsNone(client.lookup_reply("42", "1"))
+        self.assertEqual(client.snapshot_reply("42", "1")["reply_status"], "pending")
+        self.assertEqual(request("/messaging/snapshot", cap, b'{"chat_id":"42","request_id":"1"}')[0], 403)
         self.assertEqual(request("/messaging/worker/upload", cap, body, {"X-Artifact-Metadata": json.dumps(meta), "Transfer-Encoding": "chunked"})[0], 400)
 
 

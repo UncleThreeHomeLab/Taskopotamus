@@ -34,11 +34,51 @@ class ConsoleState:
         self.details = None
         self.uncertain = None
         self.attachments = {}
+        self.active_request = None
+        self.reply_view = None
 
     def snapshot(self):
         with self.lock:
             return {key: getattr(self, key) for key in
                     ("csrf", "nonce", "pending", "transcript", "auth", "notice", "draft", "details", "uncertain")}
+
+    def _show_messages(self, view, items, metadata):
+        if not isinstance(items, list) or not items:
+            return
+        rendered = []
+        for item in items:
+            if item.get("type") in ("image", "file"):
+                info = metadata.get(item.get("artifact_id"), {}) if isinstance(metadata, dict) else {}
+                if info.get("state") == "committed":
+                    self.attachments[item["artifact_id"]] = info
+                rendered.append({**item, "metadata": info})
+            else:
+                rendered.append(item)
+        if view["position"] is None:
+            self.transcript = (self.transcript + [("You", view["text"]), ("Agent", rendered)])[-20:]
+            view["position"] = len(self.transcript) - 1
+        else:
+            self.transcript[view["position"]] = ("Agent", rendered)
+        visible = {item.get("artifact_id") for _, entry in self.transcript if isinstance(entry, list) for item in entry}
+        self.attachments = {key: value for key, value in self.attachments.items() if key in visible}
+        view["count"] = len(items)
+
+    def refresh_messages(self):
+        with self.lock:
+            view = self.active_request
+            if view is None or view["terminal"]:
+                return
+        try:
+            result = self.client.snapshot_reply("console:local", view["id"])
+        except Exception:
+            return
+        if not isinstance(result, dict) or not isinstance(result.get("items"), list):
+            return
+        with self.lock:
+            if self.active_request is view and not view["terminal"] and len(result["items"]) >= view["count"]:
+                self._show_messages(view, result["items"], result.get("artifacts", {}))
+                view["terminal"] = result.get("reply_status") in ("completed", "failed")
+                view["failed"] = result.get("reply_status") == "failed"
 
     def check_upload_nonce(self, nonce):
         with self.lock:
@@ -99,6 +139,11 @@ class ConsoleState:
                 if action == "replay":
                     request_id, text = replay[:2]
                     identifiers = replay[2] if len(replay) > 2 else []
+                with self.lock:
+                    if self.reply_view is None or self.reply_view["id"] != request_id:
+                        supplied = text + ("\nFiles: " + ", ".join(i["filename"] for i in uploads) if uploads else "")
+                        self.reply_view = {"id": request_id, "text": supplied, "position": None, "terminal": False, "failed": False, "count": 0}
+                    self.active_request = self.reply_view
                 if uploads:
                     existing = self.client.lookup_reply("console:local", request_id)
                     if existing is not None:
@@ -138,31 +183,14 @@ class ConsoleState:
                 status = result.get("status", "uncertain")
                 with self.lock:
                     self.details = result.get("details")
+                    if status in ("completed", "failed"):
+                        items = result.get("items")
+                        if status == "completed" and not isinstance(items, list):
+                            items = [{"type": "text", "text": result["text"]}]
+                        self._show_messages(self.active_request, items, result.get("artifacts", {}))
+                        self.active_request["terminal"] = True
+                        self.active_request["failed"] = status == "failed"
                     if status == "completed":
-                        items = (
-                            result.get("items")
-                            if isinstance(result.get("items"), list)
-                            else [{"type": "text", "text": result["text"]}]
-                        )
-                        metadata = result.get("artifacts", {})
-                        rendered = []
-                        for item in items:
-                            if item.get("type") in ("image", "file"):
-                                info = metadata.get(item.get("artifact_id"), {}) if isinstance(metadata, dict) else {}
-                                if info.get("state") == "committed":
-                                    self.attachments[item["artifact_id"]] = info
-                                rendered.append({**item, "metadata": info})
-                            else:
-                                rendered.append(item)
-                        supplied = text + ("\nFiles: " + ", ".join(i["filename"] for i in uploads) if uploads else "")
-                        self.transcript = (self.transcript + [("You", supplied), ("Agent", rendered)])[-20:]
-                        visible = {
-                            item.get("artifact_id")
-                            for _, entry in self.transcript
-                            if isinstance(entry, list)
-                            for item in entry
-                        }
-                        self.attachments = {key: value for key, value in self.attachments.items() if key in visible}
                         self.draft, self.uncertain = "", None
                         self.notice = "Reply completed."
                     elif status == "failed":
@@ -176,15 +204,20 @@ class ConsoleState:
                 with self.lock:
                     self.transcript, self.details, self.uncertain, self.draft = [], None, None, ""
                     self.attachments = {}
+                    self.reply_view = None
                     self.notice = "New conversation started. Personal profile is preserved."
             else:
                 self._auth(self.client.login(restart=action == "retry"))
                 with self.lock:
                     self.notice = "Sign-in status updated."
         except Exception as error:
+            self.refresh_messages()
             with self.lock:
                 code = error.status if isinstance(error, AgentRequestError) else None
-                if uploads and not inference_started:
+                if self.active_request is not None and self.active_request["terminal"]:
+                    self.notice = "Agent could not finish this request. No automatic resend occurred." if self.active_request["failed"] else "Reply completed."
+                    self.uncertain = None
+                elif uploads and not inference_started:
                     self.uncertain = None
                     self.notice = "Files could not be accepted. Select files again; no agent work started. Maximum 10 files and 20 MB combined."
                 elif action in ("chat", "replay") and code not in (400, 401, 429, 507):
@@ -202,6 +235,7 @@ class ConsoleState:
                 item["stream"].close()
             with self.lock:
                 self.pending = False
+                self.active_request = None
 
 
 def make_handler(state):
@@ -268,6 +302,8 @@ def make_handler(state):
                 return self.artifact()
             if self.path != "/":
                 return self.send(404)
+            if self.authenticated():
+                state.refresh_messages()
             self.send(200, render(state.snapshot()).encode(), cookie=True)
 
         def authenticated(self):

@@ -280,6 +280,8 @@ class InboxTests(unittest.TestCase):
         def started_before_crash(chat, text, request):
             self.assertTrue(self.polling.uncertain(10))
             paid_starts.append(request)
+            with self.database.connect() as db:
+                outbox.append(db, str(chat), request, "progress", [{"type": "text", "text": "Working"}])
             raise HardCrash()
 
         agent.chat.side_effect = started_before_crash
