@@ -123,7 +123,7 @@ class DeliveryStore:
                 VALUES (%s,%s,%s,%s,%s,%s,%s,'pending')""",
                 (reply_id, chat_id, request_id, channel, serialized, now, now + self.retention))
         offset = db.execute("SELECT COALESCE(max(sequence)+1,0) FROM outgoing_items WHERE reply_id=%s", (reply_id,)).fetchone()[0]
-        for sequence, item in enumerate(delivery_items(items), offset):
+        for sequence, item in enumerate(delivery_items(items, telegram=channel == "telegram" and legacy_next is None), offset):
             state, receipt = ("available" if channel == "console" else "pending"), None
             if legacy_next is not None:
                 state = "delivered" if sequence < legacy_next else "uncertain" if sequence == legacy_next else "pending"
@@ -242,7 +242,7 @@ class DeliveryStore:
     def acknowledge(self, reply_id, sequence, attempt, state, receipt=None):
         opaque_id(reply_id)
         opaque_id(attempt)
-        if type(sequence) is not int or sequence < 0 or state not in ("delivered", "failed", "uncertain", "rate_limited"):
+        if type(sequence) is not int or sequence < 0 or state not in ("delivered", "failed", "uncertain", "rate_limited", "formatting_rejected"):
             raise ValueError("Invalid delivery receipt.")
         if receipt is not None and (not isinstance(receipt, dict) or len(json.dumps(receipt)) > 2048):
             raise ValueError("Invalid delivery receipt.")
@@ -251,8 +251,10 @@ class DeliveryStore:
         if state == "rate_limited" and (not receipt or set(receipt) != {"retry_after"}
                                        or type(receipt["retry_after"]) is not int or not 1 <= receipt["retry_after"] <= 300):
             raise ValueError("Invalid retry delay.")
+        if state == "formatting_rejected" and receipt is not None:
+            raise ValueError("Invalid formatting rejection receipt.")
         with self.database.connect() as db:
-            row = db.execute("SELECT state,attempt,receipt,retry_count FROM outgoing_items WHERE reply_id=%s AND sequence=%s FOR UPDATE",
+            row = db.execute("SELECT state,attempt,receipt,retry_count,item FROM outgoing_items WHERE reply_id=%s AND sequence=%s FOR UPDATE",
                              (reply_id, sequence)).fetchone()
             if not row:
                 raise ValueError("Stale delivery attempt.")
@@ -271,8 +273,18 @@ class DeliveryStore:
                     return
                 raise ValueError("Delivery attempt already resolved.")
             serialized = json.dumps(receipt) if receipt else None
+            if state == "formatting_rejected":
+                item = json.loads(row[4])
+                plain = item.get("plain_text")
+                if (row[0] != "inflight" or item.get("type") != "text" or item.get("parse_mode") != "HTML"
+                        or not isinstance(plain, str) or not plain or len(plain.encode("utf-16-le")) > 8192):
+                    raise ValueError("Formatting fallback requires an active HTML text item.")
             db.execute("UPDATE delivery_attempts SET state=%s,receipt=%s WHERE attempt=%s", (state, serialized, attempt))
-            if state == "rate_limited" and row[3] < 3:
+            if state == "formatting_rejected":
+                db.execute("""UPDATE outgoing_items SET item=%s,state='pending',attempt=NULL,claimed=NULL,receipt=NULL
+                    WHERE reply_id=%s AND sequence=%s""",
+                    (json.dumps({"type": "text", "text": plain}, ensure_ascii=False), reply_id, sequence))
+            elif state == "rate_limited" and row[3] < 3:
                 db.execute("""UPDATE outgoing_items SET state='pending',attempt=NULL,claimed=NULL,receipt=NULL,
                     retry_count=retry_count+1,not_before=%s WHERE reply_id=%s AND sequence=%s""",
                     (self.clock() + receipt["retry_after"], reply_id, sequence))

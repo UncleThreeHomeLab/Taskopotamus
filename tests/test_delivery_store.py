@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 from src.telegram.bot import process_update, deliver_one
 from src.messaging.delivery_store import DeliveryStore as Outbox
 from src.telegram.delivery_store import DeliveryStore
+from src.telegram.media import TelegramRejected
 from database_support import isolated_database
 
 
@@ -16,8 +17,8 @@ class DeliveryTests(unittest.TestCase):
         self.canonical = Outbox(self.database)
         def chat(chat_id, text, request_id):
             with self.database.connect() as db:
-                self.canonical.publish(db, str(chat_id), request_id, [{"type": "text", "text": "x" * 3000}])
-            return {"text": "x" * 3000, **self.canonical.get(str(chat_id), request_id)}
+                self.canonical.publish(db, str(chat_id), request_id, [{"type": "text", "text": "x" * 5000}])
+            return {"text": "x" * 5000, **self.canonical.get(str(chat_id), request_id)}
         self.agent.chat.side_effect = chat
         self.agent.claim_delivery.side_effect = lambda allowed: self.canonical.claim(sorted(allowed))
         self.agent.acknowledge_delivery.side_effect = lambda delivery, state, receipt: self.canonical.acknowledge(
@@ -54,6 +55,49 @@ class DeliveryTests(unittest.TestCase):
         self.agent.chat.assert_not_called()
         self.assertEqual([r["state"] for r in self.canonical.status("42")], ["delivered", "uncertain"])
         self.assertIsNone(self.store.get(10))
+
+    def test_formatting_fallback_ack_loss_never_repeats_send_and_restart_uses_plain(self):
+        with self.database.connect() as db:
+            self.canonical.publish(db, "42", "10", [{"type": "text", "text": "**Result**"}])
+        acknowledge = self.agent.acknowledge_delivery.side_effect
+        lost = []
+        def committed_ack_lost(delivery, state, receipt):
+            acknowledge(delivery, state, receipt)
+            if not lost:
+                lost.append(True)
+                raise RuntimeError("synthetic lost acknowledgement")
+        self.agent.acknowledge_delivery.side_effect = committed_ack_lost
+        with patch("src.telegram.bot.api", side_effect=TelegramRejected(formatting=True)) as send:
+            self.assertTrue(deliver_one(self.agent, "synthetic-token", {"42"}))
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[2]["parse_mode"], "HTML")
+        self.assertEqual(self.agent.acknowledge_delivery.call_count, 2)
+        self.canonical = Outbox(self.database)
+        with self.database.connect() as db:
+            db.execute("UPDATE delivery_pacing SET not_before=0")
+        with patch("src.telegram.bot.api", return_value={"message_id": 7}) as send:
+            self.assertTrue(deliver_one(self.agent, "synthetic-token", {"42"}))
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[2]["text"], "Result")
+        self.assertNotIn("parse_mode", send.call_args.args[2])
+        self.assertIsNone(self.canonical.claim(["42"]))
+
+    def test_only_html_formatting_rejection_can_fallback(self):
+        for index, (item, error, expected) in enumerate((
+            ({"type": "text", "text": "<b>x</b>", "parse_mode": "HTML"}, TelegramRejected(), "failed"),
+            ({"type": "text", "text": "plain"}, TelegramRejected(formatting=True), "failed"),
+            ({"type": "text", "text": "<b>x</b>", "parse_mode": "HTML"}, RuntimeError("unknown"), "uncertain"),
+            ({"type": "text", "text": "plain"}, TelegramRejected(retry_after=3), "rate_limited"),
+        )):
+            with self.subTest(index=index):
+                agent = Mock()
+                delivery = {"item": item, "chat_id": "42"}
+                agent.claim_delivery.return_value = delivery
+                with patch("src.telegram.bot.api", side_effect=error) as send:
+                    self.assertTrue(deliver_one(agent, "synthetic-token", {"42"}))
+                send.assert_called_once()
+                agent.acknowledge_delivery.assert_called_once_with(
+                    delivery, expected, {"retry_after": 3} if expected == "rate_limited" else None)
 
     def test_disallowed_user_does_not_create_reply_or_call_services(self):
         with patch("src.telegram.bot.api") as send:

@@ -9,16 +9,20 @@ from urllib.parse import quote
 
 
 class TelegramRejected(RuntimeError):
-    def __init__(self, message="Telegram rejected the request.", retry_after=None):
+    def __init__(self, message="Telegram rejected the request.", retry_after=None, formatting=False):
         super().__init__(message)
         self.retry_after = retry_after
+        self.formatting = formatting
 
 
 def rejection(data):
     if isinstance(data, dict) and data.get("ok") is False and type(data.get("error_code")) is int:
         delay = (data.get("parameters") or {}).get("retry_after") if isinstance(data.get("parameters", {}), dict) else None
         retry = delay if data["error_code"] == 429 and type(delay) is int and 1 <= delay <= 300 else None
-        return TelegramRejected(retry_after=retry)
+        description = data.get("description")
+        formatting = (data["error_code"] == 400 and isinstance(description, str) and len(description) <= 4096
+                      and description.lower().startswith("bad request: can't parse entities"))
+        return TelegramRejected(retry_after=retry, formatting=formatting)
     return None
 
 

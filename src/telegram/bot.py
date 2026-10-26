@@ -4,6 +4,7 @@ import re
 import sys
 import threading
 import time
+from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from psycopg import Error as DatabaseError
@@ -115,19 +116,26 @@ def api(token, method, body=None, timeout=40):
     )
     try:
         with urlopen(request, timeout=timeout) as response:
-            data = json.load(response)
+            if method == "sendMessage":
+                encoded = response.read(65537)
+                if len(encoded) > 65536:
+                    raise RuntimeError("Telegram returned an excessive response.")
+                data = json.loads(encoded)
+            else:
+                data = json.load(response)
     except HTTPError as error:
         rejected = None
         try:
             body = error.read(65537) if error.fp is not None else b""
             if len(body) <= 65536:
                 response = json.loads(body)
-                rejected = rejection(response)
-        except (ValueError, OSError):
+                if isinstance(response, dict) and response.get("error_code") == error.code:
+                    rejected = rejection(response)
+        except (ValueError, OSError, HTTPException):
             pass
         error.close()
         raise rejected or RuntimeError(f"Telegram {method} failed (HTTP {error.code}).") from None
-    except (URLError, TimeoutError, OSError):
+    except (URLError, TimeoutError, OSError, HTTPException):
         raise RuntimeError("Telegram network request failed.") from None
     except (ValueError, UnicodeError):
         raise RuntimeError("Telegram returned invalid JSON.") from None
@@ -226,10 +234,13 @@ def deliver_one(agent, token, allowed_users):
     try:
         item = delivery["item"]
         if item.get("type") == "text":
-            result = api(token, "sendMessage", {
+            body = {
                 "chat_id": delivery["chat_id"], "text": item["text"], "protect_content": True,
                 "link_preview_options": {"is_disabled": True},
-            })
+            }
+            if item.get("parse_mode") is not None:
+                body["parse_mode"] = item["parse_mode"]
+            result = api(token, "sendMessage", body)
         elif item.get("type") in ("image", "file"):
             info = delivery.get("artifact") or agent.artifact_info(delivery["chat_id"], item["artifact_id"])
             with agent.artifact_stream(delivery["chat_id"], item["artifact_id"]) as source:
@@ -243,6 +254,8 @@ def deliver_one(agent, token, allowed_users):
                 receipt["file_id"] = media["file_id"]
     except TelegramRejected as error:
         state, receipt = ("rate_limited", {"retry_after": error.retry_after}) if error.retry_after is not None else ("failed", None)
+        if error.formatting and item.get("type") == "text" and item.get("parse_mode") == "HTML":
+            state, receipt = "formatting_rejected", None
     except RuntimeError:
         pass
     # Retry only recording the same receipt. Never repeat the Telegram send here.

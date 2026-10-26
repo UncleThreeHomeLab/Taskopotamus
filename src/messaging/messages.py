@@ -46,13 +46,18 @@ def validate_items(items):
     return result
 
 
-def delivery_items(items):
-    """Conservative Unicode chunks preserve exact text on Telegram."""
+def delivery_items(items, telegram=False):
+    """Expand original text for its transport; media captions remain plain."""
     result = []
     for item in validate_items(items):
         if item["type"] == "text":
-            result.extend({"type": "text", "text": item["text"][i:i + 2000]}
-                          for i in range(0, len(item["text"]), 2000))
+            if telegram:
+                from src.telegram.formatting import format_reply
+                result.extend({"type": "text", **{key: chunk[key] for key in ("text", "plain_text", "parse_mode")}}
+                              for chunk in format_reply(item["text"]))
+            else:
+                result.extend({"type": "text", "text": item["text"][i:i + 2000]}
+                              for i in range(0, len(item["text"]), 2000))
         else:
             caption, units, boundary = item["caption"], 0, 0
             for character in caption:

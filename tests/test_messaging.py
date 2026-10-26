@@ -20,6 +20,8 @@ from src.messaging.artifacts import ArtifactCapacityError, ArtifactPolicy, Artif
 from src.messaging.delivery_store import DeliveryStore
 from src.messaging.http_api import MessagingAPI
 from src.messaging.message_publication import MessagePublication
+from src.messaging.messages import delivery_items
+from src.profiles.auth import CONSOLE_CHAT_ID
 from src.telegram.agent_client import AgentClient
 from src.telegram.bot import process_update
 from src.telegram.delivery_store import DeliveryStore as PollingStore
@@ -104,7 +106,7 @@ class MessagingTests(unittest.TestCase):
             self.artifacts.prepare_batch(cap, "batch", [{"type": "file", "artifact_id": first["artifact_id"]}])
 
     def test_delivery_order_receipt_retries_and_late_confirmation(self):
-        self.publish(text="x" * 5000)
+        self.publish(text="x" * 9000)
         first = self.deliveries.claim(["42"])
         self.assertIsNone(self.deliveries.claim(["42"]))
         args = (first["delivery_id"], first["sequence"], first["attempt"], "delivered", {"message_id": 7})
@@ -121,6 +123,98 @@ class MessagingTests(unittest.TestCase):
         self.assertEqual(self.deliveries.status("43"), [])
         with self.assertRaises(ValueError):
             self.deliveries.acknowledge(first["delivery_id"], 0, "f" * 32, "delivered", {"message_id": 9})
+
+    def test_markdown_transport_is_persisted_without_changing_raw_batch_or_replay(self):
+        raw = [{"type": "text", "text": "**Result** & <script>"}]
+        with self.database.connect() as db:
+            identifier = self.deliveries.append(db, "42", "1", "message", raw, request_signature="raw-signature")
+            stored = db.execute("SELECT items,request_signature FROM outgoing_batches WHERE reply_id=%s", (identifier,)).fetchone()
+        self.assertEqual((json.loads(stored[0]), stored[1]), (raw, "raw-signature"))
+        self.assertEqual(self.deliveries.snapshot("42", "1")["items"], raw)
+        restarted = DeliveryStore(self.database, clock=self.clock)
+        with patch("src.telegram.formatting.format_reply", side_effect=AssertionError("must use persisted payload")):
+            with self.database.connect() as db:
+                self.assertEqual(restarted.append(db, "42", "1", "message", raw, request_signature="raw-signature"), identifier)
+            claim = restarted.claim(["42"])
+        self.assertEqual(claim["item"], {"type": "text", "text": "<b>Result</b> &amp; &lt;script&gt;",
+                                        "plain_text": "Result & <script>", "parse_mode": "HTML"})
+
+    def test_valid_multi_item_reference_links_do_not_amplify_outgoing_payloads(self):
+        url = "https://example.com/" + "x" * 980
+        source = "[x][r] a " * 110 + "\n\n[r]: " + url
+        items = [{"type": "text", "text": source} for _ in range(31)]
+        self.assertEqual(sum(len(item["text"]) for item in items), 61907)
+        with self.database.connect() as db:
+            identifier = self.deliveries.append(db, "42", "1", "references", items)
+            rows = db.execute("SELECT item FROM outgoing_items WHERE reply_id=%s ORDER BY sequence", (identifier,)).fetchall()
+        payloads = [json.loads(row[0]) for row in rows]
+        self.assertEqual(len(payloads), 31)
+        self.assertTrue(all(item["parse_mode"] is None for item in payloads))
+        self.assertEqual([item["text"] for item in payloads], [source] * 31)
+        self.assertEqual(sum(len(item["plain_text"]) for item in payloads), 61907)
+        self.assertEqual(self.deliveries.snapshot("42", "1")["items"], items)
+
+    def test_console_legacy_and_media_overflow_never_enter_markdown_renderer(self):
+        raw = [{"type": "text", "text": "**raw**"}]
+        caption = "**caption**" + "x" * 1500
+        with patch("src.telegram.formatting.format_reply", side_effect=AssertionError("must remain plain")):
+            self.publish(chat=CONSOLE_CHAT_ID, text="**raw**")
+            self.deliveries.import_legacy("42", "1", ["**old**" + "x" * 1993, "**next**"], 1)
+            media = delivery_items([{"type": "image", "artifact_id": "a" * 32, "caption": caption}], telegram=True)
+        self.assertEqual(media, delivery_items([{"type": "image", "artifact_id": "a" * 32, "caption": caption}]))
+        self.assertEqual(media[0]["caption"] + media[1]["text"], caption)
+        with self.database.connect() as db:
+            console = db.execute("SELECT i.item FROM outgoing_items i JOIN outgoing_replies r ON r.id=i.reply_id WHERE r.chat_id=%s", (CONSOLE_CHAT_ID,)).fetchone()
+            legacy = db.execute("SELECT item,state FROM outgoing_items WHERE reply_id=%s ORDER BY sequence",
+                                (self.deliveries.get("42", "1")["delivery_id"],)).fetchall()
+        self.assertEqual(json.loads(console[0]), raw[0])
+        self.assertEqual([(json.loads(item), state) for item, state in legacy], [
+            ({"type": "text", "text": "**old**" + "x" * 1993}, "delivered"),
+            ({"type": "text", "text": "**next**"}, "uncertain")])
+
+    def test_formatting_rejection_is_durable_idempotent_and_preserves_retry_budget(self):
+        self.publish(text="**Result**")
+        first = self.deliveries.claim(["42"])
+        with self.database.connect() as db:
+            db.execute("UPDATE outgoing_items SET retry_count=2 WHERE reply_id=%s", (first["delivery_id"],))
+        rejected = (first["delivery_id"], 0, first["attempt"], "formatting_rejected")
+        self.deliveries.acknowledge(*rejected)
+        self.deliveries.acknowledge(*rejected)
+        self.assertIsNone(self.deliveries.claim(["42"]))
+        self.now += 1
+        restarted = DeliveryStore(self.database, clock=self.clock)
+        plain = restarted.claim(["42"])
+        self.assertEqual(plain["item"], {"type": "text", "text": "Result"})
+        self.assertNotEqual(plain["attempt"], first["attempt"])
+        restarted.acknowledge(*rejected)
+        with self.assertRaises(ValueError):
+            restarted.acknowledge(plain["delivery_id"], 0, plain["attempt"], "formatting_rejected")
+        restarted.acknowledge(plain["delivery_id"], 0, plain["attempt"], "rate_limited", {"retry_after": 3})
+        self.now += 2
+        self.assertIsNone(restarted.claim(["42"]))
+        self.now += 1
+        final = restarted.claim(["42"])
+        restarted.acknowledge(final["delivery_id"], 0, final["attempt"], "rate_limited", {"retry_after": 3})
+        self.assertEqual(restarted.status("42")[0]["state"], "failed")
+        restarted.acknowledge(*rejected)
+        self.now += 3
+        self.assertIsNone(restarted.claim(["42"]))
+
+    def test_old_formatting_ack_after_plain_delivery_and_expired_fallback_do_not_resend(self):
+        self.publish(text="**Result**")
+        first = self.deliveries.claim(["42"])
+        rejected = (first["delivery_id"], 0, first["attempt"], "formatting_rejected")
+        self.deliveries.acknowledge(*rejected)
+        self.now += 1
+        plain = self.deliveries.claim(["42"])
+        self.deliveries.acknowledge(plain["delivery_id"], 0, plain["attempt"], "delivered", {"message_id": 1})
+        self.deliveries.acknowledge(*rejected)
+        self.publish(chat="43", text="**expired**")
+        expired = self.deliveries.claim(["43"])
+        self.now += 1001
+        self.deliveries.acknowledge(expired["delivery_id"], 0, expired["attempt"], "formatting_rejected")
+        self.assertIsNone(self.deliveries.claim(["42", "43"]))
+        self.assertEqual(self.deliveries.status("43")[0]["state"], "expired")
 
     def test_legacy_import_idempotency_collision_and_revocation(self):
         self.deliveries.import_legacy("42", "1", ["a" * 2000, "b"], 1)
@@ -145,7 +239,7 @@ class MessagingTests(unittest.TestCase):
         self.assertIsNone(self.deliveries.get("42", "1"))
         self.assertEqual(self.deliveries.snapshot("42", "1")["reply_status"], "pending")
         first = self.deliveries.claim(["42"])
-        self.assertEqual(first["item"], first_items[0])
+        self.assertEqual(first["item"], {"type": "text", "text": "Working", "plain_text": "Working", "parse_mode": "HTML"})
         self.deliveries.acknowledge(identifier, first["sequence"], first["attempt"], "delivered", {"message_id": 1})
         with self.database.connect() as db:
             self.deliveries.append(db, "42", "1", "update-2", [{"type": "text", "text": "Result"}])
@@ -457,7 +551,7 @@ class MessagingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             file = Path(directory) / "report.txt"
             file.write_bytes(b"result-bytes")
-            parts = [{"type": "text", "text": "Before"}, {"type": "file", "path": str(file), "caption": "Report"},
+            parts = [{"type": "text", "text": "**Before**"}, {"type": "file", "path": str(file), "caption": "Report"},
                      {"type": "text", "text": "After"}]
             with patch("src.worker.message_mcp.open_output", side_effect=lambda path: open_output(path, (directory,))):
                 with self.assertRaises(RequestUncertain):
@@ -470,8 +564,10 @@ class MessagingTests(unittest.TestCase):
         self.assertEqual(first["state"], "queued")
         snapshot = self.deliveries.snapshot("42", "1")
         self.assertEqual([i["type"] for i in snapshot["items"]], ["text", "file", "text"])
+        self.assertEqual(snapshot["items"][0]["text"], "**Before**")
         self.assertIsNone(self.deliveries.get("42", "1"))
-        self.assertEqual(self.deliveries.claim(["42"])["item"]["text"], "Before")
+        self.assertEqual(self.deliveries.claim(["42"])["item"], {
+            "type": "text", "text": "<b>Before</b>", "plain_text": "Before", "parse_mode": "HTML"})
         with self.assertRaises(RuntimeError):
             client.request("/send", json.dumps({"message_id": "injected", "request_signature": "a" * 64,
                 "items": [{"type": "text", "text": "no"}], "chat_id": "43"}).encode(), {"Content-Type": "application/json"})
