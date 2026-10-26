@@ -2,6 +2,8 @@
 import json
 import time
 
+from .reply_context import extract_reply_context
+
 
 def normalize(update, allowed):
     message = update.get("message")
@@ -66,7 +68,11 @@ def normalize(update, allowed):
     if album is not None and (not isinstance(album, str) or len(album) > 128):
         error = "Invalid media album."
         album = None
-    return {"chat_id": str(chat), "text": text, "files": files, "album": album, "error": error}
+    item = {"chat_id": str(chat), "text": text, "files": files, "album": album, "error": error}
+    context = extract_reply_context(message)
+    if context:
+        item["reply_context"] = context
+    return item
 
 
 class Inbox:

@@ -14,6 +14,7 @@ from .agent_client import AgentRequestError
 from .media import TelegramRejected, rejection, send_media
 from .inbox import Inbox
 from .input_files import InputRejected, download
+from .reply_context import extract_reply_context, with_reply_context
 from .delivery_store import DeliveryStore
 from src.runtime import read_secret
 from src.storage.database import Database
@@ -42,7 +43,7 @@ def allowed_message(message, allowed_users):
     )
 
 
-def reply_for(message, allowed_users, agent=None, request_id=None, _structured=False):
+def reply_for(message, allowed_users, agent=None, request_id=None, _structured=False, _reply_contexts=None):
     if not allowed_message(message, allowed_users):
         return None
     text = message.get("text")
@@ -94,7 +95,8 @@ def reply_for(message, allowed_users, agent=None, request_id=None, _structured=F
     try:
         if text == "/new":
             return agent.reset(message["chat"]["id"])["text"]
-        result = agent.chat(message["chat"]["id"], text, request_id)
+        contexts = _reply_contexts if _reply_contexts is not None else [extract_reply_context(message)]
+        result = agent.chat(message["chat"]["id"], with_reply_context(text, contexts), request_id)
         return result if _structured else result["text"]
     except RuntimeError as error:
         if _structured:
@@ -146,7 +148,7 @@ def api(token, method, body=None, timeout=40):
     return data["result"]
 
 
-def process_update(update, allowed_users, agent, token, store, wake=None, persisted=False):
+def process_update(update, allowed_users, agent, token, store, wake=None, persisted=False, _reply_contexts=None):
     update_id = update["update_id"]
     if not persisted and update_id < store.offset:
         return
@@ -182,7 +184,10 @@ def process_update(update, allowed_users, agent, token, store, wake=None, persis
                 if isinstance(message.get("text"), str) and not message["text"].startswith("/"):
                     # Persist intent before forwarding: a process crash may bypass every error handler.
                     store.mark_uncertain(update_id)
-                result = reply_for(message, allowed_users, agent, request_id=str(update_id), _structured=True)
+                result = reply_for(
+                    message, allowed_users, agent, request_id=str(update_id),
+                    _structured=True, _reply_contexts=_reply_contexts,
+                )
             except AgentRequestError as error:
                 if error.status in (400, 401, 429, 507) and not previously_uncertain:
                     result = str(error)
@@ -288,6 +293,23 @@ def process_input(job, inbox, allowed_users, agent, token, store, wake):
     messages = job["messages"]
     files = [file for message in messages for file in message["files"]]
     text = "\n".join(message["text"] for message in messages if message["text"])
+    contexts = []
+    for index, message in enumerate(messages):
+        context = message.get("reply_context")
+        if not context:
+            continue
+        if len(messages) == 1:
+            contexts.append(context)
+        else:
+            existing = next(
+                (item for item in contexts
+                 if {key: value for key, value in item.items() if key != "source_attachments"} == context),
+                None,
+            )
+            if existing is None:
+                existing = {**context, "source_attachments": []}
+                contexts.append(existing)
+            existing["source_attachments"].append(index + 1)
     if len(messages) > 1:
         text = "\n".join(
             f'Attachment {index+1}: {message["text"]}' for index, message in enumerate(messages) if message["text"]
@@ -297,7 +319,9 @@ def process_input(job, inbox, allowed_users, agent, token, store, wake):
             "update_id": identifier,
             "message": {"chat": {"id": int(chat), "type": "private"}, "from": {"id": int(chat)}, "text": text},
         }
-        process_update(update, allowed_users, agent, token, store, wake, persisted=True)
+        process_update(
+            update, allowed_users, agent, token, store, wake, persisted=True, _reply_contexts=contexts,
+        )
         inbox.finish(identifier)
         return
     stopped = threading.Event()
@@ -332,7 +356,7 @@ def process_input(job, inbox, allowed_users, agent, token, store, wake):
             accepted.append(info["artifact_id"])
         inbox.mark_inference(identifier)
         inference = True
-        result = agent.chat(int(chat), text, str(identifier), accepted)
+        result = agent.chat(int(chat), with_reply_context(text, contexts), str(identifier), accepted)
         if not isinstance(result.get("delivery_id"), str):
             agent.import_legacy_delivery(chat, str(identifier), reply_chunks(result["text"]), 0)
         inbox.finish(identifier)
