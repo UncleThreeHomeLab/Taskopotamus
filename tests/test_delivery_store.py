@@ -1,10 +1,11 @@
 import unittest
+import time
 from unittest.mock import Mock, patch
 
-from src.telegram.bot import process_update
-from src.telegram.bot import TelegramSendError
+from src.telegram.bot import process_update, deliver_one
+from src.messaging.delivery_store import DeliveryStore as Outbox
 from src.telegram.delivery_store import DeliveryStore
-from src.telegram.formatting import format_reply
+from src.telegram.media import TelegramRejected
 from database_support import isolated_database
 
 
@@ -13,155 +14,90 @@ class DeliveryTests(unittest.TestCase):
         self.database = isolated_database(self)
         self.store = DeliveryStore(self.database)
         self.agent = Mock()
-        self.agent.chat.return_value = {"text": "**" + "x" * 6000 + "**"}
+        self.canonical = Outbox(self.database)
+        def chat(chat_id, text, request_id):
+            with self.database.connect() as db:
+                self.canonical.publish(db, str(chat_id), request_id, [{"type": "text", "text": "x" * 5000}])
+            return {"text": "x" * 5000, **self.canonical.get(str(chat_id), request_id)}
+        self.agent.chat.side_effect = chat
+        self.agent.claim_delivery.side_effect = lambda allowed: self.canonical.claim(sorted(allowed))
+        self.agent.acknowledge_delivery.side_effect = lambda delivery, state, receipt: self.canonical.acknowledge(
+            delivery["delivery_id"], delivery["sequence"], delivery["attempt"], state, receipt)
+        self.agent.import_legacy_delivery.side_effect = lambda chat, request, chunks, next_chunk: self.canonical.import_legacy(str(chat), request, chunks, next_chunk)
+        self.agent.reserve_command.side_effect = lambda chat, request, command: self.canonical.reserve_command(str(chat), request, command)
+        self.agent.lookup_reply.side_effect = lambda chat, request: self.canonical.get(str(chat), request)
+        self.agent.publish_reply.side_effect = lambda chat, request, text, attempt: self.canonical.complete_command(str(chat), request, attempt, text)
         self.update = {"update_id": 10, "message": {
             "from": {"id": 42}, "chat": {"id": 42, "type": "private"}, "text": "hello",
         }}
 
-    def test_partial_send_retries_saved_reply_after_restart_without_another_model_call(self):
-        with patch("src.telegram.bot.api", side_effect=[{}, TelegramSendError("transient")]):
-            with self.assertRaises(RuntimeError):
-                process_update(self.update, {"42"}, self.agent, "synthetic-token", self.store)
-        restarted = DeliveryStore(self.database)
-        saved = restarted.get(10)
-        with patch("src.telegram.bot.api", return_value={}) as send:
-            process_update(self.update, {"42"}, self.agent, "synthetic-token", restarted)
-            self.assertEqual(send.call_count, 1)
-            self.assertEqual(send.call_args.args[2]["text"], saved[1][1]["text"])
-            self.assertEqual(send.call_args.args[2]["parse_mode"], "HTML")
+    def test_partial_delivery_and_ambiguous_send_never_repeat_after_restart(self):
+        with patch("src.telegram.bot.api", return_value={}) as activity:
+            process_update(self.update, {"42"}, self.agent, "synthetic-token", self.store)
+        self.assertTrue(all(call.args[1] == "sendChatAction" for call in activity.call_args_list))
+        with patch("src.telegram.bot.api", side_effect=[{"message_id": 1}, RuntimeError("lost acknowledgement")]) as send:
+            self.assertTrue(deliver_one(self.agent, "synthetic-token", {"42"}))
+            with self.database.connect() as db:
+                db.execute("UPDATE delivery_pacing SET not_before=0")
+            self.assertTrue(deliver_one(self.agent, "synthetic-token", {"42"}))
+            self.assertEqual(send.call_count, 2)
+        restarted = Outbox(self.database)
+        self.assertIsNone(restarted.claim(["42"]))
+        self.assertEqual([row["state"] for row in restarted.status("42")], ["delivered", "uncertain"])
+        process_update(self.update, {"42"}, self.agent, "synthetic-token", DeliveryStore(self.database))
         self.agent.chat.assert_called_once_with(42, "hello", "10")
-        self.assertEqual(restarted.offset, 11)
-        self.assertIsNone(restarted.get(10))
-        process_update(self.update, {"42"}, self.agent, "synthetic-token", restarted)
-        self.agent.chat.assert_called_once()
-
-    def test_uncertain_send_retains_tail_and_later_updates_continue_without_duplicate(self):
-        with patch("src.telegram.bot.api", side_effect=TelegramSendError("uncertain")) as send:
-            process_update(self.update, {"42"}, self.agent, "synthetic-token", self.store)
-        self.assertEqual(send.call_count, 1)
-        saved = self.store.get(10)
-        self.assertEqual(saved[2], 0)
-        self.assertEqual(saved[1][0]["state"], "uncertain")
-        self.assertEqual(len(saved[1]), 2)
-        self.assertEqual(self.store.offset, 11)
-        with patch("src.telegram.bot.api", return_value={}) as later:
-            process_update(self.update, {"42"}, self.agent, "synthetic-token", self.store)
-            later.assert_not_called()
-            self.agent.chat.return_value = {"text": "next reply"}
-            process_update({**self.update, "update_id": 11}, {"42"}, self.agent, "synthetic-token", self.store)
-            later.assert_called_once()
-        self.assertEqual(self.store.offset, 12)
-        self.assertIsNotNone(self.store.get(10))
-        self.assertIsNone(self.store.get(11))
-
-    def test_crash_after_sending_marker_or_progress_failure_never_resends(self):
-        self.store.prepare(10, 42, format_reply("saved reply"))
-        self.store.mark_sending(10, 0, self.store.get(10)[1][0])
-        with patch("src.telegram.bot.api") as send:
-            process_update(self.update, {"42"}, self.agent, "synthetic-token", DeliveryStore(self.database))
-        send.assert_not_called()
-        self.assertEqual(self.store.get(10)[1][0]["state"], "uncertain")
-        self.assertEqual(self.store.offset, 11)
-        self.agent.chat.return_value = {"text": "next"}
-        update = {**self.update, "update_id": 11}
-        with patch.object(self.store, "mark_sent", side_effect=RuntimeError("synthetic write failure")), patch("src.telegram.bot.api", return_value={}) as first:
-            with self.assertRaises(RuntimeError):
-                process_update(update, {"42"}, self.agent, "synthetic-token", self.store)
-        first.assert_called_once()
-        self.assertEqual(self.store.get(11)[1][0]["state"], "sending")
-        with patch("src.telegram.bot.api") as retry:
-            process_update(update, {"42"}, self.agent, "synthetic-token", DeliveryStore(self.database))
-        retry.assert_not_called()
-        self.assertEqual(self.store.get(11)[1][0]["state"], "uncertain")
-
-    def test_formatting_rejection_persists_plain_fallback_before_sending(self):
-        self.agent.chat.return_value = {"text": "**Read** [details](https://example.com?a=1&b=2)"}
-        seen = []
-
-        def send(_token, _method, body):
-            saved = self.store.get(10)[1][0]
-            self.assertEqual(saved["state"], "sending")
-            self.assertEqual(saved["text"], body["text"])
-            self.assertTrue(body["protect_content"])
-            self.assertTrue(body["link_preview_options"]["is_disabled"])
-            seen.append(body)
-            if len(seen) == 1:
-                raise TelegramSendError("formatting")
-            self.assertIsNone(saved["parse_mode"])
-            self.assertNotIn("parse_mode", body)
-            self.assertIn("https://example.com?a=1&b=2", body["text"])
-            return {}
-
-        with patch("src.telegram.bot.api", side_effect=send):
-            process_update(self.update, {"42"}, self.agent, "synthetic-token", self.store)
-        self.assertEqual(len(seen), 2)
-        self.assertEqual(self.store.offset, 11)
-        self.agent.chat.assert_called_once()
-
-    def test_fallback_saved_before_crash_resumes_plain_without_model(self):
-        self.agent.chat.return_value = {"text": "**saved**"}
-        mark = self.store.mark_sending
-        attempts = []
-
-        def mark_until_crash(*args):
-            attempts.append(args)
-            if len(attempts) == 2:
-                raise RuntimeError("synthetic database failure")
-            mark(*args)
-
-        with patch.object(self.store, "mark_sending", side_effect=mark_until_crash), patch("src.telegram.bot.api", side_effect=TelegramSendError("formatting")):
-            with self.assertRaises(RuntimeError):
-                process_update(self.update, {"42"}, self.agent, "synthetic-token", self.store)
-        saved = self.store.get(10)[1][0]
-        self.assertIsNone(saved["parse_mode"])
-        self.assertEqual(saved["state"], "pending")
-        with patch("src.telegram.bot.api", return_value={}) as send:
-            process_update(self.update, {"42"}, self.agent, "synthetic-token", DeliveryStore(self.database))
-        self.assertNotIn("parse_mode", send.call_args.args[2])
-        self.assertEqual(send.call_args.args[2]["text"], "saved")
-        self.agent.chat.assert_called_once()
-
-    def test_quarantine_cursor_and_terminal_state_are_atomic(self):
-        with self.database.connect() as db:
-            db.execute('ALTER TABLE polling ADD CONSTRAINT frozen_offset CHECK ("offset" = 0)')
-        with patch("src.telegram.bot.api", side_effect=TelegramSendError("uncertain")) as send:
-            with self.assertRaises(Exception):
-                process_update(self.update, {"42"}, self.agent, "synthetic-token", self.store)
-        send.assert_called_once()
-        self.assertEqual(self.store.offset, 0)
-        self.assertEqual(self.store.get(10)[1][0]["state"], "sending")
-        with self.database.connect() as db:
-            db.execute('ALTER TABLE polling DROP CONSTRAINT frozen_offset')
-        with patch("src.telegram.bot.api") as recovered:
-            process_update(self.update, {"42"}, self.agent, "synthetic-token", DeliveryStore(self.database))
-        recovered.assert_not_called()
-        self.assertEqual(self.store.offset, 11)
-        self.assertEqual(self.store.get(10)[1][0]["state"], "uncertain")
-
-    def test_permanent_rejection_is_retained_without_poisoning_polling(self):
-        with patch("src.telegram.bot.api", side_effect=TelegramSendError("rejected")) as send:
-            process_update(self.update, {"42"}, self.agent, "synthetic-token", self.store)
-        send.assert_called_once()
-        self.assertEqual(self.store.get(10)[1][0]["state"], "rejected")
         self.assertEqual(self.store.offset, 11)
 
-    def test_legacy_plain_chunks_are_normalized_and_never_interpreted_as_html(self):
-        with self.database.connect() as db:
-            db.execute('INSERT INTO pending VALUES (10, 42, %s, 1)', ('["already sent", "**literal** <b>text</b>"]',))
-        with patch("src.telegram.bot.api", return_value={}) as send:
-            process_update(self.update, {"42"}, self.agent, "synthetic-token", self.store)
-        self.assertEqual(send.call_args.args[2]["text"], "**literal** <b>text</b>")
-        self.assertNotIn("parse_mode", send.call_args.args[2])
+    def test_legacy_pending_moves_to_canonical_quarantine_without_inference(self):
+        self.store.prepare(10, 42, ["x" * 2000, "y" * 1000])
+        self.store.mark_sent(10, 1)
+        process_update(self.update, {"42"}, self.agent, "synthetic-token", self.store)
         self.agent.chat.assert_not_called()
+        self.assertEqual([r["state"] for r in self.canonical.status("42")], ["delivered", "uncertain"])
+        self.assertIsNone(self.store.get(10))
 
-    def test_corrupt_saved_delivery_fails_closed_without_sending(self):
+    def test_formatting_fallback_ack_loss_never_repeats_send_and_restart_uses_plain(self):
         with self.database.connect() as db:
-            db.execute('INSERT INTO pending VALUES (10, 42, %s, 0)', ('[{"text": "missing state"}]',))
-        with patch("src.telegram.bot.api") as send:
-            with self.assertRaises(ValueError):
-                process_update(self.update, {"42"}, self.agent, "synthetic-token", self.store)
-        send.assert_not_called()
-        self.agent.chat.assert_not_called()
+            self.canonical.publish(db, "42", "10", [{"type": "text", "text": "**Result**"}])
+        acknowledge = self.agent.acknowledge_delivery.side_effect
+        lost = []
+        def committed_ack_lost(delivery, state, receipt):
+            acknowledge(delivery, state, receipt)
+            if not lost:
+                lost.append(True)
+                raise RuntimeError("synthetic lost acknowledgement")
+        self.agent.acknowledge_delivery.side_effect = committed_ack_lost
+        with patch("src.telegram.bot.api", side_effect=TelegramRejected(formatting=True)) as send:
+            self.assertTrue(deliver_one(self.agent, "synthetic-token", {"42"}))
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[2]["parse_mode"], "HTML")
+        self.assertEqual(self.agent.acknowledge_delivery.call_count, 2)
+        self.canonical = Outbox(self.database)
+        with self.database.connect() as db:
+            db.execute("UPDATE delivery_pacing SET not_before=0")
+        with patch("src.telegram.bot.api", return_value={"message_id": 7}) as send:
+            self.assertTrue(deliver_one(self.agent, "synthetic-token", {"42"}))
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[2]["text"], "Result")
+        self.assertNotIn("parse_mode", send.call_args.args[2])
+        self.assertIsNone(self.canonical.claim(["42"]))
+
+    def test_only_html_formatting_rejection_can_fallback(self):
+        for index, (item, error, expected) in enumerate((
+            ({"type": "text", "text": "<b>x</b>", "parse_mode": "HTML"}, TelegramRejected(), "failed"),
+            ({"type": "text", "text": "plain"}, TelegramRejected(formatting=True), "failed"),
+            ({"type": "text", "text": "<b>x</b>", "parse_mode": "HTML"}, RuntimeError("unknown"), "uncertain"),
+            ({"type": "text", "text": "plain"}, TelegramRejected(retry_after=3), "rate_limited"),
+        )):
+            with self.subTest(index=index):
+                agent = Mock()
+                delivery = {"item": item, "chat_id": "42"}
+                agent.claim_delivery.return_value = delivery
+                with patch("src.telegram.bot.api", side_effect=error) as send:
+                    self.assertTrue(deliver_one(agent, "synthetic-token", {"42"}))
+                send.assert_called_once()
+                agent.acknowledge_delivery.assert_called_once_with(
+                    delivery, expected, {"retry_after": 3} if expected == "rate_limited" else None)
 
     def test_disallowed_user_does_not_create_reply_or_call_services(self):
         with patch("src.telegram.bot.api") as send:
@@ -176,6 +112,45 @@ class DeliveryTests(unittest.TestCase):
             process_update(self.update, {"99"}, self.agent, "synthetic-token", self.store)
         send.assert_not_called()
         self.assertIsNone(self.store.get(10))
+
+    def test_volatile_command_reuses_committed_reply_after_lost_publish_ack(self):
+        self.update["message"]["text"] = "/delivery_status"
+        self.agent.delivery_status.side_effect = [[], [{"state": "delivered"}]]
+        def committed_but_ack_lost(chat, request, text, attempt):
+            self.canonical.complete_command(str(chat), request, attempt, text)
+            raise RuntimeError("synthetic lost commit acknowledgement")
+        self.agent.publish_reply.side_effect = committed_but_ack_lost
+        with self.assertRaises(RuntimeError):
+            process_update(self.update, {"42"}, self.agent, "synthetic-token", self.store)
+        committed = self.canonical.get("42", "10")
+        process_update(self.update, {"42"}, self.agent, "synthetic-token", self.store)
+        self.assertEqual(self.canonical.get("42", "10"), committed)
+        self.agent.delivery_status.assert_called_once_with(42)
+        self.agent.publish_reply.assert_called_once()
+        self.assertEqual(self.store.offset, 11)
+
+    def test_reset_is_not_repeated_after_poll_offset_commit_failure(self):
+        self.update["message"]["text"] = "/new"
+        self.agent.reset.return_value = {"text": "New conversation started."}
+        with patch.object(self.store, "finish", side_effect=RuntimeError("synthetic offset commit failure")):
+            with self.assertRaises(RuntimeError):
+                process_update(self.update, {"42"}, self.agent, "synthetic-token", self.store)
+        process_update(self.update, {"42"}, self.agent, "synthetic-token", self.store)
+        self.agent.reset.assert_called_once_with(42)
+        self.assertEqual(self.store.offset, 11)
+
+    def test_unknown_local_effect_is_reported_without_repeating_login_retry(self):
+        self.update["message"]["text"] = "/codex_login retry"
+        self.agent.login.return_value = {"state": "signed_in"}
+        self.agent.publish_reply.side_effect = RuntimeError("synthetic failure before output commit")
+        with self.assertRaises(RuntimeError):
+            process_update(self.update, {"42"}, self.agent, "synthetic-token", self.store)
+        process_update(self.update, {"42"}, self.agent, "synthetic-token", self.store)
+        self.agent.login.assert_called_once_with(restart=True)
+        self.assertEqual(self.store.offset, 11)
+        notice = self.canonical.get("42", "10")
+        self.assertEqual(notice["reply_status"], "failed")
+        self.assertIn("uncertain", notice["items"][0]["text"])
 
 
 if __name__ == "__main__":

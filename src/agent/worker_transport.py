@@ -1,11 +1,16 @@
 #!/usr/local/bin/python
 """Carry Codex stdio to the worker without forwarding controller secrets."""
 import os
+import json
 import shlex
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+
+class WorkspaceStorageError(RuntimeError):
+    pass
 
 
 def configure_transport():
@@ -26,6 +31,9 @@ def configure_transport():
 
 
 def command(arguments, environment):
+    mode = environment.get("TASKOPOTAMUS_WORKER_MODE")
+    if mode not in ("auth", "runtime", "status") or (mode == "status" and arguments):
+        raise ValueError("Explicit worker mode is required.")
     return [
         "ssh", "-T", "-F", "/dev/null", "-p", "2222",
         "-i", environment["TASKOPOTAMUS_SSH_KEY"],
@@ -34,9 +42,24 @@ def command(arguments, environment):
         "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
         "-o", "ClearAllForwardings=yes", "-o", "ForwardAgent=no", "-o", "LogLevel=ERROR",
         "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2",
-        "-o", "SendEnv=TASKOPOTAMUS_PROFILE_AUTH", "root@worker",
-        shlex.join(["/usr/local/bin/worker-codex", *arguments]),
+        "-o", "SendEnv=TASKOPOTAMUS_PROFILE_AUTH", "-o", "SendEnv=TASKOPOTAMUS_ARTIFACT_AUTH", "root@worker",
+        shlex.join(["/usr/local/bin/worker-codex", mode, *arguments]),
     ]
+
+
+def workspace_status():
+    result = subprocess.run(command([], {**os.environ, "TASKOPOTAMUS_WORKER_MODE": "status"}),
+                            capture_output=True, text=True, timeout=10)
+    if result.returncode != 0 or len(result.stdout) > 4096:
+        raise RuntimeError("Workspace status unavailable.")
+    status = json.loads(result.stdout)
+    if (not isinstance(status, dict) or type(status.get("generation")) is not int or status["generation"] < 0 or
+            type(status.get("retention_seconds")) is not int or status["retention_seconds"] <= 0 or
+            type(status.get("expires_at")) not in (int, float) or status.get("cleaning") is not False):
+        raise ValueError("Invalid workspace status.")
+    if type(status.get("admission_blocked")) is not bool or type(status.get("usage_bytes")) is not int:
+        raise ValueError("Invalid workspace admission status.")
+    return {key: status[key] for key in ("generation", "retention_seconds", "expires_at", "admission_blocked", "usage_bytes")}
 
 
 def main():

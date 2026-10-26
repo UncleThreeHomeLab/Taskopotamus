@@ -298,9 +298,20 @@ def _payload(runs, formatted=True):
             "plain_text": fallback, "state": "pending"}
 
 
-def _chunks(runs, formatted=True):
+def _chunks(runs, formatted=True, budget=MAX_RENDERED_TEXT):
     result, current = [], []
     visible, plain, previous_href, entities = 0, 0, None, 0
+    emitted = 0
+
+    def append_chunk():
+        nonlocal emitted
+        payload = _payload(current, formatted)
+        # Destinations repeat in both payloads, including after chunk splits and formatting changes.
+        emitted += len(payload["text"]) + len(payload["plain_text"])
+        if formatted and emitted > budget:
+            raise ValueError("Markdown expansion limit")
+        result.append(payload)
+
     for run in runs:
         remaining = run.text
         while remaining:
@@ -308,13 +319,13 @@ def _chunks(runs, formatted=True):
                 raise ValueError("Markdown delivery expansion limit")
             entity_cost = len(_tags(run)) if formatted else 0
             if current and entities + entity_cost > MAX_ENTITIES:
-                result.append(_payload(current, formatted))
+                append_chunk()
                 current, visible, plain, previous_href, entities = [], 0, 0, None, 0
                 continue
             extra = units(run.href) + 3 if run.href and previous_href != run.href else 0
             capacity = min(LIMIT - visible, LIMIT - plain - extra)
             if capacity <= 0:
-                result.append(_payload(current, formatted))
+                append_chunk()
                 current, visible, plain, previous_href, entities = [], 0, 0, None, 0
                 continue
             taken, count, newline_boundary, word_boundary = [], 0, 0, 0
@@ -331,7 +342,7 @@ def _chunks(runs, formatted=True):
             preferred = newline_boundary or word_boundary
             if not taken:
                 if current:
-                    result.append(_payload(current, formatted))
+                    append_chunk()
                     current, visible, plain, previous_href, entities = [], 0, 0, None, 0
                     continue
                 # A pathological cluster may exceed one message; preserve its code points instead.
@@ -345,7 +356,7 @@ def _chunks(runs, formatted=True):
             part = "".join(taken)
             count = units(part)
             if not part:
-                result.append(_payload(current, formatted))
+                append_chunk()
                 current, visible, plain, previous_href, entities = [], 0, 0, None, 0
                 continue
             current.append(replace(run, text=part))
@@ -355,10 +366,10 @@ def _chunks(runs, formatted=True):
             entities += entity_cost
             remaining = remaining[len(part):]
             if remaining:
-                result.append(_payload(current, formatted))
+                append_chunk()
                 current, visible, plain, previous_href, entities = [], 0, 0, None, 0
     if current:
-        result.append(_payload(current, formatted))
+        append_chunk()
     return result
 
 
@@ -380,6 +391,6 @@ def format_reply(text):
             renderer.runs.pop()
         if not any(run.text.strip() for run in renderer.runs):
             return _chunks([Run(text)], formatted=False)
-        return _chunks(renderer.runs)
+        return _chunks(renderer.runs, budget=renderer.budget)
     except (ValueError, KeyError, TypeError, RecursionError):
         return _chunks([Run(text)], formatted=False)

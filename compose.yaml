@@ -110,6 +110,8 @@ services:
       - source: telegram_database_password
         target: database_password
     networks: [default, database]
+    tmpfs:
+      - /tmp:mode=1777,size=32m
     depends_on:
       agent:
         condition: service_healthy
@@ -134,7 +136,7 @@ services:
     networks: [execution, console_ingress]
     ports: ["127.0.0.1:8088:8088"]
     tmpfs:
-      - /tmp:mode=1777
+      - /tmp:mode=1777,size=32m
     depends_on:
       agent:
         condition: service_healthy
@@ -169,6 +171,15 @@ services:
       AGENT_API_TOKEN_FILE: /run/secrets/agent_api_token
       PROFILE_SERVICE_URL: http://mcp:8080
       PROFILE_SIGNING_KEY_FILE: /run/secrets/profile_signing_key
+      ARTIFACT_DIRECTORY: /var/lib/taskopotamus/artifacts
+      ARTIFACT_MAX_FILES: ${ARTIFACT_MAX_FILES:-10}
+      ARTIFACT_INPUT_MAX_BYTES: ${ARTIFACT_INPUT_MAX_BYTES:-20000000}
+      ARTIFACT_OUTPUT_MAX_BYTES: ${ARTIFACT_OUTPUT_MAX_BYTES:-50000000}
+      ARTIFACT_IMAGE_MAX_BYTES: ${ARTIFACT_IMAGE_MAX_BYTES:-10000000}
+      ARTIFACT_CAPACITY_BYTES: ${ARTIFACT_CAPACITY_BYTES:-1073741824}
+      ARTIFACT_STAGING_SECONDS: ${ARTIFACT_STAGING_SECONDS:-3600}
+      ARTIFACT_RETENTION_SECONDS: ${ARTIFACT_RETENTION_SECONDS:-604800}
+      ARTIFACT_SWEEP_SECONDS: ${ARTIFACT_SWEEP_SECONDS:-60}
     secrets:
       - agent_api_token
       - profile_signing_key
@@ -183,9 +194,13 @@ services:
         condition: service_healthy
       worker:
         condition: service_healthy
-    networks: [execution, database]
+    networks:
+      execution:
+        ipv4_address: ${WORKER_AGENT_IP:-10.203.17.30}
+      database:
     volumes:
       - ${AGENT_INSTRUCTIONS_DIR:-./config/agent}:/app/config/agent:ro
+      - ${DATA_DIR:-./storage}/artifacts:/var/lib/taskopotamus/artifacts
     tmpfs:
       - /tmp:mode=1777
     healthcheck:
@@ -236,20 +251,28 @@ services:
       dockerfile: deploy/docker/worker.Dockerfile
     user: "0:0"
     group_add: ["10001"]
-    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, SYS_CHROOT, SETPCAP, NET_ADMIN]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, SYS_CHROOT, SETPCAP, NET_ADMIN, KILL]
     environment:
       WORKER_MCP_IP: ${WORKER_MCP_IP:-10.203.17.18}
+      WORKER_AGENT_IP: ${WORKER_AGENT_IP:-10.203.17.30}
       WORKER_DNS_IP: ${WORKER_DNS_IP:-1.1.1.1}
+      WORKSPACE_RETENTION_SECONDS: ${WORKSPACE_RETENTION_SECONDS:-604800}
+      WORKSPACE_SWEEP_SECONDS: ${WORKSPACE_SWEEP_SECONDS:-3600}
+      WORKSPACE_MAX_BYTES: ${WORKSPACE_MAX_BYTES:-1073741824}
     dns: ["${WORKER_DNS_IP:-1.1.1.1}"]
     secrets: [worker_host_key, worker_client_public]
     networks: [execution, default]
     volumes:
       # Native session metadata stores absolute paths; preserve the original Codex home.
       - worker_codex:/home/agent/.codex
-      - worker_workspace:/workspace
+      # Preserve pre-retention files without silently expiring them.
+      - worker_workspace:/legacy-workspace:ro
+      - worker_scratch:/workspace
+      - worker_saved:/saved
+      - worker_state:/var/lib/taskopotamus
     tmpfs:
-      - /tmp:mode=1777
-      - /run:mode=0755
+      - /tmp:mode=0700
+      - /run:mode=0700
       - /root:mode=0700
       - /home/agent:mode=0700
     sysctls:
@@ -269,6 +292,9 @@ services:
 volumes:
   worker_codex:
   worker_workspace:
+  worker_scratch:
+  worker_saved:
+  worker_state:
 
 secrets:
   agent_api_token:

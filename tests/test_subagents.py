@@ -39,13 +39,14 @@ class SubagentTests(unittest.TestCase):
             key, public = Path(directory, "key"), Path(directory, "host.pub")
             key.write_text("synthetic-private-key")
             public.write_text("ssh-ed25519 synthetic-public-key test")
-            with patch.dict(os.environ, {"WORKER_CLIENT_KEY_FILE": str(key), "WORKER_HOST_PUBLIC_KEY_FILE": str(public)}, clear=True), \
+            with patch.dict(os.environ, {"WORKER_CLIENT_KEY_FILE": str(key), "WORKER_HOST_PUBLIC_KEY_FILE": str(public),
+                                         "TASKOPOTAMUS_WORKER_MODE": "auth"}, clear=True), \
                     patch("sys.argv", ["codex-worker", "--version"]), \
                     patch("src.agent.worker_transport.subprocess.call", return_value=0) as launch:
                 self.assertEqual(transport_main(), 0)
             arguments = launch.call_args.args[0]
             self.assertEqual(arguments[0], "ssh")
-            self.assertEqual(shlex.split(arguments[-1]), ["/usr/local/bin/worker-codex", "--version"])
+            self.assertEqual(shlex.split(arguments[-1]), ["/usr/local/bin/worker-codex", "auth", "--version"])
             self.assertFalse(Path(arguments[arguments.index("-i") + 1]).exists())
 
     def test_firewall_rejects_private_destinations_before_allowing_public_web(self):
@@ -82,8 +83,9 @@ class SubagentTests(unittest.TestCase):
                 SubagentPolicy(**settings)
 
     def test_pinned_native_runtime_accepts_config_without_starting_a_model_turn(self):
+        from src.agent.attachment_tools import attachment_config
         with tempfile.TemporaryDirectory() as directory:
-            config = SubagentPolicy().config()
+            config = {**SubagentPolicy().config(), **attachment_config()}
             Path(directory, "config.toml").write_text("\n".join(f"{key} = {json.dumps(value)}" for key, value in config.items()))
             result = subprocess.run([str(bundled_codex_path()), "app-server", "--strict-config"],
                                     input="", capture_output=True, text=True, timeout=20,
@@ -92,12 +94,17 @@ class SubagentTests(unittest.TestCase):
 
     def test_ssh_transport_pins_host_and_quotes_arguments_without_sending_controller_secrets(self):
         arguments = ["app-server", "-c", 'model="synthetic"; touch /outside; #']
-        result = command(arguments, {"TASKOPOTAMUS_SSH_KEY": "/tmp/key", "TASKOPOTAMUS_SSH_HOSTS": "/tmp/hosts"})
-        self.assertEqual(shlex.split(result[-1]), ["/usr/local/bin/worker-codex", *arguments])
+        result = command(arguments, {"TASKOPOTAMUS_SSH_KEY": "/tmp/key", "TASKOPOTAMUS_SSH_HOSTS": "/tmp/hosts",
+                                     "TASKOPOTAMUS_WORKER_MODE": "runtime"})
+        self.assertEqual(shlex.split(result[-1]), ["/usr/local/bin/worker-codex", "runtime", *arguments])
         self.assertIn("StrictHostKeyChecking=yes", result)
         self.assertIn("ClearAllForwardings=yes", result)
         self.assertIn("ForwardAgent=no", result)
-        self.assertEqual([value for value in result if value.startswith("SendEnv=")], ["SendEnv=TASKOPOTAMUS_PROFILE_AUTH"])
+        self.assertEqual([value for value in result if value.startswith("SendEnv=")],
+                         ["SendEnv=TASKOPOTAMUS_PROFILE_AUTH", "SendEnv=TASKOPOTAMUS_ARTIFACT_AUTH"])
+        for mode in (None, "root", "runtime; evil"):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                command([], {"TASKOPOTAMUS_WORKER_MODE": mode})
 
     def test_private_transport_key_is_copied_to_private_temporary_storage(self):
         with tempfile.TemporaryDirectory() as directory:

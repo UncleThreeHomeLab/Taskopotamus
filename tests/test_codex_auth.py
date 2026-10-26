@@ -1,6 +1,7 @@
 import json
 import threading
 import unittest
+from contextlib import nullcontext
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -16,7 +17,8 @@ class CodexAuthTests(unittest.TestCase):
     def setUp(self):
         self.codex = Mock()
         self.codex.account.return_value = SimpleNamespace(account=None)
-        self.auth = CodexAuth(self.codex)
+        self.factory = Mock(side_effect=lambda: nullcontext(self.codex))
+        self.auth = CodexAuth(self.factory)
 
     def test_signed_in_does_not_start_another_login(self):
         self.codex.account.return_value = SimpleNamespace(account=object())
@@ -34,6 +36,7 @@ class CodexAuthTests(unittest.TestCase):
         start.assert_called_once()
         self.assertEqual(self.auth.status(), {"state": "pending"})
         self.assertEqual(first["user_code"], "TEST-0000")
+        self.assertEqual(self.factory.call_count, 1)
 
     def test_completion_clears_pending_login_and_allows_retry_after_failure(self):
         handle = Mock()
@@ -62,6 +65,20 @@ class CodexAuthTests(unittest.TestCase):
         self.auth._wait(old)
         self.assertIs(self.auth.pending, new)
         self.assertEqual(self.auth.status(), {"state": "pending"})
+
+    def test_unconfirmed_cancellation_keeps_old_handle_and_never_restarts_login(self):
+        old = Mock()
+        old.cancel.side_effect = RuntimeError("synthetic cancellation unknown")
+        old.wait.side_effect = RuntimeError("synthetic transport loss")
+        self.auth.pending = old
+        self.auth._wait(old)
+        self.assertIs(self.auth.pending, old)
+        self.assertEqual(self.auth.status(), {"state": "failed"})
+        with patch("src.agent.codex_auth.start_device_login") as start:
+            with self.assertRaises(RuntimeError):
+                self.auth.login(restart=True)
+        start.assert_not_called()
+        self.assertIs(self.auth.pending, old)
 
     def test_internal_http_api_and_client_hide_sdk_errors(self):
         token = "synthetic-service-token-for-tests-only"

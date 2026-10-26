@@ -12,12 +12,40 @@ from openai_codex.errors import InternalRpcError
 
 from src.agent.chat_service import ChatService
 from src.agent.server import make_handler
+from src.agent.worker_transport import WorkspaceStorageError
 from src.telegram.agent_client import AgentClient
 from src.profiles.instructions import DEFAULT_PROFILE, load_system_instructions
 from database_support import isolated_database
 
 
 class ChatServiceTests(unittest.TestCase):
+    def test_workspace_storage_refusal_reaches_client_without_starting_inference(self):
+        self.codex_factory.side_effect = WorkspaceStorageError("synthetic-private-detail")
+        token = "synthetic-service-token-for-tests-only"
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(Mock(), token, self.chat))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        client = AgentClient(f"http://127.0.0.1:{server.server_port}", token)
+        with self.assertRaisesRegex(RuntimeError, "Workspace storage limit reached") as caught:
+            client.chat("42", "hello", "1")
+        self.assertNotIn("synthetic-private", str(caught.exception))
+        self.turn.run.assert_not_called()
+
+    def test_workspace_generation_notice_is_cached_and_conversation_resumes(self):
+        status = Mock(return_value={"generation": 0, "retention_seconds": 604800, "expires_at": 9999999999})
+        chat = ChatService(self.codex_factory, self.database, workspace_status=status)
+        self.assertEqual(chat.reply("42", "hello", "1")["text"], "Hello")
+        status.return_value = {**status.return_value, "generation": 1}
+        reply = chat.reply("42", "continue", "2")
+        self.assertIn("Temporary workspace files expired", reply["text"])
+        self.codex.thread_resume.assert_called_once()
+        self.assertIn('"generation": 1', self.codex.thread_resume.call_args.kwargs["developer_instructions"])
+        calls = status.call_count
+        self.assertEqual(chat.reply("42", "continue", "2"), reply)
+        self.assertEqual(status.call_count, calls)
+        self.assertEqual(chat.reply("42", "another", "3")["text"], "Hello")
+
     def test_console_details_replay_survives_restart_without_inference(self):
         first = self.chat.reply("console:local", "hello", "100", include_details=True)
         self.assertEqual(first["status"], "completed")
@@ -33,7 +61,7 @@ class ChatServiceTests(unittest.TestCase):
         self.assertEqual(self.chat.reply("console:local", "hello", "100", include_details=True)["status"], "failed")
         with self.database.connect() as db:
             db.execute("UPDATE reply_runs SET status = 'pending' WHERE chat_id = 'console:local'")
-        self.assertEqual(self.chat.reply("console:local", "hello", "100", include_details=True)["status"], "uncertain")
+        self.assertEqual(self.chat.reply("console:local", "hello", "100", include_details=True)["status"], "failed")
         self.turn.run.assert_called_once()
 
     def test_console_metadata_failure_does_not_discard_reply_or_repeat_turn(self):
@@ -43,7 +71,7 @@ class ChatServiceTests(unittest.TestCase):
         self.assertEqual(first["text"], "Hello")
         replay = self.chat.reply("console:local", "hello", "100", include_details=True)
         self.assertEqual(replay["text"], "Hello")
-        self.assertEqual(replay["status"], "uncertain")
+        self.assertEqual(replay["status"], "completed")
         self.turn.run.assert_called_once()
 
     def test_console_http_identity_is_fixed_and_telegram_endpoint_remains_numeric(self):
@@ -93,7 +121,7 @@ class ChatServiceTests(unittest.TestCase):
         self.chat = ChatService(self.codex_factory, self.database, auto_compact_percent=50)
 
     def test_conversation_survives_service_recreation_and_other_chats_are_separate(self):
-        self.assertEqual(self.chat.reply("42", "hello", "1"), {"text": "Hello"})
+        self.assertEqual(self.chat.reply("42", "hello", "1")["text"], "Hello")
         recreated = ChatService(self.codex_factory, self.database)
         recreated.reply("42", "follow up", "2")
         self.codex.thread_resume.assert_called_once()
@@ -201,7 +229,7 @@ class ChatServiceTests(unittest.TestCase):
             self.assertEqual(call.args, ("42",))
         profiles.prepare.reset_mock()
         self.codex_factory.reset_mock()
-        self.assertEqual(chat.reply("42", "hello", "1"), {"text": "Hello"})
+        self.assertEqual(chat.reply("42", "hello", "1")["text"], "Hello")
         profiles.prepare.assert_not_called()
         self.codex_factory.assert_not_called()
 
@@ -303,7 +331,7 @@ class ChatServiceTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         client = AgentClient(f"http://127.0.0.1:{server.server_port}", token)
-        self.assertEqual(client.chat(42, "hello", "1"), {"text": "Hello"})
+        self.assertEqual(client.chat(42, "hello", "1")["text"], "Hello")
         self.assertIn("New conversation", client.reset(42)["text"])
         for payload in ([], {"chat_id": "../bad", "text": "hello"}):
             request = Request(f"{client.base_url}/chat", data=json.dumps(payload).encode(), method="POST", headers={"Authorization": f"Bearer {token}"})
@@ -324,7 +352,7 @@ class ChatServiceTests(unittest.TestCase):
         self.codex_factory.reset_mock()
         self.codex_factory.side_effect = RuntimeError("Runtime must not start for a replay")
         recreated = ChatService(self.codex_factory, self.database)
-        self.assertEqual(recreated.reply("42", "hello", "1"), {"text": "Hello"})
+        self.assertEqual(recreated.reply("42", "hello", "1")["text"], "Hello")
         self.turn.run.assert_called_once()
         with self.assertRaises(ValueError):
             recreated.reply("42", "different prompt", "1")

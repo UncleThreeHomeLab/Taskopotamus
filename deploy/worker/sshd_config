@@ -22,5 +22,5 @@ LogLevel ERROR
 MaxAuthTries 3
 MaxSessions 4
 MaxStartups 4:50:8
-AcceptEnv TASKOPOTAMUS_PROFILE_AUTH
-SetEnv CODEX_HOME=/home/agent/.codex HOME=/home/agent
+AcceptEnv TASKOPOTAMUS_PROFILE_AUTH TASKOPOTAMUS_ARTIFACT_AUTH
+ForceCommand /usr/local/bin/worker-codex

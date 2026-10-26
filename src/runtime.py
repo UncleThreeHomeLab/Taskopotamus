@@ -2,6 +2,10 @@ import os
 from pathlib import Path
 
 
+# Includes duplicated legacy text, ten captions, Unicode escaping, and bounded run telemetry.
+MAX_JSON_RESPONSE_BYTES = 2 * 1024 * 1024
+
+
 def read_secret(name, env=None):
     env = os.environ if env is None else env
     try:

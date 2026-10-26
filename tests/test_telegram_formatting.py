@@ -209,3 +209,24 @@ class FormattingTests(unittest.TestCase):
             parser = TelegramHTML()
             parser.feed(chunk['text'])
             self.assertLessEqual(parser.entity_count, 100)
+
+    def test_repeated_destinations_including_splits_and_format_changes_are_bounded(self):
+        url = 'https://example.com/' + 'x' * 980
+        escaped_url = 'https://example.com/?' + '&key=value' * 100
+        split_url = 'https://example.com/' + 'x' * 1980
+        sources = (
+            '[x][r] a ' * 110 + '\n\n[r]: ' + url,
+            ('[' + 'x' * 3000 + '][r] ') * 20 + '\n\n[r]: ' + split_url,
+            '[' + 'a *b* ' * 400 + '][r]\n\n[r]: ' + url,
+            '[x][r] a ' * 110 + '\n\n[r]: ' + escaped_url,
+        )
+        for source in sources:
+            with self.subTest(length=len(source)):
+                chunks = self.checked(source)
+                self.assertTrue(all(chunk['parse_mode'] is None for chunk in chunks))
+                self.assertEqual(''.join(chunk['text'] for chunk in chunks), source)
+                self.assertEqual(''.join(chunk['plain_text'] for chunk in chunks), source)
+        reasonable = '[short](https://example.com) ' * 20
+        chunks = self.checked(reasonable)
+        self.assertTrue(all(chunk['parse_mode'] == 'HTML' for chunk in chunks))
+        self.assertEqual(''.join(chunk['text'] for chunk in chunks).count('href='), 20)

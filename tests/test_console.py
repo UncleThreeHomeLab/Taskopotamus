@@ -3,6 +3,7 @@ import json
 import socket
 import threading
 import time
+import io
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
@@ -65,6 +66,30 @@ class ConsoleTests(unittest.TestCase):
         self.client.status.assert_not_called()
         self.client.console_chat.assert_not_called()
 
+    def test_attachment_preview_download_requires_session_and_streams_exact_bytes(self):
+        identifier = "a" * 32
+        content = b"synthetic attachment bytes"
+        self.client.console_chat.return_value = {"text": "ready", "status": "completed", "items": [
+            {"type": "image", "artifact_id": identifier, "caption": "Caption <script>private</script>"}],
+            "artifacts": {identifier: {"state": "committed", "filename": "chart.png", "presentation_mime": "image/png", "size": len(content)}}}
+        self.client.artifact_stream.side_effect = lambda *_: io.BytesIO(content)
+        self.state.submit("chat", self.state.nonce, "make a file")
+        finished(self.state)
+        body = self.request()[2]
+        self.assertIn(f'src="/artifact/{identifier}"', body)
+        self.assertIn("Caption &lt;script&gt;private&lt;/script&gt;", body)
+        self.assertIn(f'href="/artifact/{identifier}/download"', body)
+        self.assertEqual(self.request(path=f"/artifact/{identifier}")[0], 403)
+        cookie = {"Cookie": f"console_session={self.state.cookie}"}
+        status, headers, data = self.request(path=f"/artifact/{identifier}", headers=cookie)
+        self.assertEqual((status, headers["Content-Type"], data.encode()), (200, "image/png", content))
+        status, headers, _ = self.request(path=f"/artifact/{identifier}/download", headers=cookie)
+        self.assertEqual(status, 200)
+        self.assertIn("attachment;", headers["Content-Disposition"])
+        self.assertEqual(self.request(path=f"/artifact/{identifier}", headers={**cookie, "Origin": "https://evil.example"})[0], 403)
+        self.client.artifact_stream.side_effect = RuntimeError("expired")
+        self.assertEqual(self.request(path=f"/artifact/{identifier}", headers=cookie)[0], 410)
+
     def test_host_origin_csrf_cookie_and_identity_injection_fail_before_backend(self):
         cases = [({"Host": "evil.example:8088"}, self.fields("hi")),
                  ({"Origin": "https://evil.example"}, self.fields("hi")),
@@ -77,6 +102,53 @@ class ConsoleTests(unittest.TestCase):
                 self.assertIn(self.request("POST", "/chat", fields, headers)[0], (400, 403))
         self.client.console_chat.assert_not_called()
         self.assertEqual(self.request(headers={"Origin": "null"})[0], 403)
+
+    def test_pending_http_refresh_shows_early_items_once_and_final_replaces_same_view(self):
+        release, entered = threading.Event(), threading.Event()
+        identifier = "b" * 32
+        items = [{"type": "text", "text": "Progress <script>"},
+                 {"type": "file", "artifact_id": identifier, "caption": "Early document"}]
+        info = {"state": "committed", "filename": "early.txt", "size": 5}
+        self.client.snapshot_reply.return_value = {"reply_status": "pending", "items": items, "artifacts": {identifier: info}}
+        self.client.artifact_stream.side_effect = lambda *_: io.BytesIO(b"early")
+
+        def blocked(*_):
+            entered.set()
+            if not release.wait(3):
+                raise AssertionError("Synthetic inference did not resume")
+            return {"text": "Done", "status": "completed", "items": items + [{"type": "text", "text": "Done"}],
+                    "artifacts": {identifier: info}}
+
+        self.client.console_chat.side_effect = blocked
+        self.addCleanup(release.set)
+        self.state.submit("chat", self.state.nonce, "work")
+        self.assertTrue(entered.wait(2))
+        cookie = {"Cookie": f"console_session={self.state.cookie}"}
+        self.request()
+        self.client.snapshot_reply.assert_not_called()
+        body = self.request(headers=cookie)[2]
+        self.assertIn("Progress &lt;script&gt;", body)
+        self.assertTrue(self.state.pending)
+        self.assertEqual(self.request(path=f"/artifact/{identifier}/download", headers=cookie)[2], "early")
+        self.assertEqual(self.request(path=f"/artifact/{identifier}/download")[0], 403)
+        self.request(headers=cookie)
+        self.assertEqual(len(self.state.transcript), 2)
+        release.set()
+        finished(self.state)
+        self.assertEqual(len(self.state.transcript), 2)
+        self.assertEqual([i.get("text") for i in self.state.transcript[-1][1]], ["Progress <script>", None, "Done"])
+        self.assertEqual(self.state.notice, "Reply completed.")
+
+    def test_failed_request_keeps_queued_progress_and_terminal_notice_visible(self):
+        items = [{"type": "text", "text": "Started"}, {"type": "text", "text": "Work could not finish."}]
+        self.client.snapshot_reply.return_value = {"reply_status": "failed", "items": items}
+        self.client.console_chat.side_effect = AgentRequestError("synthetic-private-error", 500)
+        self.state.submit("chat", self.state.nonce, "work")
+        finished(self.state)
+        self.assertEqual(self.state.transcript, [("You", "work"), ("Agent", items)])
+        self.assertIsNone(self.state.uncertain)
+        self.assertIn("could not finish", self.state.notice)
+        self.assertNotIn("synthetic-private", self.request()[2])
 
     def test_duplicate_send_and_refresh_run_one_turn_and_escape_output(self):
         fields = self.fields("<script>input</script>")
@@ -117,6 +189,16 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual([call.args for call in self.client.console_chat.call_args_list], [("hello", original), ("hello", original)])
         self.assertEqual(self.state.transcript, [])
         self.assertIn("could not finish", self.state.notice)
+
+    def test_storage_refusal_is_clear_and_never_marked_uncertain(self):
+        self.client.console_chat.side_effect = AgentRequestError("synthetic-private-detail", 507)
+        self.state.submit("chat", self.state.nonce, "hello")
+        finished(self.state)
+        self.assertIsNone(self.state.uncertain)
+        self.assertEqual(self.state.transcript, [])
+        self.assertIn("Workspace storage limit reached", self.state.notice)
+        self.assertIn("No work started", self.state.notice)
+        self.assertNotIn("synthetic-private", self.state.notice)
 
     def test_auth_link_validation_and_reset_only_on_success(self):
         self.client.login.return_value = {"state": "pending", "verification_url": "https://evil.example", "user_code": "TEST-0000"}
