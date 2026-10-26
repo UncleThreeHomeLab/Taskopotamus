@@ -28,6 +28,10 @@ class NoRedirects(HTTPRedirectHandler):
         return None
 
 
+class RequestUncertain(RuntimeError):
+    pass
+
+
 def open_output(path, roots=("/workspace", "/saved")):
     """Retain no-follow descriptors through traversal, hashing, and upload."""
     if not isinstance(path, str) or not path.startswith("/") or "\x00" in path:
@@ -81,9 +85,11 @@ class AttachmentClient:
         except HTTPError as error:
             code = error.code
             error.close()
+            if code >= 500:
+                raise RequestUncertain("Message preparation could not be confirmed. Retry identical arguments and identity.") from None
             raise RuntimeError(f"Attachment preparation rejected (HTTP {code}). Check files, version, limits, and active run.") from None
         except (URLError, OSError, ValueError):
-            raise RuntimeError("Attachment preparation could not be confirmed. Retry the identical batch before changing it.") from None
+            raise RequestUncertain("Attachment preparation could not be confirmed. Retry the identical batch before changing it.") from None
 
     def attach(self, files, expected_version=0):
         if type(expected_version) is not int or expected_version < 0 or len(files) > 10 or not files and expected_version == 0:

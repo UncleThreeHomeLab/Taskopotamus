@@ -6,11 +6,13 @@ from urllib.parse import parse_qs, urlsplit
 
 from .artifacts import ArtifactCapacityError
 from .messages import opaque_id
+from .message_publication import MessagePublication
 
 
 class MessagingAPI:
     def __init__(self, deliveries, artifacts):
         self.deliveries, self.artifacts = deliveries, artifacts
+        self.messages = MessagePublication(artifacts, deliveries)
 
     @staticmethod
     def body(handler, maximum=65536):
@@ -113,7 +115,13 @@ class MessagingAPI:
                 payload = self.json_body(handler, 2 * 1024 * 1024 if worker else 65536)
                 path = parts.path
                 if worker:
-                    if path == "/messaging/worker/batch-lookup":
+                    if path == "/messaging/worker/message-lookup":
+                        self.fields(payload, {"message_id", "request_signature"})
+                        data = {"message": self.messages.lookup(credential, payload["message_id"], payload["request_signature"])}
+                    elif path == "/messaging/worker/send":
+                        self.fields(payload, {"message_id", "request_signature", "items"})
+                        data = self.messages.send(credential, payload["message_id"], payload["request_signature"], payload["items"])
+                    elif path == "/messaging/worker/batch-lookup":
                         self.fields(payload, {"expected_version", "request_key"})
                         data = {"batch": self.artifacts.batch_lookup(credential, payload["expected_version"], payload["request_key"])}
                     elif path == "/messaging/worker/batch":

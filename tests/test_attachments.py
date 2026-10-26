@@ -243,6 +243,30 @@ class WorkerAttachmentTests(unittest.TestCase):
                         self.assertIn("prepared", str(result))
             asyncio.run(exercise())
 
+    def test_real_message_stdio_exposes_only_scoped_typed_send(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "server.py"
+            script.write_text("from src.worker.message_mcp import make_server\n"
+                              "class Fake:\n def send(self, message_id, items):\n  return {'state':'queued','message_id':message_id,'count':len(items)}\n"
+                              "make_server(Fake()).run(transport='stdio')\n")
+
+            async def exercise():
+                parameters = StdioServerParameters(command=sys.executable, args=[str(script)], env={"PYTHONPATH": str(Path.cwd())})
+                async with stdio_client(parameters) as (read, write):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        listed = await session.list_tools()
+                        self.assertEqual([tool.name for tool in listed.tools], ["send_message"])
+                        result = await session.call_tool("send_message", {"message_id": "answer", "items": [
+                            {"type": "text", "text": "Hello"}, {"type": "image", "path": "/workspace/image.png", "caption": "Image"}]})
+                        self.assertFalse(result.is_error)
+                        self.assertIn("queued", str(result))
+                        denied = await session.call_tool("send_message", {"message_id": "wrong", "items": [
+                            {"type": "text", "text": "Hello", "chat_id": "43"}]})
+                        self.assertTrue(denied.is_error)
+
+            asyncio.run(exercise())
+
 
 class MultipartTests(unittest.TestCase):
     def test_multipart_exact_bytes_bounded_reads_and_downloadable_caption(self):
