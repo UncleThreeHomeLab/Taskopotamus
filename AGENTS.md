@@ -22,11 +22,11 @@ Use Docker Compose for local development and integration testing where practical
 
 ## Testing
 
-- Keep the default test suite offline. Use synthetic data and mocked service clients; never call live Telegram, Codex, OpenAI, or other external services from automated tests.
-- Default test commands must not require real credentials or consume paid service usage.
-- Do not perform live testing through Python scripts, ad hoc Python snippets, or other scripted test calls.
-- When live verification is needed, test manually through the application's normal interface, such as the Telegram bot. Keep live verification separate from the default test suite.
-- Report automated test results and manual live verification separately. If no manual live verification was performed, say so.
+- Keep all automated tests and test scripts offline. Use synthetic data, mocked service clients, and isolated test storage; never call live Telegram, Codex, OpenAI, or other external services from test code.
+- Test commands must not require real credentials or consume paid service usage. Run the Docker test image with `--network none`; never mount real credentials or production data into test containers. Offline native-runtime and configuration checks are allowed without authenticated model inference.
+- Agents may perform live verification through the application's normal interface, such as the Telegram bot or local console, when needed. Keep these agent-led checks separate from automated tests.
+- Do not write live-test code into the repository, including opt-in test cases or reusable browser tests against real services. Do not replace normal-interface verification with Python scripts, ad hoc SDK/API snippets, or other direct live-service test scripts. Agent-operated browser tools may drive the normal application interface without adding live-test code to the repository.
+- Report offline automated results and agent-led live verification separately. If no live verification was performed, say so. Never claim offline checks alone prove live model behavior.
 
 ## Runtime system instructions
 
@@ -38,7 +38,7 @@ Use Docker Compose for local development and integration testing where practical
 - Preserve parent-owned integration and verification, configured child defaults, separate edit ownership, concurrency limits, and no nested children. Check which child lifecycle controls are available; require completion evidence without inventing a close command. Keep instructions consistent with actual process shutdown and permission enforcement; prompt text cannot implement missing runtime controls.
 - Preserve application-owned workspace generation and expiry, explicit consent for `/saved`, verified copies of actual files, read-only legacy data, and protection of credentials and native state. Do not hardcode retention or model settings in the prompt when runtime configuration supplies them. A local path is not evidence of attachment delivery, and a reply cannot promise background execution after the run ends.
 - Review instruction changes against representative scenarios: a simple question, an actionable coding request, a failed child or uncertain side effect, expired files with a save request, and a conflicting profile or retrieved instruction. Check that the assistant finishes authorized work, avoids duplicate effects, verifies consequential claims, and preserves permissions. Review the corresponding behavior; do not add tests that merely assert exact prose.
-- Run relevant existing offline loader, profile-isolation, conversation-resume, and delegation tests. When behavioral verification is needed, use the normal application interface and keep it separate from automated checks under the testing rules above. Report what was actually observed, what remains unverified, and whether a reused conversation received the revised instructions. Never claim unit tests alone prove model compliance.
+- Run relevant existing offline loader, profile-isolation, conversation-resume, and delegation tests. Agents may verify behavior through the normal application interface separately under the testing rules above, without adding live-test code. Report what was actually observed, what remains unverified, and whether a reused conversation received the revised instructions. Never claim unit tests alone prove model compliance.
 
 ## Commit messages and pull request titles
 
