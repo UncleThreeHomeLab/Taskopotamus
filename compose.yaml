@@ -105,14 +105,19 @@ services:
       AGENT_URL: http://agent:8080
       AGENT_API_TOKEN_FILE: /run/secrets/agent_api_token
       CODEX_TURN_TIMEOUT_SECONDS: ${CODEX_TURN_TIMEOUT_SECONDS:-600}
+      GOOGLE_SERVICE_URL: http://google:8081
+      GOOGLE_CONTROL_SECRET_FILE: /run/secrets/google_control_secret
     secrets:
       - agent_api_token
+      - google_control_secret
       - source: telegram_database_password
         target: database_password
-    networks: [default, database]
+    networks: [default, database, google_control]
     tmpfs:
       - /tmp:mode=1777,size=32m
     depends_on:
+      google:
+        condition: service_healthy
       agent:
         condition: service_healthy
       postgres:
@@ -120,6 +125,38 @@ services:
     mem_limit: 128m
     cpus: 0.5
     pids_limit: 64
+
+  google:
+    <<: *security
+    build:
+      context: .
+      dockerfile: deploy/docker/google.Dockerfile
+    environment:
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
+      GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI:-}
+      GOOGLE_CONTROL_SECRET_FILE: /run/secrets/google_control_secret
+      GOOGLE_TOKEN_ENCRYPTION_KEY_FILE: /run/secrets/google_token_encryption_key
+      GOOGLE_STORAGE_DIRECTORY: /var/lib/taskopotamus/google
+    secrets: [google_control_secret, google_token_encryption_key]
+    volumes:
+      - ${DATA_DIR:-./storage}/google:/var/lib/taskopotamus/google
+    ports:
+      - "${GOOGLE_CALLBACK_BIND_IP:-127.0.0.1}:${GOOGLE_CALLBACK_PORT:-8090}:8080"
+    networks: [google_control, google_egress]
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8081/health', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 10
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 32
 
   test-console:
     <<: *security
@@ -297,6 +334,10 @@ volumes:
   worker_state:
 
 secrets:
+  google_control_secret:
+    file: ${CREDENTIALS_DIR:-./credentials}/google_control_secret
+  google_token_encryption_key:
+    file: ${CREDENTIALS_DIR:-./credentials}/google_token_encryption_key
   agent_api_token:
     file: ${AGENT_API_TOKEN_PATH:-${CREDENTIALS_DIR:-./credentials}/agent_api_token}
   profile_signing_key:
@@ -321,6 +362,9 @@ secrets:
     file: ${CREDENTIALS_DIR:-./credentials}/worker_client_key.pub
 
 networks:
+  google_control:
+    internal: true
+  google_egress:
   console_ingress:
     ipam:
       config:

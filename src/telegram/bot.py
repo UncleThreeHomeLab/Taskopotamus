@@ -11,6 +11,7 @@ from psycopg import Error as DatabaseError
 
 from .agent_client import AgentClient
 from .agent_client import AgentRequestError
+from .google_client import GoogleClient
 from .media import TelegramRejected, rejection, send_media
 from .inbox import Inbox
 from .input_files import InputRejected, download
@@ -43,12 +44,22 @@ def allowed_message(message, allowed_users):
     )
 
 
-def reply_for(message, allowed_users, agent=None, request_id=None, _structured=False, _reply_contexts=None):
+def reply_for(message, allowed_users, agent=None, request_id=None, _structured=False, _reply_contexts=None, _google=None):
     if not allowed_message(message, allowed_users):
         return None
     text = message.get("text")
     if not isinstance(text, str):
         return None
+    if text == "/google" or text.startswith("/google "):
+        if (type(message["chat"].get("id")) is not int
+                or message["chat"]["id"] != message["from"].get("id")):
+            return None
+        if _google is None:
+            return "Google connection is not configured. Ask the deployment owner to check Google setup."
+        try:
+            return _google.command(message["chat"]["id"], request_id, text)
+        except RuntimeError:
+            return "Google request unavailable or expired. Send /google to check before retrying."
     if text == "/start":
         return "Hi, I'm Taskopotamus. Send a message to chat, or /new to start fresh. Sign in with /codex_login; check login with /codex_status."
     if text == "/ping":
@@ -148,7 +159,7 @@ def api(token, method, body=None, timeout=40):
     return data["result"]
 
 
-def process_update(update, allowed_users, agent, token, store, wake=None, persisted=False, _reply_contexts=None):
+def process_update(update, allowed_users, agent, token, store, wake=None, persisted=False, _reply_contexts=None, _google=None):
     update_id = update["update_id"]
     if not persisted and update_id < store.offset:
         return
@@ -186,7 +197,7 @@ def process_update(update, allowed_users, agent, token, store, wake=None, persis
                     store.mark_uncertain(update_id)
                 result = reply_for(
                     message, allowed_users, agent, request_id=str(update_id),
-                    _structured=True, _reply_contexts=_reply_contexts,
+                    _structured=True, _reply_contexts=_reply_contexts, _google=_google,
                 )
             except AgentRequestError as error:
                 if error.status in (400, 401, 429, 507) and not previously_uncertain:
@@ -285,7 +296,7 @@ def delivery_loop(agent, token, allowed_users, wake, stopped):
         wake.clear()
 
 
-def process_input(job, inbox, allowed_users, agent, token, store, wake):
+def process_input(job, inbox, allowed_users, agent, token, store, wake, _google=None):
     identifier, chat = job["id"], job["chat_id"]
     if chat not in allowed_users:
         inbox.finish(identifier)
@@ -320,7 +331,7 @@ def process_input(job, inbox, allowed_users, agent, token, store, wake):
             "message": {"chat": {"id": int(chat), "type": "private"}, "from": {"id": int(chat)}, "text": text},
         }
         process_update(
-            update, allowed_users, agent, token, store, wake, persisted=True, _reply_contexts=contexts,
+            update, allowed_users, agent, token, store, wake, persisted=True, _reply_contexts=contexts, _google=_google,
         )
         inbox.finish(identifier)
         return
@@ -389,7 +400,7 @@ def process_input(job, inbox, allowed_users, agent, token, store, wake):
             activity.join(timeout=0.1)
 
 
-def input_loop(inbox, agent, token, allowed, store, wake, stopped):
+def input_loop(inbox, agent, token, allowed, store, wake, stopped, google=None):
     with inbox.database.connect() as connection:
         owns = connection.execute(
             "SELECT pg_try_advisory_lock(hashtextextended('telegram-input-dispatcher',0))"
@@ -398,16 +409,16 @@ def input_loop(inbox, agent, token, allowed, store, wake, stopped):
         if not owns:
             return
         inbox.recover()
-        dispatch_inputs(inbox, agent, token, allowed, store, wake, stopped)
+        dispatch_inputs(inbox, agent, token, allowed, store, wake, stopped, google)
 
 
-def dispatch_inputs(inbox, agent, token, allowed, store, wake, stopped):
+def dispatch_inputs(inbox, agent, token, allowed, store, wake, stopped, google=None):
     while not stopped.is_set():
         job = None
         try:
             job = inbox.claim()
             if job is not None:
-                process_input(job, inbox, allowed, agent, token, store, wake)
+                process_input(job, inbox, allowed, agent, token, store, wake, _google=google)
                 continue
         except Exception:
             if job is not None:
@@ -420,6 +431,9 @@ def main():
     os.umask(0o077)
     token, allowed_users = read_config(os.environ)
     agent = AgentClient(os.environ.get("AGENT_URL", "http://agent:8080"), read_secret("AGENT_API_TOKEN"))
+    google = None
+    if os.environ.get("GOOGLE_SERVICE_URL"):
+        google = GoogleClient(os.environ["GOOGLE_SERVICE_URL"], read_secret("GOOGLE_CONTROL_SECRET"))
     store = DeliveryStore(Database.from_env())
     inbox = Inbox(store.database)
     api(token, "getMe")
@@ -437,7 +451,7 @@ def main():
     sender = threading.Thread(target=delivery_loop, args=(agent, token, allowed_users, wake, stopped), daemon=True)
     sender.start()
     dispatcher = threading.Thread(
-        target=input_loop, args=(inbox, agent, token, allowed_users, store, wake, stopped), daemon=True
+        target=input_loop, args=(inbox, agent, token, allowed_users, store, wake, stopped, google), daemon=True
     )
     dispatcher.start()
     try:

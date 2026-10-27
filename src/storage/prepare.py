@@ -9,6 +9,7 @@ from src.runtime import private_directory
 SECRET_NAMES = (
     "agent_api_token", "profile_signing_key", "postgres_admin_password",
     "agent_database_password", "profile_database_password", "telegram_database_password", "silo_root_password",
+    "google_control_secret", "google_token_encryption_key",
 )
 
 
@@ -16,7 +17,7 @@ def prepare(data_dir, credentials_dir=None, container=False):
     if Path(data_dir).is_symlink():
         raise ValueError("Storage directories cannot be symbolic links.")
     root = private_directory(data_dir)
-    for name, owner in (("postgres", 999), ("objects", 10001), ("codex", 10001), ("legacy", 0), ("artifacts", 10001)):
+    for name, owner in (("postgres", 999), ("objects", 10001), ("codex", 10001), ("legacy", 0), ("artifacts", 10001), ("google", 10001)):
         if (root / name).is_symlink():
             raise ValueError("Storage directories cannot be symbolic links.")
         directory = root / name
