@@ -5,7 +5,7 @@ import unittest
 from contextlib import contextmanager, nullcontext, redirect_stderr
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from openai_codex.errors import InternalRpcError
@@ -19,6 +19,72 @@ from database_support import isolated_database
 
 
 class ChatServiceTests(unittest.TestCase):
+    def test_startup_timing_includes_eager_factory_and_ends_before_turn_run(self):
+        clock, output = [0], io.StringIO()
+        original = self.turn.run.return_value
+
+        @contextmanager
+        def runtime():
+            clock[0] = 5
+            yield self.codex
+
+        def factory():
+            clock[0] = 3
+            return runtime()
+
+        def start_turn(_input):
+            clock[0] = 9
+            return self.turn
+
+        def run():
+            phases = json.loads(output.getvalue())["startup_timing_ms"]
+            self.assertEqual(phases["runtime_factory"], 3000)
+            self.assertEqual(phases["runtime_enter"], 2000)
+            self.assertEqual(phases["uncached_to_turn_started"], 9000)
+            clock[0] = 99
+            return original
+
+        self.thread.turn.side_effect = start_turn
+        self.turn.run.side_effect = run
+        chat = ChatService(factory, self.database)
+        with patch("src.agent.startup_timing.time.perf_counter", side_effect=lambda: clock[0]), redirect_stderr(output):
+            self.assertEqual(chat.reply("42", "hello", "1")["text"], "Hello")
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+
+    def test_startup_diagnostics_cover_start_resume_and_skip_replay_without_private_data(self):
+        profiles = Mock()
+        profiles.prepare.return_value = ({**DEFAULT_PROFILE, "persona": "synthetic-private-profile"}, {}, "synthetic-private-token")
+        status = Mock(return_value={"generation": 0, "retention_seconds": 604800, "expires_at": 9999999999})
+        chat = ChatService(self.codex_factory, self.database, profiles=profiles, workspace_status=status)
+        output = io.StringIO()
+        with redirect_stderr(output):
+            chat.reply("42", "synthetic-private-prompt", "1")
+            chat.reply("42", "synthetic-private-prompt", "2")
+            chat.reply("42", "synthetic-private-prompt", "2")
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        common = {"instructions_load", "profile_prepare", "runtime_factory", "runtime_enter",
+                  "workspace_status", "account", "turn_start", "uncached_to_turn_started"}
+        for line, extra in zip(lines, ({"thread_start"}, {"thread_resume", "instruction_refresh"})):
+            phases = json.loads(line)["startup_timing_ms"]
+            self.assertEqual(set(phases), common | extra)
+            self.assertTrue(all(type(value) in (int, float) and value >= 0 for value in phases.values()))
+        self.assertNotIn("synthetic-private", output.getvalue())
+        self.assertEqual(self.codex_factory.call_count, 2)
+        self.assertEqual(self.thread.turn.call_count, 2)
+        self.assertEqual(self.turn.run.call_count, 2)
+
+    def test_startup_diagnostic_failure_preserves_reply_replay_and_original_error(self):
+        with patch("src.agent.startup_timing.print", side_effect=OSError("synthetic-private-output")):
+            self.assertEqual(self.chat.reply("42", "hello", "1")["text"], "Hello")
+            self.assertEqual(self.chat.reply("42", "hello", "1")["text"], "Hello")
+            failure = RuntimeError("synthetic-private-factory")
+            self.codex_factory.side_effect = failure
+            with self.assertRaises(RuntimeError) as caught:
+                self.chat.reply("42", "hello", "2")
+        self.assertIs(caught.exception, failure)
+        self.turn.run.assert_called_once()
+
     def test_workspace_storage_refusal_reaches_client_without_starting_inference(self):
         self.codex_factory.side_effect = WorkspaceStorageError("synthetic-private-detail")
         token = "synthetic-service-token-for-tests-only"
@@ -126,6 +192,7 @@ class ChatServiceTests(unittest.TestCase):
         recreated.reply("42", "follow up", "2")
         self.codex.thread_resume.assert_called_once()
         self.assertEqual(self.codex.thread_resume.call_args.args[0], "synthetic-thread")
+        self.assertIs(self.codex.thread_resume.call_args.kwargs["include_turns"], False)
         recreated.reply("43", "separate chat", "3")
         self.assertEqual(self.codex.thread_start.call_count, 2)
         options = self.codex.thread_start.call_args.kwargs
@@ -222,6 +289,8 @@ class ChatServiceTests(unittest.TestCase):
         self.assertNotIn("Updated profile", message["content"][0]["text"])
         self.assertNotIn("synthetic-chat-token", message["content"][0]["text"])
         self.assertTrue(self.codex.thread_resume.call_args.kwargs["config"]["mcp_servers.profiles.required"])
+        self.assertIs(self.codex.thread_resume.call_args.kwargs["include_turns"], False)
+        self.assertEqual(self.codex.thread_resume.call_args.args, ("synthetic-thread",))
         self.assertEqual([call.args for call in self.codex_factory.call_args_list], [
             ("synthetic-chat-token-one",), ("synthetic-chat-token-two",),
         ])

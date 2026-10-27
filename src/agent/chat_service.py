@@ -19,6 +19,7 @@ from .instruction_refresh import refresh_instructions
 from .subagents import SubagentPolicy
 from src.messaging.delivery_store import DeliveryStore
 from .attachment_tools import attachment_config
+from .startup_timing import StartupTiming
 
 
 FAILURE_TEXT = "This request could not finish or was interrupted. Its effects may be incomplete; check before trying again."
@@ -208,10 +209,14 @@ class ChatService:
                 return result
             if cancelled.is_set():
                 raise TimeoutError("Request cancelled.")
-            instructions, profile_config = load_system_instructions(), {}
+            timing = StartupTiming()
+            runtime.callback(timing.emit)
+            with timing.phase("instructions_load"):
+                instructions, profile_config = load_system_instructions(), {}
             turn_input, token, capability = text, None, None
             if self.profiles is not None:
-                profile, profile_config, token = self.profiles.prepare(chat_id)
+                with timing.phase("profile_prepare"):
+                    profile, profile_config, token = self.profiles.prepare(chat_id)
                 # Saved user text must never acquire developer authority.
                 turn_input = json.dumps({"profile": profile, "message": text}, ensure_ascii=False)
             if self.artifacts is not None:
@@ -235,16 +240,20 @@ class ChatService:
                 if cancelled.is_set():
                     raise TimeoutError("Request cancelled before worker access.")
                 profile_config.update(attachment_config())
-                client = self.codex_factory(token, capability)
-            elif self.profiles is not None:
-                client = self.codex_factory(token)
-            else:
-                client = self.codex_factory()
+            with timing.phase("runtime_factory"):
+                if self.artifacts is not None:
+                    client = self.codex_factory(token, capability)
+                elif self.profiles is not None:
+                    client = self.codex_factory(token)
+                else:
+                    client = self.codex_factory()
             # Start after the replay check; loaded threads can ignore resume configuration changes.
-            codex = runtime.enter_context(client)
+            with timing.phase("runtime_enter"):
+                codex = runtime.enter_context(client)
             workspace, expired = None, False
             if self.workspace_status is not None:
-                workspace = self.workspace_status()
+                with timing.phase("workspace_status"):
+                    workspace = self.workspace_status()
                 previous = db.execute(
                     "SELECT generation FROM conversation_workspace WHERE chat_id = %s", (chat_id,)
                 ).fetchone()
@@ -255,7 +264,9 @@ class ChatService:
                     + ". This replaces earlier workspace state. Files from earlier generations have expired. "
                     "Check file existence before reusing work. Conversation history is preserved."
                 )
-            if codex.account().account is None:
+            with timing.phase("account"):
+                account = codex.account()
+            if account.account is None:
                 raise PermissionError("Sign in to Codex first.")
             db.execute("INSERT INTO replies VALUES (%s, %s, %s, NULL)", (chat_id, request_id, digest))
             if include_details:
@@ -282,18 +293,23 @@ class ChatService:
                 if cancelled.is_set():
                     raise TimeoutError("Request cancelled.")
                 if row:
-                    thread = codex.thread_resume(row[0], **options)
+                    with timing.phase("thread_resume"):
+                        thread = codex.thread_resume(row[0], include_turns=False, **options)
                     if self.profiles is not None or workspace is not None or self.artifacts is not None:
-                        refresh_instructions(thread, instructions)
+                        with timing.phase("instruction_refresh"):
+                            refresh_instructions(thread, instructions)
                 else:
-                    thread = codex.thread_start(**options)
+                    with timing.phase("thread_start"):
+                        thread = codex.thread_start(**options)
                     db.execute("INSERT INTO conversations VALUES (%s, %s)", (chat_id, thread.id))
                     db.commit()
                 # Failed turns and model switches must not leave stale window metadata behind.
                 db.execute("DELETE FROM thread_context WHERE thread_id = %s", (thread.id,))
                 db.commit()
-                turn = thread.turn(turn_input)
+                with timing.phase("turn_start"):
+                    turn = thread.turn(turn_input)
                 active_turn.append(turn)
+                timing.turn_started()
                 if cancelled.is_set():
                     self._interrupt(turn)
                     raise TimeoutError("Request cancelled.")
