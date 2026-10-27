@@ -279,6 +279,7 @@ class GooglePermissions:
                 text.extend(["Review calendar before Save:", "Title: " + entry["title"],
                              "Exact calendar ID:", identifier,
                              f"Role: {entry['role']}. Draft access: {entry['mode'].title()}."])
+                text.append("Read sends event data to the AI provider; replies/history may retain it. Edit can create, change and delete events, affecting existing participants.")
                 modes = MODES if entry["role"] in ("writer", "owner") else MODES[:2] if entry["role"] == "reader" else MODES[:1]
                 buttons([(mode.title(), "calendar", [identifier, mode]) for mode in modes])
                 buttons([("Back to calendars", "calendar_list", None)])
@@ -307,10 +308,10 @@ class GooglePermissions:
                    (chat, generation, revision, menu["expires"], self.store.seal(chat, generation, f"menu:{revision}", menu)))
         return {"state": "menu", "text": "\n".join(text), "keyboard": keyboard}
 
-    def dispatch(self, chat, operation, callback, calendar_id=None, *, run_guard=None, deadline=None):
+    def dispatch(self, chat, operation, callback, calendar_id=None, *, run_guard=None, deadline=None, include_context=False):
         """Internal S3/S4 boundary. Check before refresh and immediately before dispatch, under lifecycle lock."""
         validate_chat(chat)
-        if operation not in ("gmail_read", "calendar_read", "calendar_edit") or not callable(callback):
+        if operation not in ("gmail_read", "calendar_read", "calendar_edit", "calendar_list") or not callable(callback):
             raise PermissionError("Google operation denied.")
         deadline = min(deadline, time.monotonic() + 20) if deadline is not None else time.monotonic() + 20
         with bounded_lock(self.oauth.lifecycle_lock, deadline):
@@ -325,19 +326,31 @@ class GooglePermissions:
                             or db.execute("SELECT 1 FROM flows WHERE chat=?", (chat,)).fetchone()):
                         raise PermissionError("Google access is Off.")
                     active = self.store.open(chat, row["generation"], "active", row["active"])
-                    if operation == "gmail_read":
+                    if operation == "calendar_list":
+                        permitted, scope = calendar_id is None, None
+                    elif operation == "gmail_read":
                         permitted = calendar_id is None and settings["gmail"] == "read"
                         scope = GMAIL_READ
                     else:
                         entry = settings["calendars"].get(calendar_id) if valid_calendar_id(calendar_id) else None
                         permitted = entry is not None and (entry["mode"] == "edit" or operation == "calendar_read" and entry["mode"] == "read")
                         scope = CALENDAR_EDIT if operation == "calendar_edit" else CALENDAR_READ
-                    if not permitted or not scopes_allow({scope}, active["scopes"]):
+                    if not permitted or scope is not None and not scopes_allow({scope}, active["scopes"]):
                         raise PermissionError("Google access is Off or scope unavailable.")
-                    return row["generation"], revision
+                    return row["generation"], revision, active["sub"], tuple(sorted(active["scopes"]))
             expected = check()
             generation, active = self.oauth.credentials(chat, deadline, run_guard=run_guard)
-            if check() != expected or generation != expected[0]:
+            if check() != expected or generation != expected[0] or active["sub"] != expected[2]:
                 raise PermissionError("Google permissions changed.")
             remaining(deadline)
+            if include_context:
+                def dispatch_guard():
+                    if check() != expected:
+                        raise PermissionError("Google permissions or account changed.")
+                    remaining(deadline)
+                    return deadline
+                with self.store.transaction(deadline) as db:
+                    _, settings = self.read(db, chat, generation)
+                context = {"sub": active["sub"], "scopes": active["scopes"], "calendars": settings["calendars"], "guard": dispatch_guard}
+                return callback(active["access_token"], calendar_id, deadline, context)
             return callback(active["access_token"], calendar_id, deadline)

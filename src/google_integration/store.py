@@ -50,6 +50,9 @@ class GoogleStore:
                 CREATE TABLE IF NOT EXISTS menus (
                     chat TEXT PRIMARY KEY, generation INTEGER NOT NULL, revision INTEGER NOT NULL,
                     expires REAL NOT NULL, payload BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS calendar_operations (
+                    chat TEXT NOT NULL, operation_key TEXT NOT NULL, payload BLOB NOT NULL,
+                    PRIMARY KEY(chat,operation_key));
             """)
         self.path.chmod(0o600)
 
