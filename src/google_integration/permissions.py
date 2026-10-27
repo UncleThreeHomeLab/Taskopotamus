@@ -94,10 +94,13 @@ class GooglePermissions:
         generation, active = self.oauth.credentials(chat, deadline)
         if not scopes_allow({BASE_SCOPES[2]}, active["scopes"]):
             raise PermissionError("Calendar list permission missing. Reconnect Google.")
+        return generation, self.catalog(active["access_token"], deadline)
+
+    def catalog(self, token, deadline):
         catalog, seen, page = {}, set(), None
         for _ in range(5):
             remaining(deadline)
-            response = self.oauth.transport.calendar_list(active["access_token"], page, deadline)
+            response = self.oauth.transport.calendar_list(token, page, deadline)
             remaining(deadline)
             items = response.get("items", [])
             if not isinstance(items, list) or len(items) > 100:
@@ -111,11 +114,40 @@ class GooglePermissions:
                                         "mode": "off"}
             page = response.get("nextPageToken")
             if page is None:
-                return generation, catalog
+                return catalog
             if not isinstance(page, str) or not 1 <= len(page) <= 2048 or page in seen:
                 break
             seen.add(page)
         raise GoogleUnavailable("Calendar list incomplete. Existing settings preserved.")
+
+    def confirmed_settings(self, pending, generation, deadline):
+        resume = pending["resume"]
+        if (not isinstance(resume, dict) or set(resume) != {"sub", "generation", "revision", "expires", "settings"}
+                or resume["sub"] != pending["sub"] or type(resume["generation"]) is not int
+                or resume["generation"] + 1 != generation or type(resume["revision"]) is not int
+                or resume["revision"] < 0 or type(resume["expires"]) not in (int, float)
+                or not self.store.clock() < resume["expires"] <= self.store.clock() + 600):
+            raise ValueError("Saved permission request expired or changed. Send /google.")
+        requested = resume["settings"]
+        self.validate(requested)
+        scopes = pending["scopes"]
+        settings = {"gmail": "read" if requested["gmail"] == "read" and scopes_allow({GMAIL_READ}, scopes) else "off",
+                    "calendars": {key: {**entry, "mode": "off"} for key, entry in requested["calendars"].items()}}
+        eligible = {key: entry["mode"] for key, entry in requested["calendars"].items()
+                    if entry["mode"] != "off" and scopes_allow(
+                        {CALENDAR_EDIT if entry["mode"] == "edit" else CALENDAR_READ}, scopes)}
+        if eligible and scopes_allow({BASE_SCOPES[2]}, scopes):
+            settings["calendars"] = self.catalog(pending["access_token"], deadline)
+            for key, mode in eligible.items():
+                entry = settings["calendars"].get(key)
+                if entry and (entry["role"] in ("writer", "owner") or mode == "read" and entry["role"] == "reader"):
+                    entry["mode"] = mode
+        unavailable = int(requested["gmail"] != settings["gmail"]) + sum(
+            entry["mode"] != "off" and settings["calendars"].get(key, {}).get("mode") != entry["mode"]
+            for key, entry in requested["calendars"].items())
+        notice = (f"Saved permitted choices. {unavailable} requested permissions remain Off because Google consent or calendar access is unavailable."
+                  if unavailable else "Saved requested permissions.")
+        return settings, notice
 
     def control(self, chat, request_id, action, token=None):
         validate_chat(chat)
@@ -148,7 +180,7 @@ class GooglePermissions:
                         result = {"state": "menu", "text": "Calendar list unavailable or incomplete. Existing settings preserved. Send /calendars to retry, or /google connect to renew consent. All access resets Off when reconnecting.", "keyboard": []}
                         self.store.save_command(db, chat, request_id, identity, result)
                     return result
-            transition = None
+            transition, resume = None, None
             remaining(deadline)
             with self.store.transaction(deadline) as db:
                 row = self.store.connection(db, chat)
@@ -199,6 +231,7 @@ class GooglePermissions:
                         granted = scopes_allow(needed, active["scopes"])
                         if increasing and not granted:
                             transition = ("connect", None, sorted(set(BASE_SCOPES) | needed))
+                            resume = {"sub": active["sub"], "generation": generation, "revision": revision, "settings": draft}
                         else:
                             # The read, revision comparison and write share one immediate transaction.
                             revision += 1
@@ -230,7 +263,8 @@ class GooglePermissions:
                     self.store.save_command(db, chat, request_id, identity, result)
                     return result
             kind, argument, scopes = transition
-            return self.oauth._control(chat, request_id, kind, argument, requested_scopes=scopes, identity_override=identity)
+            return self.oauth._control(chat, request_id, kind, argument, requested_scopes=scopes,
+                                       identity_override=identity, resume=resume)
 
     def render(self, db, chat, connection, revision, menu):
         actions, keyboard = {}, []
@@ -248,7 +282,8 @@ class GooglePermissions:
         if connection["pending"]:
             pending = self.store.open(chat, generation, "pending", connection["pending"])
             text = ["Google account waiting for confirmation: " + plain(pending["email"], 254),
-                    "Confirm only your intended account. All access stays Off; reopen settings and Save after confirmation."]
+                    ("Confirm your intended account to apply saved choices, limited to granted access."
+                     if "resume" in pending else "Confirm only your intended account. All access stays Off; reopen settings and Save after confirmation.")]
             buttons([("Confirm account", "confirm", pending["confirmation"])])
         elif menu["view"] == "login_pending":
             text = ["Google login is pending. Finish browser login, then send /google to confirm the account.",
@@ -299,7 +334,7 @@ class GooglePermissions:
                     navigation.append(("Next", "page", page + 1))
                 if navigation:
                     buttons(navigation)
-            text.append("Save may request extra Google consent and reset ALL access Off. After login, confirm here, reopen settings and Save again.")
+            text.append("Save may request extra Google consent. Your choices will apply after account confirmation, limited to granted access.")
             buttons([("Save", "save", None)])
         menu["actions"] = actions
         menu.setdefault("expires", self.store.clock() + 600)
