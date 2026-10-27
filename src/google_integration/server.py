@@ -122,8 +122,10 @@ def make_handler(oauth, control_secret, public=False, configuration_error=False)
                     flags += "; Secure"
                 return self.send(303, "Continue Google login in your browser.",
                                  (("Location", location), ("Set-Cookie", "google_oauth=" + cookie + flags)))
-            if parts.path != redirect.path or not set(parameters) <= {"state", "code", "error", "scope", "authuser", "prompt", "hd"}:
+            if parts.path != redirect.path:
                 return self.send(404, "Not found.")
+            if "iss" in parameters and parameters["iss"] != "https://accounts.google.com":
+                raise ValueError()
             if not parameters.get("state") or ("code" in parameters) == ("error" in parameters):
                 raise ValueError()
             if len(self.headers.get_all("Cookie", [])) != 1:
