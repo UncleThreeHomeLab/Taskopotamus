@@ -13,7 +13,7 @@ from .agent_client import AgentClient
 from .agent_client import AgentRequestError
 from .google_client import GoogleClient
 from .media import TelegramRejected, rejection, send_media
-from .inbox import Inbox
+from .inbox import Inbox, direct_control, google_command
 from .input_files import InputRejected, download
 from .reply_context import extract_reply_context, with_reply_context
 from .delivery_store import DeliveryStore
@@ -50,14 +50,18 @@ def reply_for(message, allowed_users, agent=None, request_id=None, _structured=F
     text = message.get("text")
     if not isinstance(text, str):
         return None
-    if text == "/google" or text.startswith("/google "):
-        if (type(message["chat"].get("id")) is not int
-                or message["chat"]["id"] != message["from"].get("id")):
+    if google_command(text):
+        if not direct_control(message):
+            return None
+        if text.startswith("/google_callback") and message.get("_google_callback") != text.removeprefix("/google_callback "):
             return None
         if _google is None:
             return "Google connection is not configured. Ask the deployment owner to check Google setup."
         try:
-            return _google.command(message["chat"]["id"], request_id, text)
+            result = _google.command(message["chat"]["id"], request_id, text)
+            if _structured and isinstance(result, str):
+                return {"google_control": True, "text": result, "keyboard": []}
+            return result
         except RuntimeError:
             return "Google request unavailable or expired. Send /google to check before retrying."
     if text == "/start":
@@ -212,7 +216,13 @@ def process_update(update, allowed_users, agent, token, store, wake=None, persis
                 store.finish(update_id)
                 return
             if isinstance(result, dict):
-                if not isinstance(result.get("delivery_id"), str):
+                if result.get("google_control") is True:
+                    if command_attempt is None:
+                        raise RuntimeError("Google control reservation required.")
+                    store.mark_uncertain(update_id)
+                    agent.publish_google_control(message["chat"]["id"], str(update_id), command_attempt,
+                                                 result["text"], result["keyboard"])
+                elif not isinstance(result.get("delivery_id"), str):
                     # An old cached or interrupted reply has no proof of prior delivery.
                     agent.import_legacy_delivery(message["chat"]["id"], str(update_id), reply_chunks(result["text"]), 0)
             else:
@@ -256,6 +266,8 @@ def deliver_one(agent, token, allowed_users):
             }
             if item.get("parse_mode") is not None:
                 body["parse_mode"] = item["parse_mode"]
+            if delivery.get("google_keyboard"):
+                body["reply_markup"] = {"inline_keyboard": delivery["google_keyboard"]}
             result = api(token, "sendMessage", body)
         elif item.get("type") in ("image", "file"):
             info = delivery.get("artifact") or agent.artifact_info(delivery["chat_id"], item["artifact_id"])
@@ -302,6 +314,12 @@ def process_input(job, inbox, allowed_users, agent, token, store, wake, _google=
         inbox.finish(identifier)
         return
     messages = job["messages"]
+    if any(google_command(message.get("text")) for message in messages):
+        if (len(messages) != 1 or not messages[0].get("control_origin")
+                or not direct_control(messages[0]["control_origin"]) or messages[0].get("files")
+                or messages[0]["control_origin"]["chat"]["id"] != int(chat)):
+            inbox.finish(identifier)
+            return
     files = [file for message in messages for file in message["files"]]
     text = "\n".join(message["text"] for message in messages if message["text"])
     contexts = []
@@ -330,6 +348,18 @@ def process_input(job, inbox, allowed_users, agent, token, store, wake, _google=
             "update_id": identifier,
             "message": {"chat": {"id": int(chat), "type": "private"}, "from": {"id": int(chat)}, "text": text},
         }
+        if google_command(text):
+            update["message"].update(messages[0]["control_origin"])
+        callback = messages[0].get("callback")
+        if callback:
+            if text != "/google_callback " + callback["data"]:
+                inbox.finish(identifier)
+                return
+            update["message"]["_google_callback"] = callback["data"]
+            try:
+                api(token, "answerCallbackQuery", {"callback_query_id": callback["id"]}, timeout=3)
+            except RuntimeError:
+                pass
         process_update(
             update, allowed_users, agent, token, store, wake, persisted=True, _reply_contexts=contexts, _google=_google,
         )
@@ -463,7 +493,7 @@ def main():
                     {
                         "offset": inbox.offset,
                         "timeout": 25,
-                        "allowed_updates": ["message"],
+                        "allowed_updates": ["message", "callback_query"],
                     },
                 )
                 for update in updates:

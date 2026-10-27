@@ -130,6 +130,11 @@ class AgentClient:
             body["command_attempt"] = command_attempt
         return self.request("/messaging/publish", "POST", body)
 
+    def publish_google_control(self, chat_id, request_id, command_attempt, text, keyboard):
+        return self.request("/messaging/google-control", "POST", {
+            "chat_id": str(chat_id), "request_id": str(request_id), "command_attempt": command_attempt,
+            "text": text, "keyboard": keyboard})
+
     def lookup_reply(self, chat_id, request_id):
         return self.request("/messaging/lookup", "POST", {"chat_id": str(chat_id), "request_id": str(request_id)})[
             "reply"

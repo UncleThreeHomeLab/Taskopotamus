@@ -166,6 +166,11 @@ class MessagingAPI:
                 elif path == "/messaging/local-command":
                     self.fields(payload, {"chat_id", "request_id", "command"})
                     data = self.deliveries.reserve_command(payload["chat_id"], payload["request_id"], payload["command"])
+                elif path == "/messaging/google-control":
+                    self.fields(payload, {"chat_id", "request_id", "command_attempt", "text", "keyboard"})
+                    self.deliveries.validate_google_menu(payload["text"], payload["keyboard"])
+                    data = self.deliveries.complete_command(payload["chat_id"], payload["request_id"],
+                                                           payload["command_attempt"], payload["text"], payload["keyboard"])
                 elif path == "/messaging/publish":
                     self.fields(payload, {"chat_id", "request_id", "text"} | ({"command_attempt"} if "command_attempt" in payload else set()))
                     if not isinstance(payload["text"], str):

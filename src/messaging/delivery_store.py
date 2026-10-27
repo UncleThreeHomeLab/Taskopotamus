@@ -37,6 +37,26 @@ class DeliveryStore:
                 reply_id TEXT REFERENCES outgoing_replies(id), message_key TEXT NOT NULL, items TEXT NOT NULL,
                 PRIMARY KEY(reply_id,message_key))""")
             db.execute("ALTER TABLE outgoing_batches ADD COLUMN IF NOT EXISTS request_signature TEXT")
+            db.execute("""CREATE TABLE IF NOT EXISTS google_control_menus (
+                reply_id TEXT PRIMARY KEY REFERENCES outgoing_replies(id), keyboard TEXT NOT NULL)""")
+
+    @staticmethod
+    def google_command(command):
+        return isinstance(command, str) and command.split(maxsplit=1)[:1] in (["/google"], ["/calendars"], ["/google_callback"])
+
+    @staticmethod
+    def validate_google_menu(text, keyboard):
+        if not isinstance(text, str) or not 1 <= len(text) <= 2000 or not isinstance(keyboard, list) or len(keyboard) > 9:
+            raise ValueError("Invalid Google control menu.")
+        for row in keyboard:
+            if not isinstance(row, list) or not 1 <= len(row) <= 3:
+                raise ValueError("Invalid Google control buttons.")
+            for button in row:
+                if (not isinstance(button, dict) or set(button) != {"text", "callback_data"}
+                        or not isinstance(button["text"], str) or not 1 <= len(button["text"]) <= 64
+                        or not isinstance(button["callback_data"], str)
+                        or not re.fullmatch(r"g:[A-Za-z0-9_-]{32}", button["callback_data"])):
+                    raise ValueError("Invalid Google control button.")
 
     def reserve_command(self, chat_id, request_id, command):
         identity(chat_id, request_id)
@@ -52,6 +72,11 @@ class DeliveryStore:
             if reply:
                 return {"reply": reply, "attempt": None}
             if previous:
+                if self.google_command(command):
+                    # Google owns durable action idempotency; reuse its complete request identity after a crash.
+                    attempt = db.execute("SELECT attempt FROM local_commands WHERE chat_id=%s AND request_id=%s",
+                                         (chat_id, request_id)).fetchone()[0]
+                    return {"reply": None, "attempt": attempt}
                 # A prior caller may have performed the action before losing its acknowledgement.
                 notice = "Previous command outcome is uncertain. Check current state before sending the command again."
                 self.publish(db, chat_id, request_id, [{"type": "text", "text": notice}], outcome="failed")
@@ -61,21 +86,31 @@ class DeliveryStore:
             db.execute("INSERT INTO local_commands VALUES (%s,%s,%s,%s,'reserved')", (chat_id, request_id, command, attempt))
             return {"reply": None, "attempt": attempt}
 
-    def complete_command(self, chat_id, request_id, attempt, text):
+    def complete_command(self, chat_id, request_id, attempt, text, google_keyboard=None):
         identity(chat_id, request_id)
         opaque_id(attempt)
+        if google_keyboard is not None:
+            self.validate_google_menu(text, google_keyboard)
         with self.database.connect() as db:
             db.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", ("command:" + chat_id + ":" + request_id,))
-            row = db.execute("SELECT attempt,state FROM local_commands WHERE chat_id=%s AND request_id=%s FOR UPDATE",
+            row = db.execute("SELECT attempt,state,command FROM local_commands WHERE chat_id=%s AND request_id=%s FOR UPDATE",
                              (chat_id, request_id)).fetchone()
             if not row or row[0] != attempt:
                 raise ValueError("Invalid local command attempt.")
+            if google_keyboard is not None and (identity(chat_id, request_id) != "telegram" or not self.google_command(row[2])):
+                raise ValueError("Reserved Google command required.")
             existing = self.get(chat_id, request_id, db)
             if existing:
                 return existing
             if row[1] != "reserved":
                 raise ValueError("Local command no longer active.")
-            self.publish(db, chat_id, request_id, [{"type": "text", "text": text}])
+            reply_id = self.publish(db, chat_id, request_id, [{"type": "text", "text": text}])
+            if google_keyboard is not None:
+                # Untrusted Google labels are plain application text, never Markdown or model item metadata.
+                db.execute("DELETE FROM outgoing_items WHERE reply_id=%s AND sequence>0", (reply_id,))
+                db.execute("UPDATE outgoing_items SET item=%s WHERE reply_id=%s AND sequence=0",
+                           (json.dumps({"type": "text", "text": text}, ensure_ascii=False), reply_id))
+                db.execute("INSERT INTO google_control_menus VALUES (%s,%s)", (reply_id, json.dumps(google_keyboard)))
             db.execute("UPDATE local_commands SET state='completed' WHERE chat_id=%s AND request_id=%s", (chat_id, request_id))
             return self.get(chat_id, request_id, db)
 
@@ -236,8 +271,12 @@ class DeliveryStore:
             db.execute("INSERT INTO delivery_attempts VALUES (%s,%s,%s,'inflight',NULL)", (attempt, row[0], row[1]))
             db.execute("""INSERT INTO delivery_pacing VALUES (%s,%s) ON CONFLICT(chat_id)
                 DO UPDATE SET not_before=EXCLUDED.not_before""", (row[3], self.clock() + 1))
-            return {"delivery_id": row[0], "sequence": row[1], "item": item,
-                    "chat_id": row[3], "request_id": row[4], "attempt": attempt}
+            delivery = {"delivery_id": row[0], "sequence": row[1], "item": item,
+                        "chat_id": row[3], "request_id": row[4], "attempt": attempt}
+            menu = db.execute("SELECT keyboard FROM google_control_menus WHERE reply_id=%s", (row[0],)).fetchone()
+            if menu and row[1] == 0:
+                delivery["google_keyboard"] = json.loads(menu[0])
+            return delivery
 
     def acknowledge(self, reply_id, sequence, attempt, state, receipt=None):
         opaque_id(reply_id)

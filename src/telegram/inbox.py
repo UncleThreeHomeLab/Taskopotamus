@@ -1,11 +1,46 @@
 """Durable receipt cursor and bounded album jobs, independent from processing."""
 import json
 import time
+import re
 
 from .reply_context import extract_reply_context
 
 
+def google_command(text):
+    return (isinstance(text, str) and text.startswith("/")
+            and text.split(maxsplit=1)[:1] in (["/google"], ["/calendars"], ["/google_callback"]))
+
+
+def direct_control(message):
+    return (type(message.get("chat", {}).get("id")) is int
+            and message["chat"]["id"] > 0
+            and type(message.get("from", {}).get("id")) is int
+            and message["chat"]["id"] == message["from"]["id"]
+            and not any(key in message for key in ("forward_origin", "forward_date", "forward_from", "forward_from_chat",
+                                                   "quote", "external_reply", "reply_to_message", "via_bot")))
+
+
 def normalize(update, allowed):
+    callback = update.get("callback_query")
+    if callback is not None:
+        if not isinstance(callback, dict):
+            return None
+        message = callback.get("message")
+        sender = callback.get("from")
+        data, identifier = callback.get("data"), callback.get("id")
+        if (not isinstance(message, dict) or not isinstance(sender, dict)
+                or not isinstance(message.get("chat"), dict) or message["chat"].get("type") != "private"
+                or str(sender.get("id")) not in allowed
+                or type(sender.get("id")) is not int or sender["id"] != message["chat"].get("id")
+                or type(message.get("message_id")) is not int or message["message_id"] <= 0
+                or not isinstance(identifier, str) or not 1 <= len(identifier) <= 256
+                or not isinstance(data, str) or not re.fullmatch(r"g:[A-Za-z0-9_-]{32}", data)):
+            return None
+        origin = {"chat": message["chat"], "from": sender}
+        if not direct_control({**message, "from": sender}):
+            return None
+        return {"chat_id": str(sender["id"]), "text": "/google_callback " + data, "files": [], "error": None,
+                "control_origin": origin, "callback": {"id": identifier, "data": data, "message_id": message["message_id"]}}
     message = update.get("message")
     if (
         not isinstance(message, dict)
@@ -19,8 +54,7 @@ def normalize(update, allowed):
     if type(chat) is not int or chat <= 0:
         return None
     text = message.get("text", message.get("caption", ""))
-    if (isinstance(text, str) and (text == "/google" or text.startswith("/google "))
-            and message["from"].get("id") != chat):
+    if google_command(text) and not direct_control(message):
         return None
     if not isinstance(text, str) or len(text) > 16000:
         return {"chat_id": str(chat), "text": "", "files": [], "error": "Message text is invalid or too long."}
@@ -72,6 +106,10 @@ def normalize(update, allowed):
         error = "Invalid media album."
         album = None
     item = {"chat_id": str(chat), "text": text, "files": files, "album": album, "error": error}
+    if google_command(text):
+        item["control_origin"] = {"chat": message["chat"], "from": message["from"]}
+        if files or album:
+            return None
     context = extract_reply_context(message)
     if context:
         item["reply_context"] = context
