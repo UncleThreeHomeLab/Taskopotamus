@@ -7,9 +7,10 @@ from contextlib import contextmanager
 from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from urllib.request import ProxyHandler, Request, build_opener
 
 from .store import digest, validate_chat
+from .data_protocol import GoogleUnavailable, NoRedirects, remaining, bounded_body
 
 
 BASE_SCOPES = ("openid", "email", "https://www.googleapis.com/auth/calendar.calendarlist.readonly")
@@ -19,17 +20,8 @@ REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 CALENDAR_LIST_URL = "https://www.googleapis.com/calendar/v3/users/me/calendarList"
 
 
-class GoogleUnavailable(RuntimeError):
-    pass
-
-
 class GrantExpired(GoogleUnavailable):
     pass
-
-
-class NoRedirects(HTTPRedirectHandler):
-    def redirect_request(self, *_args, **_kwargs):
-        return None
 
 
 class GoogleTransport:
@@ -85,29 +77,6 @@ class GoogleTransport:
             raise GoogleUnavailable("Calendar list unavailable.") from None
         except (URLError, OSError, ValueError, HTTPException):
             raise GoogleUnavailable("Calendar list unavailable.") from None
-
-
-def remaining(deadline):
-    duration = deadline - time.monotonic()
-    if duration <= 0:
-        raise GoogleUnavailable("Google request timed out.")
-    return min(10, duration)
-
-
-def bounded_body(response, limit, deadline):
-    body = bytearray()
-    while len(body) <= limit:
-        if response.fp is None:
-            remaining(deadline)
-            return body
-        # read1 performs at most one socket read; update timeout before every read to bound slow bodies.
-        response.fp.raw._sock.settimeout(remaining(deadline))
-        chunk = response.read1(min(8192, limit + 1 - len(body)))
-        if not chunk:
-            remaining(deadline)
-            return body
-        body.extend(chunk)
-    raise ValueError("Google response too large.")
 
 
 @contextmanager
@@ -291,11 +260,13 @@ class GoogleOAuth:
             result["refresh_token"] = value["refresh_token"]
         return result
 
-    def credentials(self, chat, deadline=None):
+    def credentials(self, chat, deadline=None, *, run_guard=None):
         """Service-internal only. Never expose this result through HTTP or model tools."""
         validate_chat(chat)
         deadline = deadline or time.monotonic() + 20
         with bounded_lock(self.lifecycle_lock, deadline), bounded_lock(self.refresh_lock, deadline):
+            if run_guard is not None:
+                deadline = min(deadline, run_guard())
             with self.store.transaction(deadline) as db:
                 row = self.store.connection(db, chat)
                 if row["status"] != "active" or not row["active"]:
@@ -303,6 +274,8 @@ class GoogleOAuth:
                 active = self.store.open(chat, row["generation"], "active", row["active"])
             if active["expires_at"] > self.store.clock() + 60:
                 return row["generation"], active
+            if run_guard is not None:
+                deadline = min(deadline, run_guard())
             try:
                 response = self.transport.request(TOKEN_URL, {"client_id": self.config.client_id,
                     "client_secret": self.config.client_secret, "refresh_token": active["refresh_token"],

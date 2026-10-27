@@ -9,7 +9,7 @@ from src.runtime import private_directory
 SECRET_NAMES = (
     "agent_api_token", "profile_signing_key", "postgres_admin_password",
     "agent_database_password", "profile_database_password", "telegram_database_password", "silo_root_password",
-    "google_control_secret", "google_token_encryption_key",
+    "google_control_secret", "google_token_encryption_key", "google_data_secret",
 )
 
 

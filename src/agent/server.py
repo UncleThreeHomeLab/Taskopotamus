@@ -23,7 +23,7 @@ from src.messaging.delivery_store import DeliveryStore
 from src.messaging.http_api import MessagingAPI
 
 
-def make_handler(auth, api_token, chat=None, messaging=None):
+def make_handler(auth, api_token, chat=None, messaging=None, google_data=None):
     if len(api_token) < 32 or not api_token.isascii():
         raise ValueError("Agent API token must contain at least 32 ASCII characters.")
 
@@ -61,6 +61,8 @@ def make_handler(auth, api_token, chat=None, messaging=None):
 
         def respond(self):
             try:
+                if google_data is not None and google_data.dispatch(self):
+                    return
                 if messaging is not None and messaging.dispatch(self, api_token):
                     return
                 if not (
@@ -216,7 +218,12 @@ def main():
                 stopped.wait(policy.sweep_seconds)
         maintenance = threading.Thread(target=maintain, daemon=True)
         maintenance.start()
-        with AgentHTTPServer(("0.0.0.0", 8080), make_handler(auth, api_token, chat, MessagingAPI(deliveries, artifacts))) as server:
+        from .google_data import GoogleDataAPI
+        google_secret = read_secret("GOOGLE_DATA_SECRET")
+        if len(google_secret) < 32 or not google_secret.isascii():
+            raise ValueError("Invalid Google data secret.")
+        google_data = GoogleDataAPI(artifacts, google_secret)
+        with AgentHTTPServer(("0.0.0.0", 8080), make_handler(auth, api_token, chat, MessagingAPI(deliveries, artifacts), google_data)) as server:
             print("Agent service ready.", flush=True)
             try:
                 server.serve_forever()
