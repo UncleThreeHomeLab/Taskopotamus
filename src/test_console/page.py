@@ -62,6 +62,7 @@ button{{padding:.6rem .9rem;cursor:pointer}}nav{{display:flex;flex-wrap:wrap;gap
 <label for="files">Files (optional)</label><input id="files" type="file" name="files" multiple{disabled}>
 <p>Send text, files, or both. Maximum 10 files and 20 MB combined. PNG/JPEG images can be viewed directly; other files are available for inspection.</p>
 <p><button{disabled}>Send message</button></p></form>
-<section><h2>Latest run evidence</h2><p>Configured and requested models are not actual execution telemetry.
+<section><h2>Latest run evidence</h2><p>Child creation settings are resolved by the native runtime.
+Thread settings describe current configuration, not provider execution telemetry. Child labels count observed agents only.
 Command exit codes do not independently verify tests. Child commands may be unavailable in the parent result.</p><pre>{evidence}</pre></section>
 </body></html>'''

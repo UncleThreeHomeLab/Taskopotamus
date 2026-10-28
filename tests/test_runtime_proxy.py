@@ -254,11 +254,13 @@ class RuntimeProxyTests(unittest.TestCase):
                 except Exception:
                     error_file = root / "workspace" / "mcp-error"
                     self.fail(error_file.read_text() if error_file.exists() else "Synthetic MCP failed before its startup check")
+                first.parent_thread_id = thread.id
             retained = self.lifecycle.uid_processes(51003)
             with sessions.lease("42", {}, "synthetic-profile", "b" * 43, 20) as second:
                 self.assertTrue(second.reused)
                 second.resume(thread.id, cwd=str(root / "workspace"), config=config,
                               sandbox=Sandbox.full_access, approval_mode=ApprovalMode.deny_all)
+                second.parent_thread_id = thread.id
             self.assertEqual(self.lifecycle.uid_processes(51003), retained)
             records = [item.split(":") for item in observed.read_text().splitlines()]
             self.assertEqual([item[1] for item in records], ["a" * 43, "b" * 43])

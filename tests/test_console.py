@@ -8,10 +8,12 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest.mock import Mock
+from openai_codex.generated.v2_all import SubAgentActivityThreadItem
+from openai_codex._message_router import MessageRouter
 from urllib.parse import urlencode
 
 from src.agent.http_server import AgentHTTPServer
-from src.agent.run_details import summarize_run
+from src.agent.run_details import read_thread_metadata, summarize_run
 from src.agent.subagents import SubagentPolicy
 from src.telegram.agent_client import AgentClient, AgentRequestError
 from src.test_console.server import ConsoleState, make_handler
@@ -234,6 +236,76 @@ class ConsoleTests(unittest.TestCase):
 
 
 class RunDetailsTests(unittest.TestCase):
+    def test_metadata_read_is_typed_bounded_and_drops_late_response(self):
+        router = MessageRouter()
+        client = SimpleNamespace(_router=router, _write_message=Mock())
+        with self.assertRaises(TimeoutError):
+            read_thread_metadata(client, "private-thread", .001)
+        request_id = client._write_message.call_args.args[0]["id"]
+        self.assertFalse(client._write_message.call_args.args[0]["params"]["includeTurns"])
+        self.assertNotIn(request_id, router._response_waiters)
+        router.route_response({"id": request_id, "result": {"private": "late reply"}})
+        self.assertEqual(router._response_waiters, {})
+        before = client._write_message.call_count
+        with self.assertRaises(TimeoutError):
+            read_thread_metadata(client, "private-thread", 0)
+        self.assertEqual(client._write_message.call_count, before)
+
+        payload = {"id": "private-thread", "cliVersion": "0.163.0", "createdAt": 0, "updatedAt": 0,
+                   "ephemeral": True, "cwd": "/workspace", "modelProvider": "synthetic", "preview": "synthetic-secret",
+                   "source": "exec", "status": {"type": "idle"}, "turns": [], "sessionId": "private-session",
+                   "model": "synthetic-child", "reasoningEffort": "high", "parentThreadId": "private-parent"}
+        client._write_message.side_effect = lambda message: router.route_response({"id": message["id"],
+                                                                                 "result": {"thread": payload}})
+        metadata = read_thread_metadata(client, "private-thread", .01)
+        self.assertEqual(metadata["model"], "synthetic-child")
+        self.assertTrue(metadata["ephemeral"])
+        self.assertNotIn("synthetic-secret", json.dumps(metadata))
+        self.assertNotIn("private-session", json.dumps(metadata))
+        self.assertEqual(router._response_waiters, {})
+
+    def activity(self, identifier, kind="started", model="synthetic-child", effort="high"):
+        return SubAgentActivityThreadItem(id="private-item", agent_path="private-path", agent_thread_id=identifier,
+                                          kind=kind, model=model, reasoning_effort=effort, type="subAgentActivity")
+
+    def test_native_child_creation_is_unique_resolved_and_private(self):
+        response = SimpleNamespace(status="completed", items=[
+            self.activity("private-child"), self.activity("private-child", "completed", None, None),
+        ])
+        details = summarize_run(response, "synthetic-parent", "low", SubagentPolicy(), parent_id="private-parent",
+                                native_threads={"private-child": {"parent_id": "private-parent", "model": "synthetic-child",
+                                                "reasoning": "high", "status": "idle", "ephemeral": True}})
+        self.assertEqual(details["observed_child_count"], 1)
+        self.assertEqual(details["child_activity_count"], 2)
+        self.assertEqual(details["agents"][0], {
+            "child": 1, "activity": "completed", "resolved_model": "synthetic-child", "resolved_reasoning": "high",
+            "runtime_model": "synthetic-child", "runtime_reasoning": "high", "runtime_status": "idle", "ephemeral": True,
+        })
+        self.assertFalse(details["agent_evidence_incomplete"])
+        self.assertIsNone(details["actual_execution_model"])
+        self.assertNotIn("private-", json.dumps(details))
+
+    def test_old_or_unrelated_metadata_is_not_current_request_allocation(self):
+        response = SimpleNamespace(status="completed", items=[self.activity("private-wrong-child")])
+        details = summarize_run(response, "synthetic-parent", "low", SubagentPolicy(), parent_id="private-parent",
+                                native_threads={
+                                    "private-wrong-child": {"parent_id": "another-parent", "model": "secret-model"},
+                                    "private-old-child": {"parent_id": "private-parent", "model": "stale-model"},
+                                })
+        self.assertEqual(details["agents"], [])
+        self.assertTrue(details["agent_evidence_incomplete"])
+        self.assertNotIn("secret-model", json.dumps(details))
+        self.assertNotIn("stale-model", json.dumps(details))
+
+    def test_child_evidence_marks_truncation_and_unavailable_settings(self):
+        response = SimpleNamespace(status="completed", items=[self.activity(str(number), model="bad\nmodel")
+                                                               for number in range(25)])
+        details = summarize_run(response, "synthetic-parent", "low", SubagentPolicy())
+        self.assertEqual(details["observed_child_count"], 20)
+        self.assertTrue(details["agent_evidence_truncated"])
+        self.assertTrue(details["agent_evidence_incomplete"])
+        self.assertTrue(all(agent["resolved_model"] is None for agent in details["agents"]))
+
     def test_evidence_is_bounded_allowlisted_and_never_infers_test_success(self):
         command = SimpleNamespace(type="commandExecution", status="completed", exit_code=0, duration_ms=2,
                                   command="synthetic-secret", aggregated_output="10 tests passed synthetic-secret")

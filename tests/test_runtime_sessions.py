@@ -11,6 +11,8 @@ from unittest.mock import Mock, patch
 
 from openai_codex import Codex, CodexConfig
 from openai_codex.generated.v2_all import ThreadLoadedListResponse
+from openai_codex.errors import InvalidRequestError
+from src.agent.run_details import cleanup_failure
 
 from src.agent.runtime_session import RuntimeSessions, RuntimeLease, RuntimeState, RuntimePaused, RuntimeClosed
 from src.agent.worker_transport import WorkspaceStorageError
@@ -142,16 +144,48 @@ class RuntimeSessionTests(unittest.TestCase):
                        self.clients[0]._client._proc.stderr):
             stream.close.assert_called_once()
 
-    def test_every_loaded_page_is_archived_and_verified_empty(self):
+    def test_parent_cleanup_refreshes_loaded_threads_before_pausing(self):
         client = Mock()
-        client._client.request.side_effect = [ThreadLoadedListResponse(data=["parent"], next_cursor="page2"),
-                                            ThreadLoadedListResponse(data=["child"], next_cursor=None),
+        client._client.request.side_effect = [ThreadLoadedListResponse(data=["child"], next_cursor="page2"),
+                                            ThreadLoadedListResponse(data=["parent"], next_cursor=None),
+                                            ThreadLoadedListResponse(data=[], next_cursor=None),
                                             ThreadLoadedListResponse(data=[], next_cursor=None), RuntimePaused(paused=True)]
         lease = RuntimeLease(client, {}, False)
+        lease.parent_thread_id = "parent"
         lease.finish()
-        self.assertEqual([call.args[0] for call in client.thread_archive.call_args_list], ["parent", "child"])
-        self.assertEqual([call.args[0] for call in client.thread_unarchive.call_args_list], ["parent", "child"])
+        self.assertEqual([call.args[0] for call in client.thread_archive.call_args_list], ["parent"])
+        self.assertEqual([call.args[0] for call in client.thread_unarchive.call_args_list], ["parent"])
+        self.assertEqual(lease.cleanup_counts["remaining_after_parent"], 0)
         self.assertEqual(client._client.request.call_args.args[0], "taskopotamus/runtime/end")
+
+    def test_remaining_child_is_not_mutated_and_never_pauses(self):
+        client = Mock()
+        client._client.request.side_effect = [ThreadLoadedListResponse(data=["child", "parent"], next_cursor=None),
+                                            ThreadLoadedListResponse(data=["child"], next_cursor=None)]
+        child = {"id": "child", "parent_id": "parent", "model": "synthetic", "reasoning": "high",
+                 "ephemeral": False, "status": "idle"}
+        parent = {**child, "id": "parent", "parent_id": None}
+        lease = RuntimeLease(client, {}, False)
+        lease.parent_thread_id = "parent"
+        with patch("src.agent.runtime_session.read_thread_metadata", side_effect=[child, parent]), \
+                self.assertRaises(RuntimeError):
+            lease.finish()
+        self.assertEqual([call.args[0] for call in client.thread_archive.call_args_list], ["parent"])
+        client.thread_unarchive.assert_not_called()
+        self.assertEqual(lease.cleanup_error["stage"], "verify_unloaded")
+        self.assertFalse(lease.finished)
+        self.assertNotIn("taskopotamus/runtime/end", [call.args[0] for call in client._client.request.call_args_list])
+
+    def test_unlinked_remaining_thread_is_not_archived(self):
+        client = Mock()
+        client._client.request.side_effect = [ThreadLoadedListResponse(data=["parent", "unlinked"], next_cursor=None),
+                                            ThreadLoadedListResponse(data=["unlinked"], next_cursor=None)]
+        lease = RuntimeLease(client, {}, False)
+        lease.parent_thread_id = "parent"
+        with self.assertRaises(RuntimeError):
+            lease.finish()
+        self.assertEqual([call.args[0] for call in client.thread_archive.call_args_list], ["parent"])
+        self.assertEqual(lease.cleanup_error["stage"], "verify_unloaded")
 
     def test_published_reply_can_discard_runtime_without_retrying_turn(self):
         with self.lease() as lease:
@@ -159,6 +193,28 @@ class RuntimeSessionTests(unittest.TestCase):
             lease.discarded = True
         self.assertIsNone(self.sessions.client)
         self.assertFalse(self.sessions.failed)
+
+    def test_cleanup_diagnostics_are_safe_and_do_not_claim_pause_on_failure(self):
+        client = Mock()
+        client._client.request.return_value = ThreadLoadedListResponse(data=["private-thread"], next_cursor=None)
+        client.thread_archive.side_effect = RuntimeError("synthetic-secret path and credentials")
+        lease = RuntimeLease(client, {}, False)
+        lease.parent_thread_id = "private-thread"
+        with self.assertRaises(RuntimeError):
+            lease.finish()
+        self.assertEqual(lease.cleanup_error["stage"], "archive")
+        self.assertEqual(lease.cleanup_error["error_type"], "RuntimeError")
+        self.assertNotIn("private-thread", json.dumps(lease.cleanup_error))
+        self.assertNotIn("synthetic-secret", json.dumps(lease.cleanup_error))
+        self.assertFalse(lease.finished)
+        self.assertNotIn("taskopotamus/runtime/end", [call.args[0] for call in client._client.request.call_args_list])
+        self.assertIsNone(cleanup_failure("archive", RuntimeError("secret"), {"ephemeral": "secret"})["target_ephemeral"])
+        error = RuntimeError("private message")
+        error.message, error.code = "private-thread managed sub-agent cannot archive", -32600
+        diagnostic = cleanup_failure("archive", error, {"ephemeral": False, "role": "child"})
+        self.assertEqual(diagnostic["target_role"], "child")
+        self.assertEqual(diagnostic["categories"], ["subagent", "archive", "managed"])
+        self.assertNotIn("private", json.dumps(diagnostic))
 
 
 class RequestScopeTests(unittest.TestCase):
@@ -193,6 +249,15 @@ class RequestScopeTests(unittest.TestCase):
 
 @unittest.skipIf(os.name == "nt", "Pinned native Linux configuration check")
 class NativeArchiveTests(unittest.TestCase):
+    def test_ephemeral_native_thread_has_no_archivable_rollout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with Codex(CodexConfig(env={"CODEX_HOME": directory})) as codex:
+                thread = codex.thread_start(cwd=directory, ephemeral=True)
+                self.assertTrue(thread.read(include_turns=False).thread.ephemeral)
+                with self.assertRaises(InvalidRequestError) as caught:
+                    codex.thread_archive(thread.id)
+                self.assertEqual(caught.exception.code, -32600)
+
     def test_archive_unloads_native_tools_and_resume_reads_fresh_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

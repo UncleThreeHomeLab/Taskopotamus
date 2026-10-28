@@ -13,7 +13,7 @@ from openai_codex.errors import JsonRpcError
 
 from src.profiles.instructions import load_system_instructions
 from src.profiles.auth import ProfileTokens
-from .run_details import summarize_run
+from .run_details import cleanup_failure, summarize_run
 from .compaction_policy import CompactionPolicy
 from .instruction_refresh import refresh_instructions
 from .subagents import SubagentPolicy
@@ -312,6 +312,8 @@ class ChatService:
                     thread = codex.thread_start(**options)
                     db.execute("INSERT INTO conversations VALUES (%s, %s)", (chat_id, thread.id))
                     db.commit()
+                if lease is not None:
+                    lease.parent_thread_id = thread.id
                 # Failed turns and model switches must not leave stale window metadata behind.
                 db.execute("DELETE FROM thread_context WHERE thread_id = %s", (thread.id,))
                 db.commit()
@@ -383,20 +385,33 @@ class ChatService:
                     print("Failure finalization unavailable; request outcome uncertain.", file=sys.stderr, flush=True)
                 raise
             cleanup_started = time.monotonic()
+            cleanup_error = None
             if lease is not None:
                 try:
                     lease.finish()
                 except Exception:
                     lease.discarded = True
+                    cleanup_error = lease.cleanup_error
                     print("Completed reply retained; warm runtime discarded after cleanup failure.", file=sys.stderr, flush=True)
+            try:
+                # Close now, while the database is usable, so disposal is timed and callbacks run once.
+                runtime.close()
+            except Exception as error:
+                cleanup_error = cleanup_failure("runtime_exit", error)
+                print("Completed reply retained; runtime cleanup requires recovery.", file=sys.stderr, flush=True)
             timings["cleanup"] = round((time.monotonic() - cleanup_started) * 1000)
             timings["request_total"] = round((time.monotonic() - started) * 1000)
             if include_details:
                 details = None
                 try:
-                    details = summarize_run(response, self.model, self.effort, self.subagents)
+                    details = summarize_run(
+                        response, self.model, self.effort, self.subagents, parent_id=thread.id,
+                        native_threads=lease.native_threads if lease else None,
+                        metadata_incomplete=lease.metadata_incomplete if lease else False,
+                    )
                     details.update(system_timings_ms=timings, runtime_reused=lease.reused if lease else False,
-                                   runtime_retained=bool(lease and lease.finished and not lease.discarded))
+                                   runtime_retained=bool(lease and lease.finished and not lease.discarded),
+                                   cleanup=lease.cleanup_counts if lease else {}, cleanup_error=cleanup_error)
                 except Exception:
                     # A telemetry defect must not discard a completed reply or cause another paid turn.
                     pass
