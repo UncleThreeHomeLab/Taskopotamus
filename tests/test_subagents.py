@@ -15,6 +15,7 @@ from src.agent.subagents import SubagentPolicy
 from src.agent.worker_keys import prepare_keys
 from src.agent.worker_transport import command, configure_transport, main as transport_main
 from src.agent.server import main as server_main
+from src.agent.run_details import thread_metadata
 
 
 class SubagentTests(unittest.TestCase):
@@ -26,6 +27,29 @@ class SubagentTests(unittest.TestCase):
                     config=SubagentPolicy().config(),
                 )
                 self.assertTrue(thread.id)
+                metadata = thread_metadata(thread.read(include_turns=False).thread)
+                self.assertEqual(metadata["id"], thread.id)
+                self.assertIsNotNone(metadata["model"])
+
+    def test_owner_mode_policy_and_configured_values_reach_native_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = SubagentPolicy(model="synthetic-child", effort="medium").config()
+            key = "features.multi_agent_v2.multi_agent_mode_hint_text"
+            self.assertIn("synthetic-child", config[key])
+            self.assertIn("medium", config[key])
+            marker = "Synthetic owner delegation policy."
+            config[key] = marker
+            arguments = [str(bundled_codex_path())]
+            for name, value in config.items():
+                arguments.extend(["-c", f"{name}={json.dumps(value)}"])
+            arguments.extend(["debug", "prompt-input", "Synthetic question"])
+            result = subprocess.run(arguments, capture_output=True, text=True, timeout=20, cwd=directory,
+                                    env={**os.environ, "CODEX_HOME": directory, "HOME": directory})
+        self.assertEqual(result.returncode, 0, "Pinned native runtime rejected owner delegation mode.")
+        modes = [item for item in json.loads(result.stdout) if "multi_agent.mode_instructions" in
+                 item.get("internal_chat_message_metadata_passthrough", {}).get("content_item_kinds", [])]
+        self.assertEqual(len(modes), 1)
+        self.assertEqual(modes[0]["content"][0]["text"], f"<multi_agent_mode>{marker}</multi_agent_mode>")
 
     def test_server_refuses_full_access_with_a_local_runtime(self):
         with patch.dict(os.environ, {"CODEX_BIN": "/local/codex"}, clear=True), \

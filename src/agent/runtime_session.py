@@ -10,6 +10,7 @@ from openai_codex.generated.v2_all import ThreadLoadedListResponse
 from pydantic import BaseModel, ConfigDict, StrictBool
 
 from .worker_transport import WorkspaceStorageError
+from .run_details import cleanup_failure, read_thread_metadata
 
 
 class RuntimeState(BaseModel):
@@ -155,7 +156,7 @@ class RuntimeSessions:
                     if blocked:
                         raise WorkspaceStorageError("Workspace storage limit reached.") from None
                 raise
-            lease = RuntimeLease(client, workspace, reused)
+            lease = RuntimeLease(client, workspace, reused, deadline=deadline)
             yield lease
             if not lease.discarded:
                 lease.finish()
@@ -175,10 +176,16 @@ class RuntimeSessions:
 
 
 class RuntimeLease:
-    def __init__(self, client, workspace, reused):
+    def __init__(self, client, workspace, reused, deadline=None):
         self.client, self.workspace, self.reused = client, workspace, reused
         self.finished = False
         self.published, self.discarded = False, False
+        self.parent_thread_id = None
+        self.native_threads = {}
+        self.metadata_incomplete = False
+        self.cleanup_error = None
+        self.cleanup_counts = {}
+        self.deadline = deadline
 
     def resume(self, thread_id, **options):
         try:
@@ -208,15 +215,60 @@ class RuntimeLease:
     def finish(self):
         if self.finished:
             return
-        loaded = self._loaded()
-        for thread_id in loaded:
-            self.client.thread_archive(thread_id)
-        for thread_id in loaded:
-            # Unarchive restores rollout availability without loading its tools or resuming execution.
-            self.client.thread_unarchive(thread_id)
-        if self._loaded():
-            raise RuntimeError("Native threads did not unload.")
-        response = RuntimeSessions._rpc(self.client, "end", {"unloaded": True}, RuntimePaused)
-        if response.paused is not True:
-            raise RuntimeError("Runtime did not enter idle state.")
-        self.finished = True
+        stage, target = "list_loaded", None
+        try:
+            loaded = self._loaded()
+            metadata_deadline = min(self.deadline or float("inf"), time.monotonic() + 2)
+            for thread_id in loaded[:21]:
+                if time.monotonic() >= metadata_deadline:
+                    self.metadata_incomplete = True
+                    break
+                try:
+                    metadata = read_thread_metadata(self.client._client, thread_id, metadata_deadline - time.monotonic())
+                    if metadata is not None and metadata["id"] == thread_id:
+                        metadata["role"] = (
+                            "parent" if thread_id == self.parent_thread_id
+                            else "child" if self.parent_thread_id and metadata["parent_id"] == self.parent_thread_id
+                            else "unlinked" if self.parent_thread_id else "unknown"
+                        )
+                        self.native_threads[thread_id] = metadata
+                    else:
+                        self.metadata_incomplete = True
+                except Exception:
+                    # Optional settings evidence must not change the cleanup or paid turn outcome.
+                    self.metadata_incomplete = True
+            self.metadata_incomplete |= len(self.native_threads) != len(loaded)
+            self.cleanup_counts = {
+                "loaded_threads": len(loaded),
+                "ephemeral_threads": sum(value["ephemeral"] for value in self.native_threads.values()),
+                "persistent_threads": sum(not value["ephemeral"] for value in self.native_threads.values()),
+                "metadata_unavailable": len(loaded) - len(self.native_threads),
+            }
+            archived_parent = False
+            stage = "verify_unloaded"
+            if loaded and not self.parent_thread_id:
+                raise RuntimeError("Loaded threads have no owning conversation.")
+            if self.parent_thread_id in loaded:
+                stage, target = "archive", self.native_threads.get(self.parent_thread_id, {"role": "parent"})
+                self.client.thread_archive(self.parent_thread_id)
+                archived_parent = True
+            stage, target = "verify_unloaded", None
+            remaining = self._loaded() if loaded else []
+            self.cleanup_counts["remaining_after_parent"] = len(remaining)
+            if remaining:
+                raise RuntimeError("Native threads remained loaded after conversation cleanup.")
+            if archived_parent:
+                stage, target = "unarchive", self.native_threads.get(self.parent_thread_id, {"role": "parent"})
+                # Only restore the conversation; child rollout state is not needed for the next request.
+                self.client.thread_unarchive(self.parent_thread_id)
+            stage, target = "verify_unloaded", None
+            if self._loaded():
+                raise RuntimeError("Native threads did not unload.")
+            stage = "pause"
+            response = RuntimeSessions._rpc(self.client, "end", {"unloaded": True}, RuntimePaused)
+            if response.paused is not True:
+                raise RuntimeError("Runtime did not enter idle state.")
+            self.finished = True
+        except Exception as error:
+            self.cleanup_error = cleanup_failure(stage, error, target)
+            raise

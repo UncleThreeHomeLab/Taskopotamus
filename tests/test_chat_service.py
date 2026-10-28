@@ -82,9 +82,16 @@ class ChatServiceTests(unittest.TestCase):
     def test_published_reply_survives_cleanup_failure_without_duplicate_inference(self):
         chat, sessions, factory = self.warm_chat()
         self.codex.thread_archive.side_effect = RuntimeError("synthetic archive failure")
-        first = chat.reply("42", "hello", "1", include_details=True)
+        clock = Mock(return_value=0)
+        self.codex.close.side_effect = lambda: setattr(clock, "return_value", 7)
+        with patch("src.agent.chat_service.time.monotonic", clock):
+            first = chat.reply("42", "hello", "1", include_details=True)
         self.assertEqual(first["text"], "Hello")
         self.assertFalse(first["details"]["runtime_retained"])
+        self.assertEqual(first["details"]["cleanup_error"]["stage"], "archive")
+        self.assertGreaterEqual(first["details"]["system_timings_ms"]["cleanup"], 7000)
+        self.assertGreaterEqual(first["details"]["system_timings_ms"]["request_total"], 7000)
+        self.codex.close.assert_called_once()
         self.assertIsNone(sessions.client)
         self.assertEqual(chat.reply("42", "hello", "1", include_details=True), first)
         self.turn.run.assert_called_once()
