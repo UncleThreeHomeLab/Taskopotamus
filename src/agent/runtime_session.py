@@ -34,13 +34,10 @@ class RuntimeClosed(BaseModel):
 
 
 class RuntimeSessions:
-    def __init__(self, factory, profile_url="http://mcp:8080", agent_ip="10.203.17.30", idle_seconds=300, cleanup_status=None):
-        if type(idle_seconds) is not int or not 10 <= idle_seconds <= 3600:
-            raise ValueError("Runtime idle lifetime must be between 10 and 3600 seconds.")
+    def __init__(self, factory, profile_url="http://mcp:8080", agent_ip="10.203.17.30", cleanup_status=None):
         self.factory, self.profile_url, self.agent_ip = factory, profile_url, agent_ip
-        self.idle_seconds = idle_seconds
         self.cleanup_status = cleanup_status
-        self.client, self.identity, self.last_used = None, None, 0
+        self.client, self.identity = None, None
         self.active, self.failed = False, False
         self.guard = threading.RLock()
 
@@ -129,8 +126,7 @@ class RuntimeSessions:
                 raise BlockingIOError("Agent is busy.")
             self.active = True
             try:
-                if self.client is not None and (not self._alive() or self.identity != identity
-                                                or time.monotonic() - self.last_used >= self.idle_seconds):
+                if self.client is not None and (not self._alive() or self.identity != identity):
                     self._close()
                 reused = self.client is not None
                 if self.client is None:
@@ -146,7 +142,7 @@ class RuntimeSessions:
                 workspace = self._rpc(client, "begin", {"scope": {
                     "profile_token": token, "artifact_token": artifact_token, "profile_url": self.profile_url,
                     "agent_ip": self.agent_ip, "deadline": time.time() + deadline - time.monotonic(),
-                }, "idle_seconds": self.idle_seconds}, RuntimeState).model_dump()
+                }}, RuntimeState).model_dump()
             except Exception:
                 with self.guard:
                     self._close()
@@ -164,7 +160,6 @@ class RuntimeSessions:
             if not lease.discarded:
                 lease.finish()
                 finished = True
-                self.last_used = time.monotonic()
         finally:
             with self.guard:
                 try:

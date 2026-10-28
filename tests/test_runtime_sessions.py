@@ -7,7 +7,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from openai_codex import Codex, CodexConfig
 from openai_codex.generated.v2_all import ThreadLoadedListResponse
@@ -63,6 +63,20 @@ class RuntimeSessionTests(unittest.TestCase):
         begins = [params for method, params in self.calls if method.endswith("/begin")]
         self.assertNotEqual(begins[0]["scope"]["artifact_token"], begins[1]["scope"]["artifact_token"])
 
+    def test_same_chat_reuses_native_after_extended_idle_time(self):
+        with patch("src.agent.runtime_session.time.monotonic", return_value=1000) as clock:
+            with self.lease() as first:
+                pass
+            clock.return_value = 4600
+            with self.lease(token="b") as second:
+                self.assertTrue(second.reused)
+                self.assertIs(first.client, second.client)
+        self.assertEqual(self.factory.call_count, 1)
+        first.client.close.assert_not_called()
+        begins = [params for method, params in self.calls if method.endswith("/begin")]
+        self.assertTrue(all(set(params) == {"scope"} for params in begins))
+        self.assertNotEqual(begins[0]["scope"]["artifact_token"], begins[1]["scope"]["artifact_token"])
+
     def test_chat_config_reset_and_auth_invalidate_without_killing_active_work(self):
         with self.lease():
             with self.assertRaises(BlockingIOError), self.sessions.authentication():
@@ -87,7 +101,7 @@ class RuntimeSessionTests(unittest.TestCase):
             self.assertFalse(lease.reused)
         self.assertEqual(self.factory.call_count, 2)
 
-    def test_natural_idle_exit_requires_trusted_cleanup_then_restarts(self):
+    def test_dead_worker_requires_trusted_cleanup_then_restarts(self):
         with self.lease():
             pass
         old = self.clients[0]

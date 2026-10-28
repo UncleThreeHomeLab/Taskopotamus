@@ -39,12 +39,19 @@ from pathlib import Path
 spec=importlib.util.spec_from_file_location('lifecycle',Path('deploy/worker/workspace_lifecycle.py'))
 lifecycle=importlib.util.module_from_spec(spec);spec.loader.exec_module(lifecycle)
 root=Path(sys.argv[1]); lifecycle.CODEX=sys.executable
+real_monotonic=time.monotonic
+def shifted_monotonic():
+ try: offset=float((root/'clock-offset').read_text())
+ except FileNotFoundError: offset=0
+ return real_monotonic()+offset
+time.monotonic=shifted_monotonic
 worker=lifecycle.WorkspaceLifecycle(workspace=root/'workspace',saved=root/'saved',state=root/'state',
  runtime_home=root/'native',auth_home=root/'auth',retention=30,runtime_uid=51003,auth_uid=51004)
 worker.initialize()
 if sys.argv[2]!='pinned-native':
  lifecycle.atomic_write(worker.auth_home/'auth.json',b'{"synthetic_version":"initial"}',uid=51004)
 def stage(_token):
+ if (root/'long-retention').exists(): worker.retention=3600
  pids=lifecycle.uid_processes(51003)
  assert len(pids)==1
  assert '\nState:\tT' in Path('/proc',str(pids[0]),'status').read_text()
@@ -123,7 +130,7 @@ class RuntimeProxyTests(unittest.TestCase):
         return self.receive(self.send(method, params))
 
     def begin(self, token="a", lifetime=10):
-        return self.rpc("taskopotamus/runtime/begin", {"idle_seconds": 10, "scope": {
+        return self.rpc("taskopotamus/runtime/begin", {"scope": {
             "profile_token": "synthetic-profile", "artifact_token": token * 43,
             "profile_url": "http://mcp:8080", "agent_ip": "10.203.17.30", "deadline": time.time() + lifetime}})
 
@@ -161,6 +168,25 @@ class RuntimeProxyTests(unittest.TestCase):
         self.rpc("forge", {})
         self.assertTrue((self.root / "runtime-scope" / "current.json").exists())
         self.assertIsNone(self.process.poll())
+
+    def test_idle_runtime_survives_former_cutoff_without_request_authority(self):
+        (self.root / "long-retention").touch()
+        self.begin()
+        retained = self.lifecycle.uid_processes(51003)
+        self.assertEqual(len(retained), 1)
+        descendant = self.rpc("spawn", {})["pid"]
+        self.rpc("taskopotamus/runtime/end", {"unloaded": True})
+        self.assertNotIn(descendant, self.lifecycle.uid_processes(51003))
+        self.lifecycle.atomic_write(self.root / "clock-offset", b"301")
+        time.sleep(.3)
+        self.assertIsNone(self.process.poll())
+        self.assertEqual(self.lifecycle.uid_processes(51003), retained)
+        self.assertIn("\nState:\tT", Path("/proc", str(retained[0]), "status").read_text())
+        self.assertFalse((self.root / "runtime-scope" / "current.json").exists())
+        self.begin("b")
+        self.assertEqual(self.lifecycle.uid_processes(51003), retained)
+        fresh = load_scope(self.root / "runtime-scope" / "current.json", runtime_gid=51003)
+        self.assertEqual(fresh["artifact_token"], "b" * 43)
 
     def test_stalled_privileged_input_staging_obeys_request_deadline(self):
         (self.root / "stall-stage").touch()

@@ -43,7 +43,6 @@ class RuntimeProxy:
         self.closing_output = b""
         state = lifecycle.read_state()
         self.deadline = time.monotonic() + min(30, state["created_at"] + lifecycle.retention - time.time())
-        self.idle_seconds = 300
         self.scope = lifecycle.state.parent / "runtime-scope" / "current.json"
 
     def pause(self):
@@ -79,11 +78,8 @@ class RuntimeProxy:
         if operation == "close" and not params:
             return message["id"]
         if operation == "begin":
-            if self.phase not in ("initial", "idle") or set(params) != {"scope", "idle_seconds"}:
+            if self.phase not in ("initial", "idle") or set(params) != {"scope"}:
                 raise ValueError("Invalid runtime transition.")
-            idle = params["idle_seconds"]
-            if type(idle) is not int or not 10 <= idle <= 3600:
-                raise ValueError("Invalid runtime lifetime.")
             scope = validate_scope(params["scope"])
             if scope["agent_ip"] != self.lifecycle.agent_ip:
                 raise ValueError("Invalid runtime endpoint.")
@@ -96,7 +92,6 @@ class RuntimeProxy:
             self.lifecycle.stage_inputs(scope["artifact_token"])
             self.lifecycle.directory(self.scope.parent, 0o755)
             self.lifecycle.write_scope(self.scope, scope)
-            self.idle_seconds = idle
             self.deadline = time.monotonic() + scope["deadline"] - time.time()
             if self.deadline <= time.monotonic():
                 raise TimeoutError("Runtime scope expired.")
@@ -110,7 +105,7 @@ class RuntimeProxy:
             self.phase = "idle"
             state = self.lifecycle.read_state()
             remaining = state["created_at"] + self.lifecycle.retention - time.time()
-            self.deadline = time.monotonic() + min(self.idle_seconds, remaining)
+            self.deadline = time.monotonic() + remaining
             result = {"paused": True}
         else:
             raise ValueError("Invalid runtime control.")

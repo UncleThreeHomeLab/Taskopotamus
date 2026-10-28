@@ -190,7 +190,6 @@ def main():
                 raise
         sessions = RuntimeSessions(runtime_factory, profile_url=profiles.url,
                                    agent_ip=os.environ.get("WORKER_AGENT_IP", "10.203.17.30"),
-                                   idle_seconds=int(os.environ.get("CODEX_RUNTIME_IDLE_SECONDS", "300")),
                                    cleanup_status=workspace_status)
         auth = CodexAuth(lambda: Codex(CodexConfig(
             codex_bin=codex_config.codex_bin, config_overrides=codex_config.config_overrides,
