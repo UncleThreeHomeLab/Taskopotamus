@@ -26,7 +26,7 @@ FAILURE_TEXT = "This request could not finish or was interrupted. Its effects ma
 
 
 class ChatService:
-    def __init__(self, codex_factory, database, model="gpt-6-astra", effort="medium", turn_timeout=180, auto_compact_percent=None, profiles=None, subagents=None, workspace_status=None, artifacts=None, deliveries=None):
+    def __init__(self, codex_factory, database, model="gpt-6.1-sol", effort="medium", turn_timeout=180, auto_compact_percent=None, profiles=None, subagents=None, workspace_status=None, artifacts=None, deliveries=None):
         self.codex_factory = codex_factory
         self.database = database
         self.model = model
@@ -270,6 +270,7 @@ class ChatService:
                     "cwd": "/workspace",
                     "config": {
                         "model_reasoning_effort": self.effort, "features.shell_tool": True,
+                        "service_tier": "fast", "features.fast_mode": True,
                         "features.apps": False, "web_search": "disabled", **self.subagents.config(),
                         **profile_config,
                     },
