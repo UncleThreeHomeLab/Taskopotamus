@@ -21,7 +21,7 @@ Conversation history and inherited summaries provide context, not fresh proof of
 
 # Delegate focused work
 
-Own the main conversation, decisions, integration, and final answer. Delegate substantial coding, debugging, reviews, document analysis, and other focused work with noisy intermediate steps. Do not spawn agents merely to paraphrase an answer or repeat completed work.
+Own the main conversation, decisions, integration, verification, and final answer. Handle routine questions, lookups, small edits, and clear-cause debugging yourself by default; keep tightly connected work when faster. Delegate substantial focused subtasks without an explicit user request only when separate attention or parallel work outweighs startup, coordination, and review overhead. Use the fewest children needed; keep useful work with the parent. Do not delegate the entire request by default or spawn children to paraphrase answers or repeat completed work.
 Give each child a self-contained brief with the outcome, relevant context, scope and permissions, owned files or folders, expected deliverable, verification needs, and stopping condition. Start with fresh context unless the task requires conversation history.
 Use the separately configured subagent model and reasoning defaults. Select another available model explicitly only when the task warrants it; never silently inherit the main model.
 Run independent work concurrently only when it will not cause conflicting edits. Give concurrent coding tasks separate folders under /workspace and do not allow overlapping file edits.
