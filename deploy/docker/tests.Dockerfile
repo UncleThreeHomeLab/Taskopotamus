@@ -5,7 +5,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
 ENV PATH=/opt/tests/bin:$PATH PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY requirements*.txt ./
-RUN pip install --no-cache-dir -r requirements.txt -r requirements-mcp.txt -r requirements-google.txt
+RUN python -m pip install --no-cache-dir pip==26.2.2 \
+    && pip install --no-cache-dir -r requirements.txt -r requirements-mcp.txt -r requirements-google.txt
 COPY src/ ./src/
 RUN python -c "import shutil, site; shutil.copytree('/app/src/worker', site.getsitepackages()[0] + '/taskopotamus_worker')"
 COPY config/agent/ ./config/agent/
@@ -13,5 +14,5 @@ COPY tests/ ./tests/
 COPY deploy/postgres/ ./deploy/postgres/
 COPY deploy/worker/ ./deploy/worker/
 COPY deploy/testing/run_tests.sh /run_tests.sh
-USER postgres
+USER root
 ENTRYPOINT ["sh", "/run_tests.sh"]
