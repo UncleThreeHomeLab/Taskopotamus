@@ -18,6 +18,7 @@ x-database: &database
 services:
   storage-init:
     <<: *security
+    restart: "no"
     image: python:3.13-slim
     user: "0:0"
     network_mode: none
@@ -34,6 +35,7 @@ services:
 
   postgres:
     <<: *security
+    restart: unless-stopped
     image: postgres:18.6
     user: "999:999"
     group_add: ["10001"]
@@ -65,6 +67,8 @@ services:
 
   objects:
     <<: *security
+    profiles: [object-storage]
+    restart: unless-stopped
     image: pgsty/silo:RELEASE.2026-10-18T00-00-00Z
     user: "10001:10001"
     environment:
@@ -93,6 +97,7 @@ services:
 
   telegram:
     <<: *security
+    restart: unless-stopped
     build:
       context: .
       dockerfile: deploy/docker/telegram.Dockerfile
@@ -128,6 +133,7 @@ services:
 
   google:
     <<: *security
+    restart: unless-stopped
     build:
       context: .
       dockerfile: deploy/docker/google.Dockerfile
@@ -161,6 +167,7 @@ services:
 
   test-console:
     <<: *security
+    restart: "no"
     profiles: [manual-test]
     build:
       context: .
@@ -189,6 +196,7 @@ services:
 
   agent:
     <<: *security
+    restart: unless-stopped
     build:
       context: .
       dockerfile: deploy/docker/agent.Dockerfile
@@ -256,6 +264,7 @@ services:
 
   mcp:
     <<: *security
+    restart: unless-stopped
     build:
       context: .
       dockerfile: deploy/docker/mcp.Dockerfile
@@ -288,6 +297,7 @@ services:
 
   worker:
     <<: *security
+    restart: unless-stopped
     build:
       context: .
       dockerfile: deploy/docker/worker.Dockerfile
