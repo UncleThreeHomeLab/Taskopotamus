@@ -1,7 +1,7 @@
 FROM python:3.13-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 CODEX_HOME=/home/agent/.codex
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends openssh-client \
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 agent \
     && useradd --uid 10001 --gid 10001 --home-dir /home/agent --no-create-home agent

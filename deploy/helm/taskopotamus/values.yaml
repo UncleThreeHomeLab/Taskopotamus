@@ -1,0 +1,103 @@
+# Install one release per dedicated namespace: application endpoints use fixed Service names.
+# Build and publish/import the repository's five application images before installing.
+existingSecret: ""
+# Required keys: agent_api_token, profile_signing_key, google_data_secret,
+# google_control_secret, google_token_encryption_key, postgres_admin_password,
+# agent_database_password, profile_database_password, telegram_database_password,
+# worker_client_key, worker_host_key.pub, worker_host_key, worker_client_key.pub,
+# telegram_bot_token. objects additionally needs silo_root_password. OAuth additionally
+# needs google_oauth_client_id, google_oauth_client_secret, google_oauth_redirect_uri.
+# Rotate Secrets with coordinated restarts; database passwords require explicit SQL rotation.
+telegram:
+  allowedUserIds: []
+network:
+  # Choose available private IPv4 addresses from the actual Service CIDR. Keep fixed on upgrades.
+  agentServiceIP: ""
+  mcpServiceIP: ""
+  dnsIP: ""
+  # Include ALL Pod, Service, and node CIDRs, including any globally routable cluster ranges.
+  clusterCIDRs: []
+  clusterDomain: cluster.local
+  dnsNamespaceLabels:
+    kubernetes.io/metadata.name: kube-system
+  dnsPodLabels:
+    k8s-app: kube-dns
+# Requires enforcing NetworkPolicy CNI and Service VIPs visible to worker OUTPUT rules.
+# Socket-level eBPF Service translation may be incompatible; verify on the target cluster.
+images:
+  agent: {repository: taskopotamus-agent, tag: latest, pullPolicy: IfNotPresent}
+  mcp: {repository: taskopotamus-mcp, tag: latest, pullPolicy: IfNotPresent}
+  google: {repository: taskopotamus-google, tag: latest, pullPolicy: IfNotPresent}
+  telegram: {repository: taskopotamus-telegram, tag: latest, pullPolicy: IfNotPresent}
+  worker: {repository: taskopotamus-worker, tag: latest, pullPolicy: IfNotPresent}
+  postgres: {repository: postgres, tag: "18.6", pullPolicy: IfNotPresent}
+  objects: {repository: pgsty/silo, tag: RELEASE.2026-10-18T00-00-00Z, pullPolicy: IfNotPresent}
+agent:
+  model: gpt-6.1-sol
+  reasoningEffort: medium
+  autoCompactPercent: ""
+  subagentModel: gpt-6-luna
+  subagentReasoningEffort: high
+  subagentMaxThreads: 2
+  turnTimeoutSeconds: 600
+  artifacts:
+    maxFiles: 10
+    inputMaxBytes: 20000000
+    outputMaxBytes: 50000000
+    imageMaxBytes: 10000000
+    capacityBytes: 1073741824
+    stagingSeconds: 3600
+    retentionSeconds: 604800
+    sweepSeconds: 60
+worker:
+  retentionSeconds: 604800
+  sweepSeconds: 3600
+  maxBytes: 1073741824
+# Worker needs exact added capabilities and unsafe net.ipv6.conf.all.disable_ipv6 sysctl
+# admission on its node. Do not replace these with privileged mode. Configure node PID
+# and container-log limits separately; Kubernetes has no portable Compose pids_limit field.
+storage:
+  # Compatible CSI with ReadWriteOncePod is required for managed claims (Kubernetes >=1.29).
+  # Existing claims must enforce equivalent single-writer access. Do not force-delete Pods
+  # without storage fencing. PVC requests/admission checks do not prove hard disk quotas:
+  # use a backend that enforces capacity. Managed claims remain after Helm uninstall.
+  storageClassName: ""
+  sizes:
+    postgres: 20Gi
+    artifacts: 2Gi
+    google: 1Gi
+    native: 5Gi
+    workspace: 2Gi
+    saved: 2Gi
+    state: 1Gi
+    objects: 10Gi
+  existingClaims:
+    postgres: ""
+    artifacts: ""
+    google: ""
+    native: ""
+    workspace: ""
+    saved: ""
+    state: ""
+    objects: ""
+  legacyClaim: ""
+# Optional ConfigMap containing system_instructions.md. Directory projection allows updates;
+# absent this, images use their bundled instructions. Loader still enforces UTF-8/16384 bytes.
+instructionsConfigMap: ""
+google:
+  oauthEnabled: false
+# Local access only: port-forward google:8080 (OAuth callback path /oauth/google/callback)
+# or test-console:8088. No public Ingress or LoadBalancer is created.
+objects:
+  enabled: false
+console:
+  enabled: false
+resources:
+  postgres: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: "1", memory: 512Mi}}
+  agent: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: "1", memory: 1Gi}}
+  mcp: {requests: {cpu: 100m, memory: 64Mi}, limits: {cpu: 500m, memory: 256Mi}}
+  google: {requests: {cpu: 100m, memory: 64Mi}, limits: {cpu: 500m, memory: 128Mi}}
+  telegram: {requests: {cpu: 100m, memory: 64Mi}, limits: {cpu: 500m, memory: 128Mi}}
+  worker: {requests: {cpu: 250m, memory: 256Mi}, limits: {cpu: "2", memory: 2Gi}}
+  objects: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: "1", memory: 512Mi}}
+  test-console: {requests: {cpu: 100m, memory: 64Mi}, limits: {cpu: 500m, memory: 128Mi}}

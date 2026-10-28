@@ -1,0 +1,6 @@
+apiVersion: v2
+name: taskopotamus
+description: Private single-instance Taskopotamus services
+type: application
+version: 0.1.0
+kubeVersion: ">=1.29.0-0"

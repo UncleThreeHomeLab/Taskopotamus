@@ -1,0 +1,32 @@
+{{- include "taskopotamus.validate" . -}}
+{{- range $component := include "taskopotamus.components" . | fromJsonArray }}
+{{- if ne $component "telegram" }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $component }}
+  labels:
+    {{- include "taskopotamus.labels" (dict "root" $ "component" $component) | nindent 4 }}
+spec:
+  type: ClusterIP
+  ipFamilyPolicy: SingleStack
+  ipFamilies: [IPv4]
+  {{- if eq $component "agent" }}
+  clusterIP: {{ $.Values.network.agentServiceIP | quote }}
+  {{- else if eq $component "mcp" }}
+  clusterIP: {{ $.Values.network.mcpServiceIP | quote }}
+  {{- end }}
+  selector:
+    {{- include "taskopotamus.labels" (dict "root" $ "component" $component) | nindent 4 }}
+  ports:
+    {{- if eq $component "google" }}
+    - {name: callback, port: 8080, targetPort: 8080}
+    - {name: control, port: 8081, targetPort: 8081}
+    - {name: data, port: 8082, targetPort: 8082}
+    {{- else }}
+    {{- $port := index (dict "postgres" 5432 "worker" 2222 "test-console" 8088 "objects" 9000 "agent" 8080 "mcp" 8080) $component }}
+    - {name: service, port: {{ $port }}, targetPort: {{ $port }}}
+    {{- end }}
+{{- end }}
+{{- end }}

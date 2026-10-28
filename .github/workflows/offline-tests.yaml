@@ -1,0 +1,26 @@
+name: Offline verification
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  offline-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Build runtime images
+        run: docker compose --env-file .env.example --project-name taskopotamus-helm-validation build agent mcp google telegram worker
+      - name: Check chart init executable without network or credentials
+        run: |
+          for component in agent mcp google telegram worker; do
+            docker run --rm --network none --entrypoint /usr/bin/tini "taskopotamus-helm-validation-$component" --version
+          done
+      - name: Build offline test image
+        run: docker build -f deploy/docker/tests.Dockerfile -t taskopotamus-tests:ci .
+      - name: Run isolated application, Helm, and privileged security checks
+        run: docker run --rm --network none taskopotamus-tests:ci

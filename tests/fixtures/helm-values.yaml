@@ -1,0 +1,8 @@
+existingSecret: synthetic-taskopotamus
+telegram:
+  allowedUserIds: ["42"]
+network:
+  agentServiceIP: 10.96.3.30
+  mcpServiceIP: 10.96.3.18
+  dnsIP: 10.96.0.10
+  clusterCIDRs: [10.96.0.0/12, 10.244.0.0/16, 192.168.0.0/16]

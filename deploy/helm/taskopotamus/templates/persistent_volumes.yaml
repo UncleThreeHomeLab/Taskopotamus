@@ -1,0 +1,23 @@
+{{- $names := list "postgres" "artifacts" "google" "native" "workspace" "saved" "state" -}}
+{{- if .Values.objects.enabled -}}{{- $names = append $names "objects" -}}{{- end -}}
+{{- range $name := $names }}
+{{- if not (index $.Values.storage.existingClaims $name) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "taskopotamus.claim" (dict "root" $ "name" $name) }}
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "taskopotamus.labels" (dict "root" $ "component" $name) | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOncePod]
+  {{- if $.Values.storage.storageClassName }}
+  storageClassName: {{ $.Values.storage.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ index $.Values.storage.sizes $name | quote }}
+{{- end }}
+{{- end }}
