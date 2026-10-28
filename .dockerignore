@@ -4,6 +4,7 @@
 !requirements.txt
 !requirements-mcp.txt
 !requirements-storage.txt
+!requirements-google.txt
 !tests/
 !tests/**
 !config/

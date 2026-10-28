@@ -35,7 +35,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual({name: (credentials / name).read_text() for name in SECRET_NAMES}, saved)
         self.assertEqual(len(set(saved.values())), len(SECRET_NAMES))
         self.assertTrue(all(len(value) >= 32 for value in saved.values()))
-        self.assertEqual({path.name for path in data.iterdir()}, {"postgres", "objects", "codex", "legacy", "artifacts"})
+        self.assertEqual({path.name for path in data.iterdir()}, {"postgres", "objects", "codex", "legacy", "artifacts", "google"})
         if os.name != "nt":
             self.assertEqual(data.stat().st_mode & 0o777, 0o700)
             self.assertTrue(all(path.stat().st_mode & 0o777 == 0o600 for path in credentials.iterdir() if path.suffix != ".pub"))

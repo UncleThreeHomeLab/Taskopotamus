@@ -19,6 +19,9 @@ def normalize(update, allowed):
     if type(chat) is not int or chat <= 0:
         return None
     text = message.get("text", message.get("caption", ""))
+    if (isinstance(text, str) and (text == "/google" or text.startswith("/google "))
+            and message["from"].get("id") != chat):
+        return None
     if not isinstance(text, str) or len(text) > 16000:
         return {"chat_id": str(chat), "text": "", "files": [], "error": "Message text is invalid or too long."}
     files = []
