@@ -199,7 +199,7 @@ def main():
         chat = ChatService(
             runtime_factory,
             database,
-            model=os.environ.get("CODEX_MODEL", "gpt-6-astra"),
+            model=os.environ.get("CODEX_MODEL", "gpt-6.1-sol"),
             effort=os.environ.get("CODEX_REASONING_EFFORT", "medium"),
             auto_compact_percent=int(compact_percent) if compact_percent else None,
             profiles=profiles,

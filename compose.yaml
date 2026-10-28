@@ -196,7 +196,7 @@ services:
       <<: *database
       DATABASE_NAME: taskopotamus_agent
       DATABASE_USER: taskopotamus_agent
-      CODEX_MODEL: ${CODEX_MODEL:-gpt-6-astra}
+      CODEX_MODEL: ${CODEX_MODEL:-gpt-6.1-sol}
       CODEX_REASONING_EFFORT: ${CODEX_REASONING_EFFORT:-medium}
       CODEX_AUTO_COMPACT_PERCENT: ${CODEX_AUTO_COMPACT_PERCENT:-}
       CODEX_SUBAGENT_MODEL: ${CODEX_SUBAGENT_MODEL:-gpt-6-luna}
