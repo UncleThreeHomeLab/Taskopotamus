@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from cryptography.exceptions import InvalidTag
 
@@ -317,6 +317,62 @@ class GoogleConnectionTests(unittest.TestCase):
             body = {"chat_id": "42", "request_id": "2", "action": "confirm",
                     "confirmation": self.store.status("42")["pending"]["confirmation"]}
             self.assertEqual(self.request(control, "/control", body, auth)[0], 200)
+
+    def test_callback_response_metadata_preserves_authentication_and_confirmation(self):
+        with self.server(public=True) as public:
+            start = urlsplit(self.control("connect")["url"])
+            path = start.path + "?" + start.query
+            self.assertEqual(self.request(public, path + "&extra=metadata", public=True)[0], 404)
+            status, headers, _ = self.request(public, path, public=True)
+            self.assertEqual(status, 303)
+            state = parse_qs(urlsplit(headers["Location"]).query)["state"][0]
+            cookie = headers["Set-Cookie"].split(";", 1)[0]
+            callback = "/oauth/google/callback?" + urlencode({
+                "state": state, "code": "synthetic-code", "iss": "https://accounts.google.com",
+                "provider_metadata": "synthetic-private-metadata", "redirect_uri": "https://evil.example/ignored",
+            })
+            invalid = (
+                (callback.replace("accounts.google.com", "evil.example"), {"Cookie": cookie}, 400),
+                (callback + "&iss=https%3A%2F%2Faccounts.google.com", {"Cookie": cookie}, 400),
+                (callback + "&state=duplicate", {"Cookie": cookie}, 400),
+                (callback + "&error=access_denied", {"Cookie": cookie}, 400),
+                (callback, {}, 400),
+                (callback, {"Cookie": "google_oauth=wrong-cookie"}, 400),
+                (callback, {"Cookie": cookie, "Host": "evil.example"}, 400),
+                (callback.replace("/callback?", "/unknown?"), {"Cookie": cookie}, 404),
+            )
+            for path, request_headers, expected in invalid:
+                with self.subTest(path=path, headers=request_headers):
+                    self.assertEqual(self.request(public, path, headers=request_headers, public=True)[0], expected)
+                    self.assertEqual(self.transport.calls, [])
+            status, headers, text = self.request(public, callback, headers={"Cookie": cookie}, public=True)
+            self.assertEqual(status, 200)
+            self.assertEqual([call[0] for call in self.transport.calls], [TOKEN_URL, IDENTITY_URL])
+            self.assertEqual(headers["Cache-Control"], "no-store")
+            self.assertNotIn("synthetic-private-metadata", text)
+            self.assertNotIn("evil.example", text)
+            pending = self.store.status("42")["pending"]
+            with self.assertRaises(PermissionError):
+                self.oauth.credentials("42")
+            self.control("confirm", confirmation=pending["confirmation"])
+            self.assertEqual(self.store.status("42")["gmail"], "off")
+            self.assertEqual(self.store.status("42")["calendars"], "off")
+
+    def test_callback_response_metadata_denial_is_not_fetched_or_echoed(self):
+        state, cookie, *_ = self.start()
+        path = "/oauth/google/callback?" + urlencode({
+            "state": state, "error": "access_denied", "iss": "https://accounts.google.com",
+            "error_description": "synthetic-private-error", "error_uri": "https://evil.example/error",
+            "provider_metadata": "synthetic-extra",
+        })
+        with self.server(public=True) as public:
+            status, _, text = self.request(public, path, headers={"Cookie": "google_oauth=" + cookie}, public=True)
+            self.assertEqual(status, 200)
+            self.assertEqual(self.transport.calls, [])
+            self.assertNotIn("synthetic-private-error", text)
+            self.assertNotIn("evil.example", text)
+            self.assertNotIn("pending", self.store.status("42"))
+            self.assertEqual(self.request(public, path, headers={"Cookie": "google_oauth=" + cookie}, public=True)[0], 400)
 
     def test_google_transport_uses_fixed_endpoints_and_sanitizes_errors(self):
         transport = GoogleTransport()
