@@ -129,8 +129,10 @@ def make_server(client):
 
 
 def main():
-    make_server(CalendarClient(os.environ.get("TASKOPOTAMUS_ARTIFACT_AUTH", ""),
-                               os.environ.get("TASKOPOTAMUS_AGENT_IP", ""))).run(transport="stdio")
+    from .request_scope import credentials
+
+    scope = credentials()
+    make_server(CalendarClient(scope["artifact_token"], scope["agent_ip"])).run(transport="stdio")
 
 
 if __name__ == "__main__":

@@ -32,7 +32,7 @@ def configure_transport():
 
 def command(arguments, environment):
     mode = environment.get("TASKOPOTAMUS_WORKER_MODE")
-    if mode not in ("auth", "runtime", "status") or (mode == "status" and arguments):
+    if mode not in ("auth", "runtime", "warm", "status") or (mode == "status" and arguments):
         raise ValueError("Explicit worker mode is required.")
     return [
         "ssh", "-T", "-F", "/dev/null", "-p", "2222",
@@ -59,7 +59,10 @@ def workspace_status():
         raise ValueError("Invalid workspace status.")
     if type(status.get("admission_blocked")) is not bool or type(status.get("usage_bytes")) is not int:
         raise ValueError("Invalid workspace admission status.")
-    return {key: status[key] for key in ("generation", "retention_seconds", "expires_at", "admission_blocked", "usage_bytes")}
+    result = {key: status[key] for key in ("generation", "retention_seconds", "expires_at", "admission_blocked", "usage_bytes")}
+    if type(status.get("runtime_active")) is bool:
+        result["runtime_active"] = status["runtime_active"]
+    return result
 
 
 def main():

@@ -14,11 +14,12 @@ class NoRedirects(HTTPRedirectHandler):
 
 
 class ProfileClient:
-    def __init__(self, url, secret):
+    def __init__(self, url, secret, worker_scopes=False):
         parts = urlsplit(url)
         if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password or parts.query or parts.fragment:
             raise ValueError("Invalid profile service URL.")
         self.url = url.rstrip("/")
+        self.worker_scopes = worker_scopes
         self.tokens = ProfileTokens(secret)
         self.opener = build_opener(ProxyHandler({}), NoRedirects())
 
@@ -50,4 +51,11 @@ class ProfileClient:
             "mcp_servers.profiles.tools.get_agent_profile.approval_mode": "auto",
             "mcp_servers.profiles.tools.update_agent_profile.approval_mode": "auto",
         }
+        if self.worker_scopes:
+            del config["mcp_servers.profiles.url"], config["mcp_servers.profiles.env_http_headers"]
+            config.update({
+                "mcp_servers.profiles.command": "/usr/local/bin/python",
+                "mcp_servers.profiles.args": ["-I", "-m", "taskopotamus_worker.profile_mcp"],
+                "mcp_servers.profiles.env_vars": ["TASKOPOTAMUS_REQUEST_SCOPE"],
+            })
         return profile, config, token

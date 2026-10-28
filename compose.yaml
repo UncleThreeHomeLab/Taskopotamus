@@ -204,6 +204,7 @@ services:
       CODEX_SUBAGENT_MAX_THREADS: ${CODEX_SUBAGENT_MAX_THREADS:-2}
       CODEX_TURN_TIMEOUT_SECONDS: ${CODEX_TURN_TIMEOUT_SECONDS:-600}
       CODEX_BIN: /usr/local/bin/codex-worker
+      WORKER_AGENT_IP: ${WORKER_AGENT_IP:-10.203.17.30}
       WORKER_CLIENT_KEY_FILE: /run/secrets/worker_client_key
       WORKER_HOST_PUBLIC_KEY_FILE: /run/secrets/worker_host_public
       AGENT_API_TOKEN_FILE: /run/secrets/agent_api_token

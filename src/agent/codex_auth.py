@@ -1,4 +1,5 @@
 import threading
+from contextlib import nullcontext
 
 from .device_login import start_device_login
 
@@ -6,14 +7,15 @@ from .device_login import start_device_login
 class CodexAuth:
     """One shared Codex account for this personal deployment."""
 
-    def __init__(self, codex_factory):
+    def __init__(self, codex_factory, operation_scope=nullcontext):
         self.codex_factory = codex_factory
         self.lock = threading.Lock()
         self.pending = None
         self.failed = False
+        self.operation_scope = operation_scope
 
     def status(self):
-        with self.lock:
+        with self.lock, self.operation_scope():
             return self._status()
 
     def _status(self):
@@ -25,7 +27,7 @@ class CodexAuth:
         return {"state": "failed" if self.failed else "signed_out"}
 
     def login(self, restart=False):
-        with self.lock:
+        with self.lock, self.operation_scope():
             if self._status()["state"] == "signed_in":
                 return {"state": "signed_in"}
             if restart and self.pending is not None:

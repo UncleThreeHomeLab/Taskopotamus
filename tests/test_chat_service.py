@@ -21,6 +21,97 @@ from database_support import isolated_database
 
 
 class ChatServiceTests(unittest.TestCase):
+    def warm_chat(self):
+        from src.agent.runtime_session import RuntimeSessions, RuntimeState, RuntimePaused, RuntimeClosed
+        from openai_codex.generated.v2_all import ThreadLoadedListResponse
+        from src.messaging.artifacts import ArtifactStore
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        artifacts = ArtifactStore(self.database, Path(directory.name) / "artifacts")
+        profiles = Mock()
+        profiles.prepare.return_value = (DEFAULT_PROFILE, {}, "synthetic-profile")
+        loaded = set()
+
+        def thread(*_args, **_kwargs):
+            loaded.add(self.thread.id)
+            return self.thread
+
+        def request(method, _params, response_model):
+            if method.endswith("/begin"):
+                return RuntimeState(generation=0, retention_seconds=600, expires_at=9999999999,
+                                    sweep_seconds=60, max_bytes=1000000, cleaning=False, usage_bytes=0,
+                                    admission_blocked=False, runtime_active=True)
+            if method.endswith("/end"):
+                return RuntimePaused(paused=True)
+            if method.endswith("/close"):
+                return RuntimeClosed(closed=True)
+            return ThreadLoadedListResponse(data=sorted(loaded), next_cursor=None)
+
+        self.codex.thread_start.side_effect = thread
+        self.codex.thread_resume.side_effect = thread
+        self.codex.thread_archive.side_effect = loaded.discard
+        self.codex._client._proc.poll.return_value = None
+        self.codex._client.request.side_effect = request
+        factory = Mock(return_value=self.codex)
+        sessions = RuntimeSessions(factory)
+        self.addCleanup(sessions.shutdown)
+        chat = ChatService(self.codex_factory, self.database, profiles=profiles, artifacts=artifacts, runtime_sessions=sessions)
+        return chat, sessions, factory
+
+    def test_warm_runtime_reuse_cached_reply_and_reset(self):
+        chat, sessions, factory = self.warm_chat()
+        first = chat.reply("42", "hello", "1", include_details=True)
+        second = chat.reply("42", "continue", "2", include_details=True)
+        self.assertFalse(first["details"]["runtime_reused"])
+        self.assertTrue(second["details"]["runtime_reused"])
+        self.assertTrue(second["details"]["runtime_retained"])
+        self.assertIn("setup_total", second["details"]["system_timings_ms"])
+        self.assertEqual(factory.call_count, 1)
+        from src.agent.request_tools import request_config
+
+        for method in (self.codex.thread_start, self.codex.thread_resume):
+            config = method.call_args.kwargs["config"]
+            self.assertEqual({key: value for key, value in config.items() if key.startswith("mcp_servers.")}, request_config())
+        calls = self.codex._client.request.call_count
+        self.assertEqual(chat.reply("42", "continue", "2", include_details=True), second)
+        self.assertEqual(self.codex._client.request.call_count, calls)
+        chat.reset("42")
+        self.assertIsNone(sessions.client)
+
+    def test_published_reply_survives_cleanup_failure_without_duplicate_inference(self):
+        chat, sessions, factory = self.warm_chat()
+        self.codex.thread_archive.side_effect = RuntimeError("synthetic archive failure")
+        first = chat.reply("42", "hello", "1", include_details=True)
+        self.assertEqual(first["text"], "Hello")
+        self.assertFalse(first["details"]["runtime_retained"])
+        self.assertIsNone(sessions.client)
+        self.assertEqual(chat.reply("42", "hello", "1", include_details=True), first)
+        self.turn.run.assert_called_once()
+
+    def test_warm_begin_capacity_refusal_reaches_http_507_without_inference(self):
+        chat, sessions, _factory = self.warm_chat()
+        previous = self.codex._client.request.side_effect
+
+        def request(method, params, response_model):
+            if method.endswith("/begin"):
+                raise RuntimeError("synthetic private staging detail")
+            return previous(method, params, response_model)
+
+        self.codex._client.request.side_effect = request
+        sessions.cleanup_status = Mock(return_value={"runtime_active": False, "admission_blocked": True})
+        token = "synthetic-service-token-for-tests-only"
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(Mock(), token, chat))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        client = AgentClient(f"http://127.0.0.1:{server.server_port}", token)
+        with self.assertRaisesRegex(RuntimeError, "Workspace storage limit reached") as caught:
+            client.chat("42", "hello", "1")
+        self.assertEqual(caught.exception.status, 507)
+        self.assertNotIn("private", str(caught.exception))
+        self.turn.run.assert_not_called()
+
     def test_gmail_and_existing_tools_start_resume_and_cached_replay(self):
         from src.messaging.artifacts import ArtifactStore
         from src.agent.google_tools import google_config

@@ -7,6 +7,7 @@ WORKDIR /app
 COPY requirements*.txt ./
 RUN pip install --no-cache-dir -r requirements.txt -r requirements-mcp.txt -r requirements-google.txt
 COPY src/ ./src/
+RUN python -c "import shutil, site; shutil.copytree('/app/src/worker', site.getsitepackages()[0] + '/taskopotamus_worker')"
 COPY config/agent/ ./config/agent/
 COPY tests/ ./tests/
 COPY deploy/postgres/ ./deploy/postgres/

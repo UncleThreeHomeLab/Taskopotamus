@@ -40,15 +40,15 @@ def directory(path, mode, uid=0):
     path.chmod(mode)
 
 
-def atomic_write(path, content, uid=0):
+def atomic_write(path, content, uid=0, gid=None, mode=0o600):
     # Parent directories have fixed, non-writable ancestors; no user-supplied paths enter this function.
     parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     temporary = None
     try:
         descriptor, temporary = tempfile.mkstemp(prefix=".pending-", dir=path.parent)
         with os.fdopen(descriptor, "wb") as output:
-            os.fchmod(output.fileno(), 0o600)
-            os.fchown(output.fileno(), uid, uid)
+            os.fchmod(output.fileno(), mode)
+            os.fchown(output.fileno(), uid, uid if gid is None else gid)
             output.write(content)
             output.flush()
             os.fsync(output.fileno())
@@ -104,13 +104,13 @@ def uid_processes(uid):
     return result
 
 
-def stop_uid(uid, grace=2):
+def stop_uid(uid, grace=2, retained_pid=None):
     if uid == 0 or uid == os.getuid():
         raise ValueError("Refusing to stop supervisor identity.")
     for signum in (signal.SIGTERM, signal.SIGKILL):
         deadline = time.monotonic() + grace
         while True:
-            processes = uid_processes(uid)
+            processes = [pid for pid in uid_processes(uid) if pid != retained_pid]
             if not processes:
                 return
             for pid in processes:
@@ -126,7 +126,7 @@ def stop_uid(uid, grace=2):
             if time.monotonic() >= deadline:
                 break
             time.sleep(0.05)
-    if uid_processes(uid):
+    if [pid for pid in uid_processes(uid) if pid != retained_pid]:
         raise RuntimeError("Worker execution has not stopped.")
 
 
@@ -142,6 +142,9 @@ def wait_device_login(child, descriptor):
 
 
 class WorkspaceLifecycle:
+    proc_root = Path("/proc")
+    directory = staticmethod(directory)
+
     def __init__(self, workspace=Path("/workspace"), saved=Path("/saved"), state=Path("/var/lib/taskopotamus/state"),
                  runtime_home=Path("/home/agent/.codex"), auth_home=Path("/var/lib/taskopotamus/auth/.codex"),
                  retention=604800, sweep=3600, max_bytes=1073741824, runtime_uid=RUNTIME_UID, auth_uid=AUTH_UID, agent_ip="10.203.17.30"):
@@ -250,11 +253,24 @@ class WorkspaceLifecycle:
                     total += Path(root, name).lstat().st_size
         return total
 
-    def prepare(self, now=None, admission=False):
-        stop_uid(self.runtime_uid)
+    def stop_runtime_except(self, pid):
+        if pid not in uid_processes(self.runtime_uid):
+            raise RuntimeError("Retained native identity is unavailable.")
+        stop_uid(self.runtime_uid, retained_pid=pid)
+
+    def write_scope(self, path, value):
+        atomic_write(path, json.dumps(value).encode(), gid=self.runtime_uid, mode=0o440)
+
+    def prepare(self, now=None, admission=False, retained_pid=None):
+        if retained_pid is None:
+            stop_uid(self.runtime_uid)
+        else:
+            self.stop_runtime_except(retained_pid)
         value = self.read_state()
         now = time.time() if now is None else now
         if value["cleaning"] or now >= value["created_at"] + self.retention:
+            if retained_pid is not None:
+                raise RuntimeError("Workspace expired; runtime replacement required.")
             value["cleaning"] = True
             self.write_state(value)
             if not shutil.rmtree.avoids_symlink_attacks:
@@ -288,7 +304,7 @@ class WorkspaceLifecycle:
             raise ValueError("Invalid workspace admission state.")
         return {"generation": value["generation"], "expires_at": value["created_at"] + self.retention,
                 "retention_seconds": self.retention, "sweep_seconds": self.sweep, "max_bytes": self.max_bytes,
-                "cleaning": value["cleaning"], **admission}
+                "cleaning": value["cleaning"], "runtime_active": self.pending.exists(), **admission}
 
     def maintenance(self):
         try:
@@ -298,8 +314,9 @@ class WorkspaceLifecycle:
             pass
 
     def child_command(self, mode, arguments):
-        uid = self.runtime_uid if mode == "runtime" else self.auth_uid
-        home = self.workspace / ".home" if mode == "runtime" else self.auth_home.parent / "home"
+        runtime = mode in ("runtime", "warm")
+        uid = self.runtime_uid if runtime else self.auth_uid
+        home = self.workspace / ".home" if runtime else self.auth_home.parent / "home"
         directory(home, 0o700, uid)
         temporary = home / "tmp"
         directory(temporary, 0o700, uid)
@@ -308,7 +325,7 @@ class WorkspaceLifecycle:
                        "XDG_CONFIG_HOME": str(home / ".config"), "XDG_DATA_HOME": str(home / ".local/share"),
                        "PIP_CACHE_DIR": str(home / ".cache/pip"), "UV_CACHE_DIR": str(home / ".cache/uv"),
                        "npm_config_cache": str(home / ".cache/npm"), "PYTHONDONTWRITEBYTECODE": "1",
-                       "CODEX_HOME": str(self.runtime_home if mode == "runtime" else self.auth_home),
+                       "CODEX_HOME": str(self.runtime_home if runtime else self.auth_home),
                        "NO_COLOR": "1", "TERM": "dumb"}
         if mode == "runtime" and os.environ.get("TASKOPOTAMUS_PROFILE_AUTH"):
             environment["TASKOPOTAMUS_PROFILE_AUTH"] = os.environ["TASKOPOTAMUS_PROFILE_AUTH"]
@@ -318,22 +335,37 @@ class WorkspaceLifecycle:
                 raise ValueError("Invalid attachment capability.")
             environment["TASKOPOTAMUS_ARTIFACT_AUTH"] = token
             environment["TASKOPOTAMUS_AGENT_IP"] = self.agent_ip
+        if mode == "warm":
+            environment["TASKOPOTAMUS_REQUEST_SCOPE"] = str(self.state.parent / "runtime-scope" / "current.json")
         command = ["setpriv", f"--reuid={uid}", f"--regid={uid}", "--clear-groups", "--bounding-set=-all",
                    "--inh-caps=-all", "--ambient-caps=-all", "--no-new-privs", CODEX, *arguments]
-        return command, environment, self.workspace if mode == "runtime" else home
+        return command, environment, self.workspace if runtime else home
+
+    def stage_inputs(self, token):
+        from taskopotamus_worker.input_files import fetch_inputs, materialize_inputs
+
+        (self.state / "input-refusal.json").unlink(missing_ok=True)
+        manifest, source = fetch_inputs(token, self.agent_ip)
+        try:
+            materialize_inputs(manifest, source, self.workspace, self.max_bytes - self.usage(), self.runtime_uid)
+        except OverflowError:
+            atomic_write(self.state / "input-refusal.json", b'{"blocked":true}')
+            atomic_write(self.state / "admission.json", json.dumps({"usage_bytes": self.usage(), "admission_blocked": True}).encode())
+            raise RuntimeError("Input exceeds workspace storage limit.") from None
 
     def run(self, mode, arguments):
         from contextlib import ExitStack
         with ExitStack() as locks:
-            if mode == "runtime":
+            runtime = mode in ("runtime", "warm")
+            if runtime:
                 locks.enter_context(self.lock("workspace"))
             locks.enter_context(self.lock("credentials"))
             self.recover_credentials()
             stop_uid(self.auth_uid)
-            if mode == "runtime":
+            if runtime:
                 (self.state / "input-refusal.json").unlink(missing_ok=True)
                 self.prepare(admission=True)
-                token = os.environ.get("TASKOPOTAMUS_ARTIFACT_AUTH")
+                token = os.environ.get("TASKOPOTAMUS_ARTIFACT_AUTH") if mode == "runtime" else None
                 if token:
                     from taskopotamus_worker.input_files import fetch_inputs, materialize_inputs
 
@@ -351,13 +383,14 @@ class WorkspaceLifecycle:
                         raise RuntimeError("Input exceeds workspace storage limit.") from None
                 self.begin_runtime_credentials()
             command, environment, cwd = self.child_command(mode, arguments)
-            uid = self.runtime_uid if mode == "runtime" else self.auth_uid
+            uid = self.runtime_uid if runtime else self.auth_uid
             child = None
             previous = {}
 
             def interrupted(_signum, _frame):
                 raise InterruptedError("Worker operation interrupted.")
 
+            close_id = None
             try:
                 for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                     previous[signum] = signal.signal(signum, interrupted)
@@ -367,17 +400,40 @@ class WorkspaceLifecycle:
                     env=environment,
                     cwd=cwd,
                     start_new_session=True,
-                    stdin=subprocess.DEVNULL if login else None,
+                    stdin=subprocess.PIPE if mode == "warm" else subprocess.DEVNULL if login else None,
+                    stdout=subprocess.PIPE if mode == "warm" else None,
                 )
-                result = wait_device_login(child, sys.stdin.fileno()) if login else child.wait()
+                if mode == "warm":
+                    from taskopotamus_worker.runtime_supervisor import RuntimeProxy
+
+                    proxy = RuntimeProxy(self, child, sys.stdin.fileno(), sys.stdout.fileno())
+                    close_id = proxy.run()
+                    result = 0
+                else:
+                    result = wait_device_login(child, sys.stdin.fileno()) if login else child.wait()
             finally:
                 for signum, handler in previous.items():
-                    signal.signal(signum, handler)
+                    signal.signal(signum, signal.SIG_IGN if mode == "warm" else handler)
+                if mode == "warm" and child is not None and child.poll() is None:
+                    # A stopped process cannot handle SIGTERM until continued.
+                    try:
+                        os.kill(child.pid, signal.SIGCONT)
+                    except ProcessLookupError:
+                        pass
                 stop_uid(uid)
                 if child is not None:
                     child.wait(timeout=5)
-                if mode == "runtime":
+                if runtime:
                     self.recover_credentials()
+                    if mode == "warm" and time.time() >= self.read_state()["created_at"] + self.retention:
+                        self.prepare()
+                if mode == "warm":
+                    for signum, handler in previous.items():
+                        signal.signal(signum, handler)
+            if close_id is not None:
+                from taskopotamus_worker.runtime_supervisor import close_acknowledgment
+
+                close_acknowledgment(sys.stdout.fileno(), close_id, proxy.closing_output)
         return result
 
 
@@ -388,7 +444,7 @@ def parse_remote(original):
     mode, arguments = parts[1], parts[2:]
     if mode == "status" and not arguments:
         return mode, arguments
-    if mode not in ("runtime", "auth"):
+    if mode not in ("runtime", "warm", "auth"):
         raise ValueError("Invalid worker mode.")
     # Controller only needs pinned app-server, version inspection, and device login.
     if len(arguments) >= 2 and arguments[0] in ("-c", "--config") and arguments[1] == 'cli_auth_credentials_store="file"':
@@ -398,6 +454,8 @@ def parse_remote(original):
     allowed = (["app-server", "--listen", "stdio://"], ["--version"])
     if rest not in allowed and not (mode == "auth" and rest == ["login", "--device-auth"]):
         raise ValueError("Unsupported worker command.")
+    if mode == "warm" and rest != ["app-server", "--listen", "stdio://"]:
+        raise ValueError("Unsupported warm worker command.")
     return mode, arguments
 
 

@@ -91,7 +91,7 @@ class AttachmentTests(unittest.TestCase):
             self.store.scope(tokens[0])
         self.assertEqual(chat.reply("42", "hello", "2")["text"], "ready")
         config = codex.thread_start.call_args.kwargs["config"]
-        self.assertEqual(config["mcp_servers.reply_attachments.env_vars"], ["TASKOPOTAMUS_ARTIFACT_AUTH", "TASKOPOTAMUS_AGENT_IP"])
+        self.assertEqual(config["mcp_servers.reply_attachments.env_vars"], ["TASKOPOTAMUS_REQUEST_SCOPE", "TASKOPOTAMUS_ARTIFACT_AUTH", "TASKOPOTAMUS_AGENT_IP"])
         self.assertNotIn(tokens[-1], json.dumps(config))
         turn.run.assert_called_once()
 

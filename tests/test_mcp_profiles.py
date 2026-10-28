@@ -1,5 +1,9 @@
 import logging
+import asyncio
 import unittest
+from unittest.mock import patch
+
+import httpx2
 
 from starlette.testclient import TestClient
 
@@ -14,6 +18,36 @@ SECRET = "synthetic-test-profile-signing-key-only-123456"
 
 
 class MCPProfileTests(unittest.TestCase):
+    def test_request_bound_stdio_proxy_preserves_real_profile_protocol_and_version_checks(self):
+        from src.worker.profile_mcp import make_server
+
+        scope = {"profile_url": "http://mcp:8080", "profile_token": self.tokens.issue("42")}
+        from src.worker.request_mcp import RequestServer
+
+        proxy = asyncio.run(RequestServer.combine([make_server(scope)]))
+        app = make_app(self.store, SECRET)
+        original_client = httpx2.AsyncClient
+
+        def client(**options):
+            return original_client(transport=httpx2.ASGITransport(app=app), **options)
+
+        async def exercise():
+            async with app.app.router.lifespan_context(app.app):
+                with patch("src.worker.profile_mcp.httpx2.AsyncClient", side_effect=client):
+                    initial = await proxy.call_tool("get_agent_profile", {})
+                    updated = await proxy.call_tool("update_agent_profile", {
+                        "expected_version": 0, "changes": {"persona": "Synthetic updated preference"}})
+                    stale = await proxy.call_tool("update_agent_profile", {
+                        "expected_version": 0, "changes": {"persona": "Stale preference"}})
+            return initial, updated, stale
+
+        initial, updated, stale = asyncio.run(exercise())
+        self.assertEqual(initial.structured_content["version"], 0)
+        self.assertTrue(updated.structured_content["ok"])
+        self.assertFalse(stale.structured_content["ok"])
+        self.assertEqual(self.store.get("42")["persona"], "Synthetic updated preference")
+        self.assertEqual(self.store.get("43")["version"], 0)
+
     def setUp(self):
         logging.disable(logging.CRITICAL)
         self.store = ProfileStore(isolated_database(self))
