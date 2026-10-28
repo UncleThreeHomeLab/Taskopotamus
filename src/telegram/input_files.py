@@ -3,11 +3,13 @@ import hashlib
 import re
 import tempfile
 import time
+from http.client import HTTPException
 from urllib.parse import quote
 from urllib.request import Request, build_opener, ProxyHandler, HTTPRedirectHandler
 from urllib.error import HTTPError, URLError
 
 from .media import TelegramRejected
+from .response_body import DeadlineExpired, read_chunk
 
 
 class InputRejected(ValueError):
@@ -60,11 +62,11 @@ def download(token, descriptor, api, opener=None, remaining=20000000):
                 raise InputRejected("Files exceed 20 MB combined.")
             size, digest, deadline = 0, hashlib.sha256(), time.monotonic() + 60
             while True:
-                chunk = response.read(min(65536, remaining - size + 1))
+                chunk = read_chunk(response, min(65536, remaining - size + 1), deadline)
                 if not chunk:
                     break
                 size += len(chunk)
-                if size > remaining or time.monotonic() > deadline:
+                if size > remaining:
                     raise InputRejected("Files exceed 20 MB or the transfer deadline.")
                 stream.write(chunk)
                 digest.update(chunk)
@@ -76,7 +78,10 @@ def download(token, descriptor, api, opener=None, remaining=20000000):
         error.close()
         stream.close()
         raise InputRejected("Telegram file is unavailable. Please send it again.") from None
-    except (URLError, OSError):
+    except DeadlineExpired:
+        stream.close()
+        raise InputRejected("Files exceed 20 MB or the transfer deadline.") from None
+    except (URLError, OSError, HTTPException):
         stream.close()
         raise RuntimeError("Telegram file download could not be confirmed.") from None
     except BaseException:

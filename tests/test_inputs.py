@@ -15,6 +15,7 @@ from PIL import Image
 from openai_codex import LocalImageInput, TextInput
 
 from database_support import isolated_database
+from http_response import SyntheticResponse
 from src.agent.chat_service import ChatService
 from src.agent.http_server import AgentHTTPServer
 from src.messaging.artifacts import ArtifactStore
@@ -237,7 +238,7 @@ class InboxTests(unittest.TestCase):
         with self.assertRaises(InputRejected):
             download("synthetic-token", {"file_id": "id", "filename": "a.txt"}, api)
         api.return_value = {"file_path": "documents/file.txt", "file_size": 3}
-        response = io.BytesIO(b"abc")
+        response = SyntheticResponse(b"abc")
         response.headers = {"Content-Length": "3"}
         opener = Mock()
         opener.open.return_value = response
@@ -245,10 +246,51 @@ class InboxTests(unittest.TestCase):
         with stream:
             self.assertEqual(stream.read(), b"abc")
         self.assertEqual(info["size"], 3)
+        self.assertEqual(info["sha256"], hashlib.sha256(b"abc").hexdigest())
         opener.open.side_effect = OSError("https://api.telegram.org/botsynthetic-token/private")
         with self.assertRaises(RuntimeError) as caught:
             download("synthetic-token", {"file_id": "id", "filename": "a.txt"}, api, opener=opener)
         self.assertNotIn("synthetic-token", str(caught.exception))
+
+    def test_download_deadline_rejects_slow_chunks_and_late_eof_and_closes_streams(self):
+        metadata = Mock(return_value={"file_path": "documents/file.txt", "file_size": 1})
+        for late_eof in (False, True):
+            response = SyntheticResponse(b"a")
+            response.length = None
+            read = response.source.read1
+            clock = Mock(return_value=0)
+            stream = io.BytesIO()
+
+            def slow_read(size):
+                clock.return_value = 55 if late_eof and response.body_bytes == 0 else 61
+                return read(size)
+
+            response.source.read1 = slow_read
+            with self.subTest(late_eof=late_eof), patch("src.telegram.response_body.time.monotonic", clock), patch(
+                "src.telegram.input_files.tempfile.TemporaryFile", return_value=stream
+            ):
+                with self.assertRaisesRegex(InputRejected, "deadline"):
+                    download("synthetic-token", {"file_id": "id"}, metadata, opener=Mock(open=Mock(return_value=response)))
+            self.assertTrue(stream.closed)
+            self.assertTrue(response.closed)
+            self.assertEqual(
+                [call.args[0] for call in response.socket.settimeout.call_args_list],
+                [10, 5] if late_eof else [10],
+            )
+
+    def test_download_transport_failures_close_streams_and_redact_credentials(self):
+        metadata = Mock(return_value={"file_path": "documents/file.txt", "file_size": 1})
+        for failure in (TimeoutError("synthetic-token"), http.client.IncompleteRead(b"synthetic-token")):
+            response, stream = SyntheticResponse(b"a"), io.BytesIO()
+            response.source.read1 = Mock(side_effect=failure)
+            with self.subTest(failure=type(failure).__name__), patch(
+                "src.telegram.input_files.tempfile.TemporaryFile", return_value=stream
+            ):
+                with self.assertRaises(RuntimeError) as caught:
+                    download("synthetic-token", {"file_id": "id"}, metadata, opener=Mock(open=Mock(return_value=response)))
+            self.assertNotIn("synthetic-token", str(caught.exception))
+            self.assertTrue(stream.closed)
+            self.assertTrue(response.closed)
 
     def test_persisted_text_job_ignores_legacy_processing_cursor(self):
         self.polling.finish(100)
