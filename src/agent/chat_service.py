@@ -20,13 +20,14 @@ from .subagents import SubagentPolicy
 from src.messaging.delivery_store import DeliveryStore
 from .attachment_tools import attachment_config
 from .google_tools import google_config
+from .request_tools import request_config
 
 
 FAILURE_TEXT = "This request could not finish or was interrupted. Its effects may be incomplete; check before trying again."
 
 
 class ChatService:
-    def __init__(self, codex_factory, database, model="gpt-6.1-sol", effort="medium", turn_timeout=180, auto_compact_percent=None, profiles=None, subagents=None, workspace_status=None, artifacts=None, deliveries=None):
+    def __init__(self, codex_factory, database, model="gpt-6.1-sol", effort="medium", turn_timeout=180, auto_compact_percent=None, profiles=None, subagents=None, workspace_status=None, artifacts=None, deliveries=None, runtime_sessions=None):
         self.codex_factory = codex_factory
         self.database = database
         self.model = model
@@ -38,6 +39,7 @@ class ChatService:
         self.workspace_status = workspace_status
         self.artifacts = artifacts
         self.deliveries = deliveries or DeliveryStore(database)
+        self.runtime_sessions = runtime_sessions
         self.lock = threading.Lock()
         with database.connect() as db:
             db.execute("CREATE TABLE IF NOT EXISTS conversations (chat_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL)")
@@ -177,6 +179,8 @@ class ChatService:
         attachments = [] if attachments is None else attachments
         digest = digest or self._fingerprint(chat_id, text, request_id, attachments)
         deadline = deadline if deadline is not None else time.monotonic() + self.turn_timeout
+        started = time.monotonic()
+        timings, lease = {}, None
         with ExitStack() as runtime, self.database.connect() as db:
             row = db.execute(
                 "SELECT input_hash, reply FROM replies WHERE chat_id = %s AND request_id = %s", (chat_id, request_id),
@@ -235,18 +239,31 @@ class ChatService:
                 runtime.callback(self._revoke_artifacts, chat_id, request_id)
                 if cancelled.is_set():
                     raise TimeoutError("Request cancelled before worker access.")
-                profile_config.update(attachment_config())
-                profile_config.update(google_config())
-                client = self.codex_factory(token, capability)
-            elif self.profiles is not None:
-                client = self.codex_factory(token)
+                if self.runtime_sessions is None:
+                    profile_config.update(attachment_config())
+                    profile_config.update(google_config())
+            if self.runtime_sessions is not None:
+                profile_config = request_config()
+            timings["preparation"] = round((time.monotonic() - started) * 1000)
+            acquisition = time.monotonic()
+            if self.runtime_sessions is not None:
+                configuration = {"model": self.model, "effort": self.effort, "tools": profile_config,
+                                 "subagents": self.subagents.config(), "compact_percent": self.compaction.percent}
+                lease = runtime.enter_context(self.runtime_sessions.lease(
+                    chat_id, configuration, token, capability, self._remaining(deadline)))
+                codex = lease.client
             else:
-                client = self.codex_factory()
-            # Start after the replay check; loaded threads can ignore resume configuration changes.
-            codex = runtime.enter_context(client)
-            workspace, expired = None, False
-            if self.workspace_status is not None:
-                workspace = self.workspace_status()
+                if self.artifacts is not None:
+                    client = self.codex_factory(token, capability)
+                elif self.profiles is not None:
+                    client = self.codex_factory(token)
+                else:
+                    client = self.codex_factory()
+                codex = runtime.enter_context(client)
+            timings["runtime_begin"] = round((time.monotonic() - acquisition) * 1000)
+            workspace, expired = lease.workspace if lease else None, False
+            if lease is not None or self.workspace_status is not None:
+                workspace = workspace if lease else self.workspace_status()
                 previous = db.execute(
                     "SELECT generation FROM conversation_workspace WHERE chat_id = %s", (chat_id,)
                 ).fetchone()
@@ -257,8 +274,11 @@ class ChatService:
                     + ". This replaces earlier workspace state. Files from earlier generations have expired. "
                     "Check file existence before reusing work. Conversation history is preserved."
                 )
+            account_started = time.monotonic()
             if codex.account().account is None:
                 raise PermissionError("Sign in to Codex first.")
+            timings["account"] = round((time.monotonic() - account_started) * 1000)
+            thread_started = time.monotonic()
             db.execute("INSERT INTO replies VALUES (%s, %s, %s, NULL)", (chat_id, request_id, digest))
             if include_details:
                 db.execute("INSERT INTO reply_runs VALUES (%s, %s, 'pending', NULL)", (chat_id, request_id))
@@ -285,7 +305,7 @@ class ChatService:
                 if cancelled.is_set():
                     raise TimeoutError("Request cancelled.")
                 if row:
-                    thread = codex.thread_resume(row[0], **options)
+                    thread = lease.resume(row[0], **options) if lease else codex.thread_resume(row[0], **options)
                     if self.profiles is not None or workspace is not None or self.artifacts is not None:
                         refresh_instructions(thread, instructions)
                 else:
@@ -300,7 +320,11 @@ class ChatService:
                 if cancelled.is_set():
                     self._interrupt(turn)
                     raise TimeoutError("Request cancelled.")
+                timings["thread_setup"] = round((time.monotonic() - thread_started) * 1000)
+                timings["setup_total"] = round((time.monotonic() - started) * 1000)
+                native_started = time.monotonic()
                 response = turn.run()
+                timings["native_turn"] = round((time.monotonic() - native_started) * 1000)
                 if cancelled.is_set():
                     raise TimeoutError("Request cancelled before publication.")
                 # Learn from runtime usage, never from a model-name table or private catalog cache.
@@ -348,6 +372,8 @@ class ChatService:
                     if scope_deadline is not None and scope_deadline <= self.artifacts.clock():
                         raise TimeoutError("Reply capability expired before publication.")
                     db.commit()
+                    if lease is not None:
+                        lease.published = True
                     publication["result"] = {**result, **({"status": "completed", "details": None} if include_details else {})}
             except Exception:
                 db.rollback()
@@ -356,10 +382,21 @@ class ChatService:
                 except Exception:
                     print("Failure finalization unavailable; request outcome uncertain.", file=sys.stderr, flush=True)
                 raise
+            cleanup_started = time.monotonic()
+            if lease is not None:
+                try:
+                    lease.finish()
+                except Exception:
+                    lease.discarded = True
+                    print("Completed reply retained; warm runtime discarded after cleanup failure.", file=sys.stderr, flush=True)
+            timings["cleanup"] = round((time.monotonic() - cleanup_started) * 1000)
+            timings["request_total"] = round((time.monotonic() - started) * 1000)
             if include_details:
                 details = None
                 try:
                     details = summarize_run(response, self.model, self.effort, self.subagents)
+                    details.update(system_timings_ms=timings, runtime_reused=lease.reused if lease else False,
+                                   runtime_retained=bool(lease and lease.finished and not lease.discarded))
                 except Exception:
                     # A telemetry defect must not discard a completed reply or cause another paid turn.
                     pass
@@ -394,6 +431,8 @@ class ChatService:
         if not self.lock.acquire(blocking=False):
             raise BlockingIOError("Agent is busy.")
         try:
+            if self.runtime_sessions is not None:
+                self.runtime_sessions.close()
             with self.database.connect() as db:
                 db.execute(
                     "DELETE FROM thread_context WHERE thread_id IN (SELECT thread_id FROM conversations WHERE chat_id = %s)",

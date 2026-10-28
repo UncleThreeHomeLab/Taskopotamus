@@ -18,6 +18,7 @@ from src.profiles.auth import CONSOLE_CHAT_ID, ProfileTokens
 from src.storage.database import Database
 from .worker_transport import configure_transport, workspace_status, WorkspaceStorageError
 from .subagents import SubagentPolicy
+from .runtime_session import RuntimeSessions
 from src.messaging.artifacts import ArtifactPolicy, ArtifactStore
 from src.messaging.delivery_store import DeliveryStore
 from src.messaging.http_api import MessagingAPI
@@ -165,7 +166,7 @@ def main():
         raise ValueError("Full-access execution requires the isolated worker transport.")
     api_token = read_secret("AGENT_API_TOKEN")
     compact_percent = os.environ.get("CODEX_AUTO_COMPACT_PERCENT", "").strip()
-    profiles = ProfileClient(os.environ.get("PROFILE_SERVICE_URL", "http://mcp:8080"), read_secret("PROFILE_SIGNING_KEY"))
+    profiles = ProfileClient(os.environ.get("PROFILE_SERVICE_URL", "http://mcp:8080"), read_secret("PROFILE_SIGNING_KEY"), worker_scopes=True)
     subagents = SubagentPolicy(
         os.environ.get("CODEX_SUBAGENT_MODEL", "gpt-6-luna"),
         os.environ.get("CODEX_SUBAGENT_REASONING_EFFORT", "high"),
@@ -176,22 +177,25 @@ def main():
         raise ValueError("Turn timeout must be between 30 and 1800 seconds.")
     codex_config = CodexConfig(codex_bin=os.environ["CODEX_BIN"], config_overrides=('cli_auth_credentials_store="file"',))
     with configure_transport():
-        auth = CodexAuth(lambda: Codex(CodexConfig(
-            codex_bin=codex_config.codex_bin, config_overrides=codex_config.config_overrides,
-            env={"TASKOPOTAMUS_WORKER_MODE": "auth"},
-        )))
-        def runtime_factory(token, artifact_token):
+        def runtime_factory():
             try:
                 return Codex(CodexConfig(
                     codex_bin=codex_config.codex_bin,
                     config_overrides=codex_config.config_overrides,
-                    env={"TASKOPOTAMUS_PROFILE_AUTH": f"Bearer {token}", "TASKOPOTAMUS_ARTIFACT_AUTH": artifact_token,
-                         "TASKOPOTAMUS_WORKER_MODE": "runtime"},
+                    env={"TASKOPOTAMUS_WORKER_MODE": "warm"},
                 ))
             except Exception:
                 if workspace_status()["admission_blocked"]:
                     raise WorkspaceStorageError("Workspace storage limit reached.") from None
                 raise
+        sessions = RuntimeSessions(runtime_factory, profile_url=profiles.url,
+                                   agent_ip=os.environ.get("WORKER_AGENT_IP", "10.203.17.30"),
+                                   idle_seconds=int(os.environ.get("CODEX_RUNTIME_IDLE_SECONDS", "300")),
+                                   cleanup_status=workspace_status)
+        auth = CodexAuth(lambda: Codex(CodexConfig(
+            codex_bin=codex_config.codex_bin, config_overrides=codex_config.config_overrides,
+            env={"TASKOPOTAMUS_WORKER_MODE": "auth"},
+        )), operation_scope=sessions.authentication)
         database = Database.from_env()
         policy = ArtifactPolicy.from_env()
         deliveries = DeliveryStore(database, retention=policy.retention_seconds)
@@ -204,7 +208,7 @@ def main():
             auto_compact_percent=int(compact_percent) if compact_percent else None,
             profiles=profiles,
             subagents=subagents, turn_timeout=timeout, workspace_status=workspace_status,
-            artifacts=artifacts, deliveries=deliveries,
+            artifacts=artifacts, deliveries=deliveries, runtime_sessions=sessions,
         )
         stopped = threading.Event()
         def maintain():
@@ -228,8 +232,11 @@ def main():
             try:
                 server.serve_forever()
             finally:
-                stopped.set()
-                maintenance.join(timeout=10)
+                try:
+                    sessions.shutdown()
+                finally:
+                    stopped.set()
+                    maintenance.join(timeout=10)
 
 
 if __name__ == "__main__":

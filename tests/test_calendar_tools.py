@@ -72,7 +72,7 @@ class CalendarValidationTests(unittest.TestCase):
 
     def test_static_mcp_has_no_provider_credentials_and_extra_arguments_fail(self):
         config = google_config()
-        self.assertEqual(config["mcp_servers.calendar.env_vars"], ["TASKOPOTAMUS_ARTIFACT_AUTH", "TASKOPOTAMUS_AGENT_IP"])
+        self.assertEqual(config["mcp_servers.calendar.env_vars"], ["TASKOPOTAMUS_REQUEST_SCOPE", "TASKOPOTAMUS_ARTIFACT_AUTH", "TASKOPOTAMUS_AGENT_IP"])
         client = CalendarClient("x" * 43, "10.203.17.30")
         self.assertEqual(client.url, "http://10.203.17.30:8080/google/worker/calendar")
         client.execute = Mock(return_value={"ok": True})

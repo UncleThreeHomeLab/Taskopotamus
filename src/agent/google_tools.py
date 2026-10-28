@@ -5,7 +5,7 @@ def google_config():
     config = {
         "mcp_servers.gmail.command": "/usr/local/bin/python",
         "mcp_servers.gmail.args": ["-I", "-m", "taskopotamus_worker.gmail_mcp"],
-        "mcp_servers.gmail.env_vars": ["TASKOPOTAMUS_ARTIFACT_AUTH", "TASKOPOTAMUS_AGENT_IP"],
+        "mcp_servers.gmail.env_vars": ["TASKOPOTAMUS_REQUEST_SCOPE", "TASKOPOTAMUS_ARTIFACT_AUTH", "TASKOPOTAMUS_AGENT_IP"],
         "mcp_servers.gmail.enabled_tools": ["search_gmail", "read_gmail"],
         "mcp_servers.gmail.required": True,
         "mcp_servers.gmail.tool_timeout_sec": 30,
@@ -17,7 +17,7 @@ def google_config():
     config.update({
         "mcp_servers.calendar.command": "/usr/local/bin/python",
         "mcp_servers.calendar.args": ["-I", "-m", "taskopotamus_worker.calendar_mcp"],
-        "mcp_servers.calendar.env_vars": ["TASKOPOTAMUS_ARTIFACT_AUTH", "TASKOPOTAMUS_AGENT_IP"],
+        "mcp_servers.calendar.env_vars": ["TASKOPOTAMUS_REQUEST_SCOPE", "TASKOPOTAMUS_ARTIFACT_AUTH", "TASKOPOTAMUS_AGENT_IP"],
         "mcp_servers.calendar.enabled_tools": tools,
         "mcp_servers.calendar.required": True,
         "mcp_servers.calendar.tool_timeout_sec": 30,

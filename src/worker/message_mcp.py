@@ -111,7 +111,10 @@ def make_server(client):
 
 
 def main():
-    client = MessageClient(os.environ.get("TASKOPOTAMUS_ARTIFACT_AUTH", ""), os.environ.get("TASKOPOTAMUS_AGENT_IP", ""))
+    from .request_scope import credentials
+
+    scope = credentials()
+    client = MessageClient(scope["artifact_token"], scope["agent_ip"])
     make_server(client).run(transport="stdio")
 
 
