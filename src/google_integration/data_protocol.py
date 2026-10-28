@@ -2,6 +2,8 @@
 import json
 import re
 import time
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request
@@ -57,6 +59,118 @@ def arguments(value):
 def message_id(value):
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value):
         raise ValueError("Invalid Gmail message ID.")
+    return value
+
+
+def calendar_id(value):
+    if (not isinstance(value, str) or not 1 <= len(value) <= 1024 or value == "primary"
+            or any(not c.isprintable() or c.isspace() for c in value)):
+        raise ValueError("Exact calendar ID required.")
+    return value
+
+
+def event_id(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,1024}", value):
+        raise ValueError("Invalid event ID.")
+    return value
+
+
+def operation_key(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", value):
+        raise ValueError("Stable operation key required (16-128 ASCII characters).")
+    return value
+
+
+def timestamp(value):
+    if (not isinstance(value, str) or len(value) > 64
+            or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})", value)):
+        raise ValueError("RFC3339 timestamp with explicit offset required.")
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def event_time(value):
+    if not isinstance(value, dict):
+        raise ValueError("Invalid event time.")
+    if set(value) == {"date"}:
+        raw = value["date"]
+        if not isinstance(raw, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+            raise ValueError("Invalid all-day date.")
+        return date.fromisoformat(raw)
+    if set(value) not in ({"dateTime"}, {"dateTime", "timeZone"}):
+        raise ValueError("Use either date or dateTime, not both.")
+    if "timeZone" in value:
+        zone = value["timeZone"]
+        if not isinstance(zone, str) or not 1 <= len(zone) <= 128:
+            raise ValueError("Invalid timezone.")
+        try:
+            ZoneInfo(zone)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValueError("Valid IANA timezone required.") from None
+    return timestamp(value["dateTime"])
+
+
+def event_fields(value, *, create=False):
+    if (not isinstance(value, dict) or not value
+            or not set(value) <= {"summary", "description", "location", "start", "end"}):
+        raise ValueError("Only summary, description, location, start and end are supported.")
+    for key, limit in (("summary", 256), ("description", 4000), ("location", 512)):
+        if key in value and (not isinstance(value[key], str) or len(value[key]) > limit
+                             or any(ord(c) < 32 and c not in "\n\t" for c in value[key])):
+            raise ValueError("Invalid event text.")
+    if create and not {"start", "end"} <= set(value):
+        raise ValueError("Start and exclusive end required.")
+    for key in ("start", "end"):
+        if key in value:
+            event_time(value[key])
+    if {"start", "end"} <= set(value):
+        start, end = event_time(value["start"]), event_time(value["end"])
+        if type(start) is not type(end) or end <= start:
+            raise ValueError("Matching time forms and end after start required; all-day end is exclusive.")
+    return value
+
+
+def calendar_arguments(value):
+    if not isinstance(value, dict):
+        raise ValueError("Invalid Calendar arguments.")
+    operation = value.get("operation")
+    required = {
+        "list_calendars": {"offset", "limit"},
+        "list_calendar_events": {"calendar_id", "time_min", "time_max", "limit"},
+        "read_calendar_event": {"calendar_id", "event_id"},
+        "create_calendar_event": {"calendar_id", "operation_key", "fields"},
+        "update_calendar_event": {"calendar_id", "event_id", "etag", "occurrence", "operation_key", "fields"},
+        "delete_calendar_event": {"calendar_id", "event_id", "etag", "occurrence", "operation_key"},
+        "calendar_operation_status": {"calendar_id", "operation_key"},
+    }
+    if operation not in required or set(value) != required[operation] | {"operation"}:
+        raise ValueError("Unsupported Calendar operation or arguments.")
+    if "calendar_id" in value:
+        calendar_id(value["calendar_id"])
+    if "event_id" in value:
+        event_id(value["event_id"])
+    if "operation_key" in value:
+        operation_key(value["operation_key"])
+    if "limit" in value and (type(value["limit"]) is not int or not 1 <= value["limit"] <= (20 if operation == "list_calendars" else 5)):
+        raise ValueError("Invalid Calendar limit.")
+    if "offset" in value and (type(value["offset"]) is not int or not 0 <= value["offset"] <= 500):
+        raise ValueError("Invalid Calendar offset.")
+    if operation == "list_calendar_events":
+        start, end = timestamp(value["time_min"]), timestamp(value["time_max"])
+        if not timedelta(0) < end - start <= timedelta(days=93):
+            raise ValueError("Explicit event window must be at most 93 days.")
+    if "fields" in value:
+        event_fields(value["fields"], create=operation == "create_calendar_event")
+    if "etag" in value:
+        if not isinstance(value["etag"], str) or not re.fullmatch(r'"[\x21\x23-\x7e]{1,254}"', value["etag"]):
+            raise ValueError("Previously read quoted etag required.")
+        occurrence = value["occurrence"]
+        if occurrence is not None:
+            if not isinstance(occurrence, dict) or set(occurrence) != {"recurring_event_id", "original_start_time"}:
+                raise ValueError("Explicit single occurrence identity required.")
+            event_id(occurrence["recurring_event_id"])
+            event_time(occurrence["original_start_time"])
+            if occurrence["recurring_event_id"] == value["event_id"]:
+                raise ValueError("Series-wide changes unsupported.")
     return value
 
 

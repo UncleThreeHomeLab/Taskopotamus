@@ -3,7 +3,7 @@ import secrets
 import threading
 import time
 
-from src.google_integration.data_protocol import authorization, body, capability, private_post, arguments, NoRedirects, remaining
+from src.google_integration.data_protocol import authorization, body, capability, private_post, arguments, calendar_arguments, NoRedirects, remaining
 from src.profiles.auth import ProfileTokens
 from urllib.request import ProxyHandler, build_opener
 
@@ -47,17 +47,18 @@ class GoogleDataAPI:
                 if set(payload) != {"capability"}:
                     raise ValueError()
                 result = self.check(payload["capability"])
-            elif handler.path == "/google/worker/gmail":
+            elif handler.path in ("/google/worker/gmail", "/google/worker/calendar"):
                 started = time.monotonic()
                 initial = self.check(token, started + 20)
                 deadline = started + min(20, initial["remaining_seconds"])
-                payload = arguments(body(handler))
+                calendar = handler.path == "/google/worker/calendar"
+                payload = (calendar_arguments if calendar else arguments)(body(handler, 131072 if calendar else 16384))
                 acquired = self.slots.acquire(blocking=False)
                 if not acquired:
                     handler.send_json({"error": "Google data busy."}, 429)
                     return True
                 handler.read_deadline.cancel()
-                result = private_post(self.opener, "http://google:8082/data/gmail", self.secret,
+                result = private_post(self.opener, "http://google:8082/data/" + ("calendar" if calendar else "gmail"), self.secret,
                                       {"capability": token, "arguments": payload},
                                       deadline)
                 final = self.check(token, deadline)
