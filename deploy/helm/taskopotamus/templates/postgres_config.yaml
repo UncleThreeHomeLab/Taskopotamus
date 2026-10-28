@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-postgres-init
+  labels:
+    {{- include "taskopotamus.labels" (dict "root" . "component" "postgres") | nindent 4 }}
+data:
+  initialize_databases.sh: |
+    {{- .Files.Get "files/initialize_databases.sh" | nindent 4 }}

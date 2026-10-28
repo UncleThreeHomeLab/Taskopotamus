@@ -5,6 +5,7 @@
 !requirements-mcp.txt
 !requirements-storage.txt
 !requirements-google.txt
+!requirements-test.txt
 !tests/
 !tests/**
 !config/
@@ -19,5 +20,7 @@
 !deploy/testing/**
 !deploy/worker/
 !deploy/worker/**
+!deploy/helm/
+!deploy/helm/**
 **/__pycache__/
 **/*.pyc

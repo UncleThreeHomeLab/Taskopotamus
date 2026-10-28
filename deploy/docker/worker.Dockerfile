@@ -1,6 +1,6 @@
 FROM python:3.13-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 CODEX_HOME=/home/agent/.codex HOME=/home/agent
-RUN apt-get update && apt-get install -y --no-install-recommends openssh-server git curl ca-certificates iptables util-linux build-essential \
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-server git curl ca-certificates iptables util-linux build-essential tini \
     && rm -rf /var/lib/apt/lists/* /etc/ssh/ssh_host_* \
     && passwd -d root
 RUN groupadd --gid 10001 agent && useradd --uid 10001 --gid 10001 --no-create-home agent \

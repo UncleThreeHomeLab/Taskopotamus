@@ -6,7 +6,8 @@ if [ "$(id -u)" = 0 ]; then
     PYTHONPATH=/app/tests python -m unittest \
         test_runtime_proxy.RuntimeProxyTests \
         test_workspace_lifecycle.WorkspaceLifecycleTests \
-        test_runtime_sessions.RequestScopeTests.test_snapshot_is_immutable_and_unsafe_files_rejected
+        test_runtime_sessions.RequestScopeTests.test_snapshot_is_immutable_and_unsafe_files_rejected \
+        test_helm_chart.HelmChartTests.test_volume_initializers_preserve_contents_and_private_ownership
     exit
 fi
 export TEST_DATABASE_SOCKET="$(mktemp -d /tmp/taskopotamus-tests-XXXXXX)"

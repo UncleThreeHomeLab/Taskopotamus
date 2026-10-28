@@ -1,0 +1,245 @@
+{{- include "taskopotamus.validate" . -}}
+{{- range $component := include "taskopotamus.components" . | fromJsonArray }}
+{{- $context := dict "root" $ "component" $component }}
+{{- $worker := eq $component "worker" }}
+{{- $uid := 10001 }}
+{{- if $worker }}{{ $uid = 0 }}{{ else if eq $component "postgres" }}{{ $uid = 999 }}{{ end }}
+{{- $data := include "taskopotamus.data" $context | fromJson }}
+{{- $secrets := include "taskopotamus.secrets" $context | fromJson }}
+{{- $imageComponent := $component }}{{ if eq $component "test-console" }}{{ $imageComponent = "agent" }}{{ end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $component }}
+  labels:
+    {{- include "taskopotamus.labels" $context | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "taskopotamus.labels" $context | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "taskopotamus.labels" $context | nindent 8 }}
+      {{- if eq $component "postgres" }}
+      annotations:
+        checksum/initialization: {{ $.Files.Get "files/initialize_databases.sh" | sha256sum }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsUser: {{ $uid }}
+        runAsGroup: {{ $uid }}
+        runAsNonRoot: {{ not $worker }}
+        seccompProfile:
+          type: RuntimeDefault
+        {{- if $worker }}
+        supplementalGroups: [10001]
+        sysctls:
+          - {name: net.ipv6.conf.all.disable_ipv6, value: "1"}
+        {{- end }}
+      {{- if $worker }}
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: [{{ $.Values.network.dnsIP | quote }}]
+        searches:
+          - {{ printf "%s.svc.%s" $.Release.Namespace $.Values.network.clusterDomain | quote }}
+          - {{ printf "svc.%s" $.Values.network.clusterDomain | quote }}
+          - {{ $.Values.network.clusterDomain | quote }}
+        options:
+          - {name: ndots, value: "5"}
+      {{- end }}
+      initContainers:
+        - name: prepare-private-volumes
+          image: {{ include "taskopotamus.image" (dict "root" $ "component" "agent") | quote }}
+          imagePullPolicy: {{ $.Values.images.agent.pullPolicy }}
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+              add: [CHOWN, FOWNER, DAC_OVERRIDE]
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 250m, memory: 64Mi}
+          command:
+            - python
+            - -c
+            - |
+              import os
+              from pathlib import Path
+              uid = {{ $uid }}
+              # Own only mount roots; never mutate existing data or native state recursively.
+              {{- if not $worker }}
+              for name in {{ keys $data | sortAlpha | toJson }}:
+                  path = Path('/data') / name
+                  os.chown(path, uid, uid)
+                  path.chmod(0o700)
+              target = Path('/run/secrets')
+              for name in {{ keys $secrets | sortAlpha | toJson }}:
+                  path = target / name
+                  path.write_bytes((Path('/secret-source') / name).read_bytes())
+                  os.chown(path, uid, uid)
+                  path.chmod(0o400)
+              os.chown(target, uid, uid)
+              target.chmod(0o700)
+              {{- end }}
+              Path('/tmp').chmod({{ if $worker }}0o700{{ else }}0o1777{{ end }})
+              {{- if $worker }}
+              for name in ('/run', '/root', '/home/agent'):
+                  Path(name).chmod(0o700)
+              {{- else if eq $component "postgres" }}
+              os.chown('/var/run/postgresql', uid, uid)
+              Path('/var/run/postgresql').chmod(0o3770)
+              {{- end }}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+            {{- if $worker }}
+            - {name: run, mountPath: /run}
+            - {name: root, mountPath: /root}
+            - {name: home, mountPath: /home/agent}
+            {{- else }}
+            - {name: projected-secrets, mountPath: /secret-source, readOnly: true}
+            - {name: private-secrets, mountPath: /run/secrets}
+            {{- range $name, $_ := $data }}
+            - {name: {{ $name }}, mountPath: {{ printf "/data/%s" $name }}}
+            {{- end }}
+            {{- if eq $component "postgres" }}
+            - {name: postgres-run, mountPath: /var/run/postgresql}
+            {{- end }}
+            {{- end }}
+      containers:
+        - name: {{ $component }}
+          image: {{ include "taskopotamus.image" $context | quote }}
+          imagePullPolicy: {{ (index $.Values.images $imageComponent).pullPolicy }}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+              {{- if $worker }}
+              add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, SYS_CHROOT, SETPCAP, NET_ADMIN, KILL]
+              {{- end }}
+          {{- if eq $component "postgres" }}
+          args: [postgres, -c, log_error_verbosity=terse, -c, log_min_error_statement=panic]
+          {{- else if eq $component "objects" }}
+          args: [server, /data, --console-address, "127.0.0.1:9001"]
+          {{- else }}
+          command: [/usr/bin/tini, -g, --]
+          {{- if $worker }}
+          args: [/usr/local/bin/start-worker]
+          {{- else }}
+          args: [python, -m, {{ index (dict "agent" "src.agent.server" "mcp" "src.mcp_server.server" "google" "src.google_integration.server" "telegram" "src.telegram.bot" "test-console" "src.test_console.server") $component }}]
+          {{- end }}
+          {{- end }}
+          env:
+            {{- range $name, $value := include "taskopotamus.environment" $context | fromJson }}
+            - name: {{ $name }}
+              value: {{ $value | toString | quote }}
+            {{- end }}
+            {{- if eq $component "telegram" }}
+            - name: TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.existingSecret | quote }}
+                  key: telegram_bot_token
+            {{- end }}
+          resources:
+            {{- index $.Values.resources $component | toYaml | nindent 12 }}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+            {{- if $worker }}
+            - {name: run, mountPath: /run}
+            - {name: root, mountPath: /root}
+            - {name: home, mountPath: /home/agent}
+            - {name: projected-secrets, mountPath: /run/secrets, readOnly: true}
+            - {name: legacy, mountPath: /legacy-workspace, readOnly: true}
+            {{- else }}
+            - {name: private-secrets, mountPath: /run/secrets, readOnly: true}
+            {{- end }}
+            {{- range $name, $path := $data }}
+            - {name: {{ $name }}, mountPath: {{ $path }}}
+            {{- end }}
+            {{- if eq $component "postgres" }}
+            - {name: postgres-run, mountPath: /var/run/postgresql}
+            - {name: postgres-init, mountPath: /docker-entrypoint-initdb.d, readOnly: true}
+            {{- end }}
+            {{- if and $.Values.instructionsConfigMap (has $component (list "agent" "mcp")) }}
+            - {name: instructions, mountPath: /app/config/agent, readOnly: true}
+            {{- end }}
+          {{- if ne $component "telegram" }}
+          {{- $probe := list }}
+          {{- if eq $component "worker" }}
+          {{- $probe = list "sh" "-c" "test -s /run/sshd/sshd.pid && /usr/sbin/sshd -t -f /etc/ssh/taskopotamus_config" }}
+          {{- else if eq $component "postgres" }}
+          {{- $probe = list "pg_isready" "-U" "postgres" "-d" "postgres" }}
+          {{- else if eq $component "objects" }}
+          {{- $probe = list "curl" "--fail" "--silent" "--output" "/dev/null" "http://localhost:9000/minio/health/live" }}
+          {{- else }}
+          {{- $port := 8080 }}{{ if eq $component "google" }}{{ $port = 8081 }}{{ else if eq $component "test-console" }}{{ $port = 8088 }}{{ end }}
+          {{- $probe = list "python" "-c" (printf "import urllib.request; urllib.request.urlopen('http://localhost:%d/health', timeout=3)" $port) }}
+          {{- end }}
+          readinessProbe:
+            exec:
+              command: {{ toJson $probe }}
+            periodSeconds: 5
+            timeoutSeconds: 4
+          startupProbe:
+            exec:
+              command: {{ toJson $probe }}
+            periodSeconds: 5
+            timeoutSeconds: 4
+            failureThreshold: 60
+          {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {medium: Memory}
+        - name: projected-secrets
+          secret:
+            secretName: {{ $.Values.existingSecret | quote }}
+            defaultMode: 0400
+            items:
+              {{- range $path, $key := $secrets }}
+              - {key: {{ $key | quote }}, path: {{ $path | quote }}}
+              {{- end }}
+        {{- if $worker }}
+        - {name: run, emptyDir: {medium: Memory}}
+        - {name: root, emptyDir: {medium: Memory}}
+        - {name: home, emptyDir: {medium: Memory}}
+        - name: legacy
+          {{- if $.Values.storage.legacyClaim }}
+          persistentVolumeClaim: {claimName: {{ $.Values.storage.legacyClaim | quote }}, readOnly: true}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- else }}
+        - name: private-secrets
+          emptyDir: {medium: Memory, sizeLimit: 1Mi}
+        {{- end }}
+        {{- range $name, $_ := $data }}
+        - name: {{ $name }}
+          persistentVolumeClaim:
+            claimName: {{ include "taskopotamus.claim" (dict "root" $ "name" $name) | quote }}
+        {{- end }}
+        {{- if eq $component "postgres" }}
+        - {name: postgres-run, emptyDir: {medium: Memory}}
+        - name: postgres-init
+          configMap:
+            name: {{ $.Release.Name }}-postgres-init
+            defaultMode: 0555
+        {{- end }}
+        {{- if and $.Values.instructionsConfigMap (has $component (list "agent" "mcp")) }}
+        - name: instructions
+          configMap:
+            name: {{ $.Values.instructionsConfigMap | quote }}
+        {{- end }}
+{{- end }}

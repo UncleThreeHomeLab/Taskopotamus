@@ -1,0 +1,93 @@
+{{- $components := include "taskopotamus.components" . | fromJsonArray -}}
+{{- $edges := dict
+  "telegram" (list (dict "component" "agent" "port" 8080) (dict "component" "google" "port" 8081) (dict "component" "postgres" "port" 5432))
+  "agent" (list (dict "component" "worker" "port" 2222) (dict "component" "mcp" "port" 8080) (dict "component" "google" "port" 8082) (dict "component" "postgres" "port" 5432))
+  "worker" (list (dict "component" "agent" "port" 8080) (dict "component" "mcp" "port" 8080))
+  "google" (list (dict "component" "agent" "port" 8080))
+  "mcp" (list (dict "component" "postgres" "port" 5432))
+  "test-console" (list (dict "component" "agent" "port" 8080))
+  "postgres" (list)
+  "objects" (list)
+-}}
+{{- $blocked := concat (list
+  "0.0.0.0/8" "10.0.0.0/8" "100.64.0.0/10" "127.0.0.0/8" "169.254.0.0/16"
+  "172.16.0.0/12" "192.0.0.0/24" "192.0.2.0/24" "192.168.0.0/16"
+  "198.18.0.0/15" "198.51.100.0/24" "203.0.113.0/24" "224.0.0.0/4" "240.0.0.0/4"
+) .Values.network.clusterCIDRs | uniq -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-default-deny
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: taskopotamus
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress: []
+{{- range $component := $components }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $.Release.Name }}-{{ $component }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "taskopotamus.labels" (dict "root" $ "component" $component) | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  {{- $incoming := false }}
+  {{- range $source := $components }}
+  {{- range $edge := index $edges $source }}
+  {{- if eq $edge.component $component }}
+  {{- if not $incoming }}
+  ingress:
+  {{- $incoming = true }}
+  {{- end }}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "taskopotamus.labels" (dict "root" $ "component" $source) | nindent 14 }}
+      ports: [{protocol: TCP, port: {{ $edge.port }}}]
+  {{- end }}
+  {{- end }}
+  {{- end }}
+  {{- if not $incoming }}
+  ingress: []
+  {{- end }}
+  {{- if has $component (list "postgres" "objects") }}
+  egress: []
+  {{- else }}
+  egress:
+    {{- range $edge := index $edges $component }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "taskopotamus.labels" (dict "root" $ "component" $edge.component) | nindent 14 }}
+      ports: [{protocol: TCP, port: {{ $edge.port }}}]
+    {{- end }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- $.Values.network.dnsNamespaceLabels | toYaml | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- $.Values.network.dnsPodLabels | toYaml | nindent 14 }}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    {{- if has $component (list "telegram" "google" "worker") }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- $blocked | toYaml | nindent 14 }}
+      ports:
+        - {protocol: TCP, port: 443}
+        {{- if ne $component "telegram" }}
+        - {protocol: TCP, port: 80}
+        {{- end }}
+    {{- end }}
+  {{- end }}
+{{- end }}
