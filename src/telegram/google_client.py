@@ -53,9 +53,11 @@ class GoogleClient:
             if state in ("disabled", "unavailable"):
                 return "Google connection is not configured. Ask the deployment owner to check Google setup."
             if state == "login":
-                warning = "Extra Google consent required. ALL access reset Off. Reopen settings and Save after account confirmation.\n" if result.get("reauthorization") else ""
+                retained = result.get("permissions_retained")
+                warning = ("Extra Google consent required. Your saved choices will apply after account confirmation, limited to granted access.\n"
+                           if retained else "Extra Google consent required. ALL access reset Off. Reopen settings and Save after account confirmation.\n" if result.get("reauthorization") else "")
                 return (warning + f"Open {result['url']}\nSign in only on Google's page. Never send passwords or tokens here.\n"
-                        "After login, send /google here to review and confirm the account. All data access stays off.")
+                        "After login, send /google here to review and confirm the account. Access stays suspended until confirmation.")
             if result.get("pending"):
                 pending = result["pending"]
                 return (f"Google account waiting for confirmation: {pending['email']}\n"
@@ -67,6 +69,10 @@ class GoogleClient:
                 return ("Google disconnected locally. Google revocation could not be confirmed. "
                         "Remove Taskopotamus access at https://myaccount.google.com/connections.")
             if state == "active":
+                if result.get("permissions_applied"):
+                    return (f"Google connected: {result['email']}\n{result['notice']}\n"
+                            f"Gmail: {result['gmail'].title()}. Calendars with access: {result['calendar_count']}.\n"
+                            "Send /google or /calendars to review settings.")
                 return f"Google connected: {result['email']}\nGmail: Off. Calendar events: Off.\nSend /google or /calendars to choose access and Save."
             if state == "reconnect":
                 return "Google authorization expired. All access is off. Reconnect with /google connect."

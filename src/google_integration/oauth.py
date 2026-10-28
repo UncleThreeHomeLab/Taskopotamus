@@ -105,7 +105,7 @@ class GoogleOAuth:
         with self.lifecycle_lock:
             return self._control(chat, request_id, action, confirmation)
 
-    def _control(self, chat, request_id, action, confirmation=None, requested_scopes=None, identity_override=None):
+    def _control(self, chat, request_id, action, confirmation=None, requested_scopes=None, identity_override=None, resume=None):
         validate_chat(chat)
         if action == "status":
             return self.store.status(chat)
@@ -114,6 +114,8 @@ class GoogleOAuth:
         if action == "confirm" and (not isinstance(confirmation, str) or len(confirmation) > 100):
             raise ValueError("Invalid Google confirmation.")
         identity = identity_override or action + (":" + confirmation if action == "confirm" else "")
+        if action == "confirm":
+            return self._confirm(chat, request_id, identity, confirmation)
         revoke_token = None
         with self.store.transaction() as db:
             saved = self.store.cached(db, chat, request_id, identity)
@@ -122,6 +124,16 @@ class GoogleOAuth:
             row = self.store.connection(db, chat)
             generation = row["generation"]
             if action == "connect":
+                if resume is not None:
+                    revision, _ = self.permissions.read(db, chat, generation)
+                    active = self.store.open(chat, generation, "active", row["active"]) if row["active"] else {}
+                    if (row["status"] != "active" or row["pending"]
+                            or db.execute("SELECT 1 FROM flows WHERE chat=?", (chat,)).fetchone()
+                            or resume["generation"] != generation or resume["revision"] != revision
+                            or resume["sub"] != active.get("sub")):
+                        raise ValueError("Google permission request changed. Send /google.")
+                    self.permissions.validate(resume["settings"])
+                    resume = {**resume, "expires": self.store.clock() + 600}
                 generation += 1
                 retained = None
                 if row["active"]:
@@ -134,21 +146,13 @@ class GoogleOAuth:
                            (generation, retained, chat))
                 db.execute("INSERT INTO flows VALUES (?,?,?,?,?,?,?)", (
                     chat, generation, digest(ticket), None, None,
-                    self.store.seal(chat, generation, "flow", {"scopes": list(requested_scopes or BASE_SCOPES)}), self.store.clock() + 600))
+                    self.store.seal(chat, generation, "flow", {"scopes": list(requested_scopes or BASE_SCOPES),
+                                                              **({"resume": resume} if resume is not None else {})}), self.store.clock() + 600))
                 result = {"state": "login", "url": self.config.origin + "/oauth/google/start?" + urlencode({"ticket": ticket})}
                 if requested_scopes:
                     result["reauthorization"] = True
-            elif action == "confirm":
-                if (not row["pending"] or row["pending_until"] <= self.store.clock()
-                        or not secrets.compare_digest(digest(confirmation), row["pending_hash"])):
-                    raise ValueError("Google confirmation expired or unavailable. Send /google.")
-                pending = self.store.open(chat, generation, "pending", row["pending"])
-                pending.pop("confirmation")
-                pending["permissions"] = {"gmail": "off", "calendars": {}}
-                generation += 1
-                db.execute("UPDATE connections SET generation=?,status='active',active=?,pending=NULL,pending_hash=NULL,pending_until=NULL WHERE chat=?",
-                           (generation, self.store.seal(chat, generation, "active", pending), chat))
-                result = {"state": "active", "email": pending["email"], "gmail": "off", "calendars": "off"}
+                if resume is not None:
+                    result["permissions_retained"] = True
             else:
                 if row["active"]:
                     active = self.store.open(chat, generation, "active", row["active"])
@@ -175,6 +179,58 @@ class GoogleOAuth:
                                (self.store.seal(chat, cached["generation"], "command:" + request_id, result), chat, request_id))
         return result
 
+    def _confirm(self, chat, request_id, identity, confirmation):
+        deadline = time.monotonic() + 20
+        with self.store.transaction(deadline) as db:
+            saved = self.store.cached(db, chat, request_id, identity)
+            if saved is not None:
+                return saved
+            row = self.store.connection(db, chat)
+            if (not row["pending"] or row["pending_until"] <= self.store.clock()
+                    or not secrets.compare_digest(digest(confirmation), row["pending_hash"])):
+                raise ValueError("Google confirmation expired or unavailable. Send /google.")
+            generation, expected_hash, expected_until = row["generation"], row["pending_hash"], row["pending_until"]
+            revision, _ = self.permissions.read(db, chat, generation)
+            pending = self.store.open(chat, generation, "pending", row["pending"])
+        settings, notice = {"gmail": "off", "calendars": {}}, None
+        if "resume" in pending:
+            if revision != 0:
+                raise ValueError("Google permissions changed. Send /google.")
+            try:
+                settings, notice = self.permissions.confirmed_settings(pending, generation, deadline)
+            except GoogleUnavailable:
+                return {"state": "menu", "text": "Calendar verification unavailable. Your saved choices are still pending. Send /google and retry Confirm account; no new Google login is needed.", "keyboard": []}
+        remaining(deadline)
+        with self.store.transaction(deadline) as db:
+            saved = self.store.cached(db, chat, request_id, identity)
+            if saved is not None:
+                return saved
+            row = self.store.connection(db, chat)
+            current_revision, _ = self.permissions.read(db, chat, row["generation"])
+            if (row["generation"] != generation or row["pending_hash"] != expected_hash
+                    or row["pending_until"] != expected_until or expected_until <= self.store.clock()
+                    or not row["pending"] or current_revision != revision
+                    or db.execute("SELECT 1 FROM flows WHERE chat=?", (chat,)).fetchone()):
+                raise ValueError("Google confirmation expired or changed. Send /google.")
+            applied = "resume" in pending
+            pending.pop("confirmation")
+            pending.pop("resume", None)
+            pending["permissions"] = {"gmail": "off", "calendars": {}}
+            generation += 1
+            db.execute("UPDATE connections SET generation=?,status='active',active=?,pending=NULL,pending_hash=NULL,pending_until=NULL WHERE chat=?",
+                       (generation, self.store.seal(chat, generation, "active", pending), chat))
+            db.execute("DELETE FROM permissions WHERE chat=?", (chat,))
+            if applied:
+                self.permissions.write(db, chat, generation, 1, settings)
+            db.execute("DELETE FROM menus WHERE chat=?", (chat,))
+            result = {"state": "active", "email": pending["email"], "gmail": settings["gmail"], "calendars": "off"}
+            if applied:
+                result.pop("calendars")
+                result.update(permissions_applied=True, notice=notice,
+                              calendar_count=sum(entry["mode"] != "off" for entry in settings["calendars"].values()))
+            self.store.save_command(db, chat, request_id, identity, result)
+            return result
+
     def start(self, ticket):
         import base64
         import hashlib
@@ -188,7 +244,7 @@ class GoogleOAuth:
             flow = self.store.open(row["chat"], row["generation"], "flow", row["payload"])
             scopes = flow.get("scopes", list(BASE_SCOPES))
             db.execute("UPDATE flows SET ticket_hash=NULL,state_hash=?,cookie_hash=?,payload=? WHERE chat=?",
-                       (digest(state), digest(cookie), self.store.seal(row["chat"], row["generation"], "flow", {"verifier": verifier, "scopes": scopes}), row["chat"]))
+                       (digest(state), digest(cookie), self.store.seal(row["chat"], row["generation"], "flow", {**flow, "verifier": verifier, "scopes": scopes}), row["chat"]))
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
         return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode({
             "client_id": self.config.client_id, "redirect_uri": self.config.redirect_uri,
@@ -239,9 +295,12 @@ class GoogleOAuth:
                 raise GoogleUnavailable("Google offline access unavailable. Reconnect in Telegram.")
             confirmation = secrets.token_urlsafe(24)
             pending = {**tokens, "sub": identity["sub"], "email": identity["email"], "confirmation": confirmation}
+            if "resume" in flow:
+                pending["resume"] = flow["resume"]
+            expires = min(self.store.clock() + 600, flow["resume"]["expires"]) if "resume" in flow else self.store.clock() + 600
             db.execute("UPDATE connections SET pending=?,pending_hash=?,pending_until=? WHERE chat=?",
                        (self.store.seal(row["chat"], row["generation"], "pending", pending), digest(confirmation),
-                        self.store.clock() + 600, row["chat"]))
+                        expires, row["chat"]))
 
     def _tokens(self, value):
         if (not isinstance(value, dict) or not isinstance(value.get("access_token"), str)

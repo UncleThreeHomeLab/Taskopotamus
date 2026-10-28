@@ -1,6 +1,8 @@
 """Offline permission, callback, discovery and application-only delivery checks."""
 import copy
 import http.client
+import io
+import json
 import socket
 import threading
 import time
@@ -17,6 +19,7 @@ from src.messaging.delivery_store import DeliveryStore
 from src.messaging.messages import validate_items
 from src.telegram.bot import deliver_one, process_input, reply_for
 from src.telegram.inbox import Inbox, normalize
+from src.telegram.google_client import GoogleClient
 
 
 class PermissionGoogle(connection_tests.SyntheticGoogle):
@@ -107,7 +110,7 @@ class GooglePermissionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.click(original, "Gmail Read")
 
-    def test_incremental_consent_resets_all_off_partial_denial_never_restores(self):
+    def test_partial_incremental_consent_keeps_ungranted_choices_off(self):
         self.finish()
         menu = self.click(self.menu(), "Gmail Read")
         self.assertEqual(len(self.transport.calls), 2)
@@ -128,6 +131,177 @@ class GooglePermissionTests(unittest.TestCase):
             self.click(menu, "Save")
         retry = self.click(self.menu(), "Gmail Read")
         self.assertEqual(self.click(retry, "Save")["state"], "login")
+
+    def test_saved_gmail_choice_applies_after_incremental_consent_without_second_save(self):
+        self.finish()
+        login = self.click(self.click(self.menu(), "Gmail Read"), "Save")
+        ticket = parse_qs(urlsplit(login["url"]).query)["ticket"][0]
+        url, cookie = self.oauth.start(ticket)
+        self.transport.scopes += [GMAIL_READ]
+        self.oauth.callback(parse_qs(urlsplit(url).query)["state"][0], cookie, "synthetic-code")
+        with self.assertRaises(PermissionError):
+            self.permissions.dispatch("42", "gmail_read", Mock())
+        result = self.click(self.menu(), "Confirm account")
+        self.assertEqual(self.settings()[1]["gmail"], "read")
+        self.assertTrue(result["permissions_applied"])
+        self.assertEqual(self.permissions.dispatch("42", "gmail_read", lambda *_: "allowed"), "allowed")
+        calls = len(self.transport.calls)
+        self.assertEqual(self.click(self.menu(), "Save")["state"], "menu")
+        self.assertEqual(len(self.transport.calls), calls)
+        self.assertEqual(self.transport.list_calls, [])
+
+    def consent(self, login, scopes):
+        ticket = parse_qs(urlsplit(login["url"]).query)["ticket"][0]
+        url, cookie = self.oauth.start(ticket)
+        self.transport.scopes = scopes
+        self.oauth.callback(parse_qs(urlsplit(url).query)["state"][0], cookie, "synthetic-code")
+        return self.store.status("42")["pending"]["confirmation"]
+
+    def calendar_consent(self):
+        self.transport.scopes = list(BASE_SCOPES) + [GMAIL_READ]
+        self.finish()
+        self.click(self.click(self.menu(), "Gmail Read"), "Save")
+        return self.click(self.select_mode(self.menu(True), 1, "Edit"), "Save")
+
+    def test_saved_gmail_and_new_calendar_apply_once_with_fresh_catalog_and_new_calendars_off(self):
+        login = self.calendar_consent()
+        self.consent(login, list(BASE_SCOPES) + [GMAIL_READ, CALENDAR_EDIT])
+        self.transport.pages[0]["items"].append({"id": "new-calendar", "summary": "New", "accessRole": "owner"})
+        menu = self.menu()
+        self.number += 1
+        request = str(self.number)
+        result = self.click(menu, "Confirm account", request=request)
+        settings = self.settings()[1]
+        self.assertEqual(settings["gmail"], "read")
+        self.assertEqual(settings["calendars"]["calendar-exact@example.test"]["mode"], "edit")
+        self.assertEqual(settings["calendars"]["new-calendar"]["mode"], "off")
+        self.assertEqual(result["calendar_count"], 1)
+        self.assertEqual(self.permissions.dispatch("42", "calendar_edit", lambda *_: "allowed", "calendar-exact@example.test"), "allowed")
+        calls = len(self.transport.list_calls)
+        self.assertEqual(self.click(menu, "Confirm account", request=request), result)
+        self.assertEqual(len(self.transport.list_calls), calls)
+        with self.assertRaises(ValueError):
+            self.click(menu, "Confirm account")
+
+    def test_partial_calendar_grants_or_roles_never_enable_unapproved_access(self):
+        for scenario in ("missing-events", "missing-list", "reader", "unsupported", "removed"):
+            with self.subTest(scenario=scenario):
+                self.transport.pages = [{"items": [{"id": "calendar-exact@example.test", "summary": "Synthetic", "accessRole": "owner"}]}]
+                login = self.calendar_consent()
+                scopes = ["openid", "email", GMAIL_READ, CALENDAR_EDIT] if scenario == "missing-list" else list(BASE_SCOPES) + [GMAIL_READ]
+                if scenario not in ("missing-list", "missing-events"):
+                    scopes.append(CALENDAR_EDIT)
+                self.consent(login, scopes)
+                if scenario in ("reader", "unsupported"):
+                    self.transport.pages[0]["items"][0]["accessRole"] = "reader" if scenario == "reader" else "freeBusyReader"
+                elif scenario == "removed":
+                    self.transport.pages = [{"items": []}]
+                result = self.click(self.menu(), "Confirm account")
+                settings = self.settings()[1]
+                self.assertEqual(settings["gmail"], "read")
+                self.assertEqual(settings["calendars"].get("calendar-exact@example.test", {}).get("mode", "off"), "off")
+                self.assertIn("1 requested permissions remain Off", result["notice"])
+                if scenario in ("missing-events", "missing-list"):
+                    self.assertEqual(self.transport.list_calls, [])
+                with self.assertRaises(PermissionError):
+                    self.permissions.dispatch("42", "calendar_edit", Mock(), "calendar-exact@example.test")
+
+    def test_calendar_verification_failure_preserves_confirmation_and_retry_needs_no_login(self):
+        login = self.calendar_consent()
+        confirmation = self.consent(login, list(BASE_SCOPES) + [GMAIL_READ, CALENDAR_EDIT])
+        self.transport.pages = [GoogleUnavailable("synthetic unavailable")]
+        result = self.click(self.menu(), "Confirm account")
+        self.assertEqual(result["state"], "menu")
+        self.assertIn("no new Google login", result["text"])
+        self.assertEqual(self.store.status("42")["pending"]["confirmation"], confirmation)
+        with self.assertRaises(PermissionError):
+            self.permissions.dispatch("42", "gmail_read", Mock())
+        token_calls = len(self.transport.calls)
+        self.transport.pages = [{"items": [{"id": "calendar-exact@example.test", "accessRole": "writer"}]}]
+        result = self.click(self.menu(), "Confirm account")
+        self.assertTrue(result["permissions_applied"])
+        self.assertEqual(len(self.transport.calls), token_calls)
+        self.assertEqual(self.settings()[1]["calendars"]["calendar-exact@example.test"]["mode"], "edit")
+
+    def test_expired_replaced_other_account_owner_and_changed_pending_cannot_restore_choices(self):
+        self.finish()
+        for scenario in ("expired", "replaced", "other-owner", "other-account", "changed-revision"):
+            with self.subTest(scenario=scenario):
+                self.transport.subject = "synthetic-subject"
+                self.transport.scopes = list(BASE_SCOPES)
+                self.finish()
+                login = self.click(self.click(self.menu(), "Gmail Read"), "Save")
+                confirmation = self.consent(login, list(BASE_SCOPES) + [GMAIL_READ])
+                chat = "42"
+                if scenario == "expired":
+                    self.now += 601
+                elif scenario == "replaced":
+                    self.control("connect")
+                elif scenario == "other-owner":
+                    chat = "43"
+                elif scenario == "other-account":
+                    with self.store.transaction() as db:
+                        row = self.store.connection(db, "42")
+                        pending = self.store.open("42", row["generation"], "pending", row["pending"])
+                        pending["resume"]["sub"] = "another-subject"
+                        db.execute("UPDATE connections SET pending=? WHERE chat='42'", (self.store.seal("42", row["generation"], "pending", pending),))
+                else:
+                    with self.store.transaction() as db:
+                        row = self.store.connection(db, "42")
+                        self.permissions.write(db, "42", row["generation"], 1, {"gmail": "off", "calendars": {}})
+                with self.assertRaises(ValueError):
+                    self.control("confirm", chat, confirmation)
+                self.assertEqual(self.settings()[1]["gmail"], "off")
+
+    def test_catalog_race_rechecks_confirmation_generation_before_applying_choices(self):
+        login = self.calendar_consent()
+        self.consent(login, list(BASE_SCOPES) + [GMAIL_READ, CALENDAR_EDIT])
+        original = self.transport.calendar_list
+        def replaced(*args):
+            result = original(*args)
+            self.control("connect")
+            return result
+        self.transport.calendar_list = replaced
+        with self.assertRaises(ValueError):
+            self.click(self.menu(), "Confirm account")
+        self.assertEqual(self.settings()[1], {"gmail": "off", "calendars": {}})
+
+    def test_manual_reconnect_drops_retained_choices_and_initial_connections_still_start_off(self):
+        self.finish()
+        login = self.click(self.click(self.menu(), "Gmail Read"), "Save")
+        self.consent(login, list(BASE_SCOPES) + [GMAIL_READ])
+        self.finish()
+        self.assertEqual(self.settings()[1], {"gmail": "off", "calendars": {}})
+
+    def test_denied_incremental_consent_never_restores_saved_choices(self):
+        self.finish()
+        login = self.click(self.click(self.menu(), "Gmail Read"), "Save")
+        ticket = parse_qs(urlsplit(login["url"]).query)["ticket"][0]
+        url, cookie = self.oauth.start(ticket)
+        state = parse_qs(urlsplit(url).query)["state"][0]
+        self.oauth.callback(state, cookie, denied=True)
+        self.assertNotIn("pending", self.store.status("42"))
+        self.assertEqual(self.settings()[1], {"gmail": "off", "calendars": {}})
+        with self.assertRaises(ValueError):
+            self.oauth.callback(state, cookie, "synthetic-code")
+
+    def test_telegram_reports_retained_choices_and_applied_permissions_without_second_save(self):
+        self.finish()
+        login = self.click(self.click(self.menu(), "Gmail Read"), "Save")
+        client = GoogleClient("http://google:8081", connection_tests.SECRET)
+        with patch.object(client.opener, "open", return_value=io.BytesIO(json.dumps(login).encode())):
+            text = client.command(42, "1", "/google")
+        self.assertIn("saved choices", text)
+        self.assertNotIn("reset Off", text)
+        self.consent(login, list(BASE_SCOPES) + [GMAIL_READ])
+        pending = self.menu()
+        self.assertIn("apply saved choices", pending["text"])
+        result = self.click(pending, "Confirm account")
+        with patch.object(client.opener, "open", return_value=io.BytesIO(json.dumps(result).encode())):
+            text = client.command(42, "2", "/google confirm synthetic-confirmation")
+        self.assertIn("Gmail: Read", text)
+        self.assertNotIn("Gmail: Off", text)
+        self.assertNotIn("Save again", text)
 
     def test_calendar_catalog_new_removed_roles_exact_ids_and_failed_snapshots(self):
         self.enable()
