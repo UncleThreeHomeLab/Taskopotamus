@@ -17,6 +17,7 @@ from .inbox import Inbox, direct_control, google_command
 from .input_files import InputRejected, download
 from .reply_context import extract_reply_context, with_reply_context
 from .delivery_store import DeliveryStore
+from .response_body import remaining, read_body
 from src.runtime import read_secret
 from src.storage.database import Database
 
@@ -125,32 +126,40 @@ def reply_chunks(text):
 
 
 def api(token, method, body=None, timeout=40):
-    request = Request(
-        f"https://api.telegram.org/bot{token}/{method}",
-        data=json.dumps(body or {}).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    # ponytail: a hard header deadline needs a different transport; urlopen bounds individual waits.
+    payload, deadline = body or {}, time.monotonic() + timeout
+    limit = 8388608 if method == "getUpdates" else 65536
     try:
-        with urlopen(request, timeout=timeout) as response:
-            if method == "sendMessage":
-                encoded = response.read(65537)
-                if len(encoded) > 65536:
-                    raise RuntimeError("Telegram returned an excessive response.")
+        while True:
+            request = Request(
+                f"https://api.telegram.org/bot{token}/{method}",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(request, timeout=remaining(deadline, timeout)) as response:
+                encoded = read_body(response, limit, deadline, timeout)
+            if len(encoded) <= limit:
                 data = json.loads(encoded)
-            else:
-                data = json.load(response)
+                break
+            batch_limit = payload.get("limit", 100)
+            if method != "getUpdates" or type(batch_limit) is not int or not 1 < batch_limit <= 100:
+                raise RuntimeError("Telegram returned an excessive response.")
+            # Smaller polling batches retain the offset; never retry an uncertain send.
+            payload = {**payload, "limit": max(1, batch_limit // 2)}
+            del encoded
     except HTTPError as error:
         rejected = None
         try:
-            body = error.read(65537) if error.fp is not None else b""
-            if len(body) <= 65536:
-                response = json.loads(body)
+            encoded = read_body(error.fp, 65536, deadline, timeout) if error.fp is not None else b""
+            if len(encoded) <= 65536:
+                response = json.loads(encoded)
                 if isinstance(response, dict) and response.get("error_code") == error.code:
                     rejected = rejection(response)
         except (ValueError, OSError, HTTPException):
             pass
-        error.close()
+        finally:
+            error.close()
         raise rejected or RuntimeError(f"Telegram {method} failed (HTTP {error.code}).") from None
     except (URLError, TimeoutError, OSError, HTTPException):
         raise RuntimeError("Telegram network request failed.") from None
