@@ -30,6 +30,8 @@ class DeliveryStore:
                 attempt TEXT PRIMARY KEY, reply_id TEXT NOT NULL, sequence INTEGER NOT NULL, state TEXT NOT NULL, receipt TEXT)""")
             db.execute("""INSERT INTO delivery_attempts SELECT attempt,reply_id,sequence,state,receipt FROM outgoing_items
                 WHERE attempt IS NOT NULL ON CONFLICT DO NOTHING""")
+            db.execute("""CREATE INDEX IF NOT EXISTS delivery_attempts_inflight ON delivery_attempts(attempt)
+                WHERE state='inflight'""")
             db.execute("""CREATE TABLE IF NOT EXISTS local_commands (
                 chat_id TEXT, request_id TEXT, command TEXT NOT NULL, attempt TEXT NOT NULL,
                 state TEXT NOT NULL, PRIMARY KEY(chat_id,request_id))""")
@@ -231,7 +233,8 @@ class DeliveryStore:
         db.execute("UPDATE outgoing_items SET state='uncertain' WHERE state='inflight' AND claimed <= %s",
                    (now - self.attempt_timeout,))
         db.execute("""UPDATE delivery_attempts a SET state='uncertain' WHERE a.state='inflight' AND EXISTS
-            (SELECT 1 FROM outgoing_items i WHERE i.attempt=a.attempt AND i.state='uncertain')""")
+            (SELECT 1 FROM outgoing_items i WHERE i.reply_id=a.reply_id AND i.sequence=a.sequence
+                AND i.attempt=a.attempt AND i.state='uncertain')""")
         db.execute("""UPDATE outgoing_items SET state='expired' WHERE state IN ('pending','available') AND reply_id IN
                    (SELECT id FROM outgoing_replies WHERE expires <= %s)""", (now,))
 
