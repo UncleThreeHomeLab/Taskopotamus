@@ -45,16 +45,24 @@ class GoogleStore:
                     chat TEXT NOT NULL, request_id TEXT NOT NULL, action_hash TEXT NOT NULL,
                     generation INTEGER NOT NULL, response BLOB NOT NULL, expires REAL NOT NULL,
                     PRIMARY KEY(chat,request_id));
+                CREATE TABLE IF NOT EXISTS permissions (
+                    chat TEXT PRIMARY KEY, generation INTEGER NOT NULL, revision INTEGER NOT NULL, payload BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS menus (
+                    chat TEXT PRIMARY KEY, generation INTEGER NOT NULL, revision INTEGER NOT NULL,
+                    expires REAL NOT NULL, payload BLOB NOT NULL);
             """)
         self.path.chmod(0o600)
 
     @contextmanager
-    def transaction(self):
-        db = sqlite3.connect(self.path, timeout=5)
+    def transaction(self, deadline=None):
+        timeout = 5 if deadline is None else max(0, min(5, deadline - time.monotonic()))
+        db = sqlite3.connect(self.path, timeout=timeout)
         db.row_factory = sqlite3.Row
         try:
             db.execute("PRAGMA secure_delete=ON")
             db.execute("BEGIN IMMEDIATE")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Google storage timed out.")
             yield db
             db.commit()
         except BaseException:
@@ -81,6 +89,7 @@ class GoogleStore:
         now = self.clock()
         db.execute("DELETE FROM flows WHERE expires<=?", (now,))
         db.execute("DELETE FROM commands WHERE expires<=?", (now,))
+        db.execute("DELETE FROM menus WHERE expires<=?", (now,))
         db.execute("UPDATE connections SET pending=NULL,pending_hash=NULL,pending_until=NULL WHERE pending_until<=?", (now,))
 
     def cached(self, db, chat, request_id, action):

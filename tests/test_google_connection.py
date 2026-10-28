@@ -35,7 +35,7 @@ class SyntheticGoogle:
         self.on_token = None
         self.refresh_rotation = None
 
-    def request(self, url, fields=None, token=None):
+    def request(self, url, fields=None, token=None, timeout=10):
         self.calls.append((url, fields, token))
         if self.failure:
             raise self.failure
@@ -232,7 +232,7 @@ class GoogleConnectionTests(unittest.TestCase):
         original = self.transport.request
         new_flow = []
 
-        def stale_refresh(url, fields=None, token=None):
+        def stale_refresh(url, fields=None, token=None, timeout=10):
             if url == TOKEN_URL and fields.get("grant_type") == "refresh_token":
                 new_flow.append(self.start())
                 raise GrantExpired("synthetic-expired")
@@ -324,7 +324,9 @@ class GoogleConnectionTests(unittest.TestCase):
             transport.request("https://evil.example/token")
         for code, payload, expected in ((400, {"error": "invalid_grant", "detail": "synthetic-secret"}, GrantExpired),
                                         (500, {"error": "synthetic-secret"}, GoogleUnavailable)):
-            error = HTTPError(TOKEN_URL, code, "synthetic-secret", {}, io.BytesIO(json.dumps(payload).encode()))
+            response = Mock()
+            response.read1.side_effect = [json.dumps(payload).encode(), b""]
+            error = HTTPError(TOKEN_URL, code, "synthetic-secret", {}, response)
             with patch.object(transport.opener, "open", side_effect=error), self.assertRaises(expected) as caught:
                 transport.request(TOKEN_URL, {"refresh_token": "synthetic-secret"})
             self.assertNotIn("synthetic-secret", str(caught.exception))
@@ -366,7 +368,7 @@ class GoogleConnectionTests(unittest.TestCase):
         with patch.object(client.opener, "open", return_value=response) as send:
             self.assertIn("not connected", client.command(42, "1", "/google"))
         request = send.call_args.args[0]
-        self.assertEqual(json.loads(request.data), {"chat_id": "42", "request_id": "1", "action": "status"})
+        self.assertEqual(json.loads(request.data), {"chat_id": "42", "request_id": "1", "action": "menu_google"})
         self.assertEqual(request.full_url, "http://google:8081/control")
 
 

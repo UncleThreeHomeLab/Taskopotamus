@@ -25,10 +25,14 @@ class GoogleClient:
     def command(self, chat, request_id, text):
         pieces = text.split()
         if pieces == ["/google"]:
-            action, confirmation = "status", None
-        elif len(pieces) == 2 and pieces[1] in ("connect", "disconnect"):
+            action, confirmation = "menu_google", None
+        elif pieces == ["/calendars"]:
+            action, confirmation = "menu_calendars", None
+        elif len(pieces) == 2 and pieces[0] == "/google_callback":
+            action, confirmation = "callback", pieces[1]
+        elif len(pieces) == 2 and pieces[0] == "/google" and pieces[1] in ("connect", "disconnect"):
             action, confirmation = pieces[1], None
-        elif len(pieces) == 3 and pieces[1] == "confirm":
+        elif len(pieces) == 3 and pieces[0] == "/google" and pieces[1] == "confirm":
             action, confirmation = "confirm", pieces[2]
         else:
             return "Google commands: /google, /google connect, /google disconnect."
@@ -44,23 +48,26 @@ class GoogleClient:
                 raise ValueError()
             result = json.loads(encoded)
             state = result["state"]
+            if state == "menu":
+                return {"google_control": True, "text": result["text"], "keyboard": result["keyboard"]}
             if state in ("disabled", "unavailable"):
                 return "Google connection is not configured. Ask the deployment owner to check Google setup."
             if state == "login":
-                return (f"Open {result['url']}\nSign in only on Google's page. Never send passwords or tokens here.\n"
+                warning = "Extra Google consent required. ALL access reset Off. Reopen settings and Save after account confirmation.\n" if result.get("reauthorization") else ""
+                return (warning + f"Open {result['url']}\nSign in only on Google's page. Never send passwords or tokens here.\n"
                         "After login, send /google here to review and confirm the account. All data access stays off.")
             if result.get("pending"):
                 pending = result["pending"]
                 return (f"Google account waiting for confirmation: {pending['email']}\n"
                         "Confirm only if this is the account you intended to connect:\n"
                         f"/google confirm {pending['confirmation']}\nAll data access stays off after confirmation.")
-            if action == "disconnect":
+            if action == "disconnect" or state == "disconnected" and "revoked" in result:
                 if result.get("revoked") is True:
                     return "Google disconnected locally and Google access revoked."
                 return ("Google disconnected locally. Google revocation could not be confirmed. "
                         "Remove Taskopotamus access at https://myaccount.google.com/connections.")
             if state == "active":
-                return f"Google connected: {result['email']}\nGmail: Off. Calendar events: Off.\nDisconnect with /google disconnect."
+                return f"Google connected: {result['email']}\nGmail: Off. Calendar events: Off.\nSend /google or /calendars to choose access and Save."
             if state == "reconnect":
                 return "Google authorization expired. All access is off. Reconnect with /google connect."
             return "Google is not connected. Send /google connect."

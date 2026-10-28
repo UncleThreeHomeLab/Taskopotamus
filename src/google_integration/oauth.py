@@ -2,6 +2,8 @@
 import json
 import secrets
 import threading
+import time
+from contextlib import contextmanager
 from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -14,6 +16,7 @@ BASE_SCOPES = ("openid", "email", "https://www.googleapis.com/auth/calendar.cale
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 IDENTITY_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+CALENDAR_LIST_URL = "https://www.googleapis.com/calendar/v3/users/me/calendarList"
 
 
 class GoogleUnavailable(RuntimeError):
@@ -33,18 +36,17 @@ class GoogleTransport:
     def __init__(self):
         self.opener = build_opener(ProxyHandler({}), NoRedirects())
 
-    def request(self, url, fields=None, token=None):
+    def request(self, url, fields=None, token=None, timeout=10):
         if url not in (TOKEN_URL, IDENTITY_URL, REVOKE_URL):
             raise ValueError("Unsupported Google endpoint.")
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         if token:
             headers["Authorization"] = "Bearer " + token
         request = Request(url, data=urlencode(fields).encode() if fields is not None else None, headers=headers)
+        deadline = time.monotonic() + timeout
         try:
-            with self.opener.open(request, timeout=10) as response:
-                body = response.read(65537)
-            if len(body) > 65536:
-                raise ValueError()
+            with self.opener.open(request, timeout=timeout) as response:
+                body = bounded_body(response, 65536, deadline)
             if url == REVOKE_URL:
                 return {}
             value = json.loads(body)
@@ -54,8 +56,8 @@ class GoogleTransport:
         except HTTPError as error:
             expired = False
             try:
-                body = error.read(65537)
-                expired = url == TOKEN_URL and len(body) <= 65536 and json.loads(body).get("error") == "invalid_grant"
+                body = bounded_body(error.fp, 65536, deadline)
+                expired = url == TOKEN_URL and json.loads(body).get("error") == "invalid_grant"
             except (ValueError, AttributeError, OSError):
                 pass
             error.close()
@@ -65,6 +67,59 @@ class GoogleTransport:
         except (URLError, OSError, ValueError, HTTPException):
             raise GoogleUnavailable("Google request could not be completed.") from None
 
+    def calendar_list(self, token, page_token, deadline):
+        fields = {"maxResults": 100}
+        if page_token:
+            fields["pageToken"] = page_token
+        request = Request(CALENDAR_LIST_URL + "?" + urlencode(fields),
+                          headers={"Authorization": "Bearer " + token})
+        try:
+            with self.opener.open(request, timeout=remaining(deadline)) as response:
+                body = bounded_body(response, 262144, deadline)
+            value = json.loads(body)
+            if not isinstance(value, dict):
+                raise ValueError()
+            return value
+        except HTTPError as error:
+            error.close()
+            raise GoogleUnavailable("Calendar list unavailable.") from None
+        except (URLError, OSError, ValueError, HTTPException):
+            raise GoogleUnavailable("Calendar list unavailable.") from None
+
+
+def remaining(deadline):
+    duration = deadline - time.monotonic()
+    if duration <= 0:
+        raise GoogleUnavailable("Google request timed out.")
+    return min(10, duration)
+
+
+def bounded_body(response, limit, deadline):
+    body = bytearray()
+    while len(body) <= limit:
+        if response.fp is None:
+            remaining(deadline)
+            return body
+        # read1 performs at most one socket read; update timeout before every read to bound slow bodies.
+        response.fp.raw._sock.settimeout(remaining(deadline))
+        chunk = response.read1(min(8192, limit + 1 - len(body)))
+        if not chunk:
+            remaining(deadline)
+            return body
+        body.extend(chunk)
+    raise ValueError("Google response too large.")
+
+
+@contextmanager
+def bounded_lock(lock, deadline):
+    acquired = lock.acquire(timeout=remaining(deadline))
+    if not acquired:
+        raise GoogleUnavailable("Google request timed out.")
+    try:
+        yield
+    finally:
+        lock.release()
+
 
 class GoogleOAuth:
     def __init__(self, config, store, transport=None):
@@ -72,12 +127,16 @@ class GoogleOAuth:
         self.transport = transport or GoogleTransport()
         self.refresh_lock = threading.Lock()
         self.lifecycle_lock = threading.RLock()
+        from .permissions import GooglePermissions
+        self.permissions = GooglePermissions(self)
 
     def control(self, chat, request_id, action, confirmation=None):
+        if action in ("menu_google", "menu_calendars", "callback"):
+            return self.permissions.control(chat, request_id, action, confirmation)
         with self.lifecycle_lock:
             return self._control(chat, request_id, action, confirmation)
 
-    def _control(self, chat, request_id, action, confirmation=None):
+    def _control(self, chat, request_id, action, confirmation=None, requested_scopes=None, identity_override=None):
         validate_chat(chat)
         if action == "status":
             return self.store.status(chat)
@@ -85,7 +144,7 @@ class GoogleOAuth:
             raise ValueError("Unknown Google command.")
         if action == "confirm" and (not isinstance(confirmation, str) or len(confirmation) > 100):
             raise ValueError("Invalid Google confirmation.")
-        identity = action + (":" + confirmation if action == "confirm" else "")
+        identity = identity_override or action + (":" + confirmation if action == "confirm" else "")
         revoke_token = None
         with self.store.transaction() as db:
             saved = self.store.cached(db, chat, request_id, identity)
@@ -106,8 +165,10 @@ class GoogleOAuth:
                            (generation, retained, chat))
                 db.execute("INSERT INTO flows VALUES (?,?,?,?,?,?,?)", (
                     chat, generation, digest(ticket), None, None,
-                    self.store.seal(chat, generation, "flow", {}), self.store.clock() + 600))
+                    self.store.seal(chat, generation, "flow", {"scopes": list(requested_scopes or BASE_SCOPES)}), self.store.clock() + 600))
                 result = {"state": "login", "url": self.config.origin + "/oauth/google/start?" + urlencode({"ticket": ticket})}
+                if requested_scopes:
+                    result["reauthorization"] = True
             elif action == "confirm":
                 if (not row["pending"] or row["pending_until"] <= self.store.clock()
                         or not secrets.compare_digest(digest(confirmation), row["pending_hash"])):
@@ -129,6 +190,8 @@ class GoogleOAuth:
                 db.execute("DELETE FROM flows WHERE chat=?", (chat,))
                 db.execute("UPDATE connections SET generation=generation+1,status='disconnected',active=NULL,pending=NULL,pending_hash=NULL,pending_until=NULL WHERE chat=?", (chat,))
                 result = {"state": "disconnected", "revoked": None}
+            db.execute("DELETE FROM permissions WHERE chat=?", (chat,))
+            db.execute("DELETE FROM menus WHERE chat=?", (chat,))
             self.store.save_command(db, chat, request_id, identity, result)
         if revoke_token:
             try:
@@ -153,12 +216,14 @@ class GoogleOAuth:
             row = db.execute("SELECT * FROM flows WHERE ticket_hash=?", (digest(ticket),)).fetchone()
             if row is None:
                 raise ValueError("Google login link expired. Reconnect in Telegram.")
+            flow = self.store.open(row["chat"], row["generation"], "flow", row["payload"])
+            scopes = flow.get("scopes", list(BASE_SCOPES))
             db.execute("UPDATE flows SET ticket_hash=NULL,state_hash=?,cookie_hash=?,payload=? WHERE chat=?",
-                       (digest(state), digest(cookie), self.store.seal(row["chat"], row["generation"], "flow", {"verifier": verifier}), row["chat"]))
+                       (digest(state), digest(cookie), self.store.seal(row["chat"], row["generation"], "flow", {"verifier": verifier, "scopes": scopes}), row["chat"]))
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
         return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode({
             "client_id": self.config.client_id, "redirect_uri": self.config.redirect_uri,
-            "response_type": "code", "scope": " ".join(BASE_SCOPES), "state": state,
+            "response_type": "code", "scope": " ".join(scopes), "state": state,
             "code_challenge": challenge, "code_challenge_method": "S256", "access_type": "offline",
             "prompt": "consent select_account", "include_granted_scopes": "true",
         }), cookie
@@ -226,11 +291,12 @@ class GoogleOAuth:
             result["refresh_token"] = value["refresh_token"]
         return result
 
-    def credentials(self, chat):
+    def credentials(self, chat, deadline=None):
         """Service-internal only. Never expose this result through HTTP or model tools."""
         validate_chat(chat)
-        with self.refresh_lock:
-            with self.store.transaction() as db:
+        deadline = deadline or time.monotonic() + 20
+        with bounded_lock(self.lifecycle_lock, deadline), bounded_lock(self.refresh_lock, deadline):
+            with self.store.transaction(deadline) as db:
                 row = self.store.connection(db, chat)
                 if row["status"] != "active" or not row["active"]:
                     raise PermissionError("Google connection unavailable.")
@@ -240,19 +306,20 @@ class GoogleOAuth:
             try:
                 response = self.transport.request(TOKEN_URL, {"client_id": self.config.client_id,
                     "client_secret": self.config.client_secret, "refresh_token": active["refresh_token"],
-                    "grant_type": "refresh_token"})
+                    "grant_type": "refresh_token"}, timeout=remaining(deadline))
+                remaining(deadline)
                 updated = self._tokens(response)
-                if not updated["scopes"]:
+                if "scope" not in response:
                     updated["scopes"] = active["scopes"]
                 active.update(updated)
             except GrantExpired:
-                with self.store.transaction() as db:
+                with self.store.transaction(deadline) as db:
                     changed = db.execute("UPDATE connections SET status='reconnect',active=NULL,pending=NULL,pending_hash=NULL,pending_until=NULL,generation=generation+1 WHERE chat=? AND generation=?",
                                          (chat, row["generation"]))
                     if changed.rowcount:
                         db.execute("DELETE FROM flows WHERE chat=? AND generation=?", (chat, row["generation"]))
                 raise
-            with self.store.transaction() as db:
+            with self.store.transaction(deadline) as db:
                 saved = db.execute("UPDATE connections SET active=? WHERE chat=? AND generation=? AND status='active'",
                                    (self.store.seal(chat, row["generation"], "active", active), chat, row["generation"]))
                 if not saved.rowcount:
