@@ -124,6 +124,46 @@ class MessagingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.deliveries.acknowledge(first["delivery_id"], 0, "f" * 32, "delivered", {"message_id": 9})
 
+    def test_attempt_index_upgrade_preserves_retry_history_and_late_confirmation(self):
+        self.publish()
+        delivered = self.deliveries.claim(["42"])
+        receipt = {"message_id": 7}
+        self.deliveries.acknowledge(delivered["delivery_id"], 0, delivered["attempt"], "delivered", receipt)
+        self.publish(chat="43")
+        limited = self.deliveries.claim(["43"])
+        retry_receipt = {"retry_after": 3}
+        retry_ack = (limited["delivery_id"], 0, limited["attempt"], "rate_limited", retry_receipt)
+        self.deliveries.acknowledge(*retry_ack)
+        self.now += 3
+        current = self.deliveries.claim(["43"])
+        self.now += 11
+
+        with self.database.connect() as db:
+            before = db.execute("SELECT attempt,state,receipt FROM delivery_attempts ORDER BY attempt").fetchall()
+            db.execute("DROP INDEX delivery_attempts_inflight")
+        for _ in range(2):
+            self.deliveries = DeliveryStore(self.database, retention=1000, attempt_timeout=10, clock=self.clock)
+        with self.database.connect() as db:
+            self.assertEqual(db.execute("SELECT attempt,state,receipt FROM delivery_attempts ORDER BY attempt").fetchall(), before)
+            self.assertEqual(db.execute("""SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+                WHERE c.relname='delivery_attempts_inflight'""").fetchone(), (True,))
+
+        self.assertIsNone(self.deliveries.claim(["43"]))
+        with self.database.connect() as db:
+            history = {attempt: (state, json.loads(stored) if stored else None) for attempt, state, stored in
+                       db.execute("SELECT attempt,state,receipt FROM delivery_attempts").fetchall()}
+        self.assertEqual(history, {
+            delivered["attempt"]: ("delivered", receipt),
+            limited["attempt"]: ("rate_limited", retry_receipt),
+            current["attempt"]: ("uncertain", None),
+        })
+        self.deliveries.acknowledge(current["delivery_id"], 0, current["attempt"], "delivered", {"message_id": 8})
+        self.deliveries.acknowledge(*retry_ack)
+        with self.assertRaises(ValueError):
+            self.deliveries.acknowledge(limited["delivery_id"], 0, limited["attempt"], "delivered", {"message_id": 9})
+        self.assertEqual(self.deliveries.status("43")[0]["state"], "delivered")
+        self.assertIsNone(self.deliveries.claim(["43"]))
+
     def test_markdown_transport_is_persisted_without_changing_raw_batch_or_replay(self):
         raw = [{"type": "text", "text": "**Result** & <script>"}]
         with self.database.connect() as db:
