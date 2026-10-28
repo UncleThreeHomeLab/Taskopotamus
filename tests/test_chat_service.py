@@ -2,10 +2,12 @@ import json
 import io
 import threading
 import unittest
+import tempfile
+from pathlib import Path
 from contextlib import contextmanager, nullcontext, redirect_stderr
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from openai_codex.errors import InternalRpcError
@@ -19,6 +21,35 @@ from database_support import isolated_database
 
 
 class ChatServiceTests(unittest.TestCase):
+    def test_gmail_and_existing_tools_start_resume_and_cached_replay(self):
+        from src.messaging.artifacts import ArtifactStore
+        from src.agent.google_tools import google_config
+        from src.agent.subagents import SubagentPolicy
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = ArtifactStore(self.database, Path(directory) / "artifacts")
+            profiles = Mock()
+            profiles.prepare.return_value = (DEFAULT_PROFILE, {"mcp_servers.profiles.required": True}, "synthetic-token")
+            policy = SubagentPolicy()
+            chat = ChatService(self.codex_factory, self.database, profiles=profiles, artifacts=artifacts, subagents=policy)
+            chat.reply("42", "hello", "1")
+            chat.reply("42", "continue", "2")
+            for method in (self.codex.thread_start, self.codex.thread_resume):
+                config = method.call_args.kwargs["config"]
+                for key, value in {**google_config(), **policy.config()}.items():
+                    self.assertEqual(config[key], value)
+                self.assertTrue(config["mcp_servers.profiles.required"])
+                self.assertEqual(config["mcp_servers.reply_attachments.enabled_tools"], ["send_message"])
+            self.assertEqual(self.thread._client.request.call_args.args[0], "thread/inject_items")
+            self.assertEqual(len(self.codex_factory.call_args.args), 2)
+            profiles.prepare.reset_mock()
+            self.codex_factory.reset_mock()
+            with patch("src.agent.chat_service.load_system_instructions", side_effect=AssertionError("Cached replay reloaded instructions")), \
+                    patch("src.agent.chat_service.google_config", side_effect=AssertionError("Cached replay prepared Google")):
+                self.assertEqual(chat.reply("42", "continue", "2")["text"], "Hello")
+            profiles.prepare.assert_not_called()
+            self.codex_factory.assert_not_called()
+
     def test_workspace_storage_refusal_reaches_client_without_starting_inference(self):
         self.codex_factory.side_effect = WorkspaceStorageError("synthetic-private-detail")
         token = "synthetic-service-token-for-tests-only"

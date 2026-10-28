@@ -269,6 +269,7 @@ class GooglePermissions:
             text = ["Google connected: " + plain(active["email"], 254), menu.pop("notice", "Changes are drafts until Save.")]
             if menu["view"] == "google":
                 text.append("Gmail: " + menu["draft"]["gmail"].title())
+                text.append("Gmail Read sends selected email to the configured AI provider. Email may appear in Telegram and conversation history.")
                 buttons([("Gmail Off", "gmail", "off"), ("Gmail Read", "gmail", "read")])
                 text.append("Use /calendars for individual calendar access.")
                 buttons([("Disconnect Google", "disconnect_review", None)])
@@ -306,14 +307,17 @@ class GooglePermissions:
                    (chat, generation, revision, menu["expires"], self.store.seal(chat, generation, f"menu:{revision}", menu)))
         return {"state": "menu", "text": "\n".join(text), "keyboard": keyboard}
 
-    def dispatch(self, chat, operation, callback, calendar_id=None):
+    def dispatch(self, chat, operation, callback, calendar_id=None, *, run_guard=None, deadline=None):
         """Internal S3/S4 boundary. Check before refresh and immediately before dispatch, under lifecycle lock."""
         validate_chat(chat)
         if operation not in ("gmail_read", "calendar_read", "calendar_edit") or not callable(callback):
             raise PermissionError("Google operation denied.")
-        deadline = time.monotonic() + 20
+        deadline = min(deadline, time.monotonic() + 20) if deadline is not None else time.monotonic() + 20
         with bounded_lock(self.oauth.lifecycle_lock, deadline):
             def check():
+                nonlocal deadline
+                if run_guard is not None:
+                    deadline = min(deadline, run_guard())
                 with self.store.transaction(deadline) as db:
                     row = self.store.connection(db, chat)
                     revision, settings = self.read(db, chat, row["generation"])
@@ -332,7 +336,7 @@ class GooglePermissions:
                         raise PermissionError("Google access is Off or scope unavailable.")
                     return row["generation"], revision
             expected = check()
-            generation, active = self.oauth.credentials(chat, deadline)
+            generation, active = self.oauth.credentials(chat, deadline, run_guard=run_guard)
             if check() != expected or generation != expected[0]:
                 raise PermissionError("Google permissions changed.")
             remaining(deadline)

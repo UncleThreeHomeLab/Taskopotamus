@@ -150,13 +150,20 @@ def main():
         config, error = GoogleConfig(), True
         print("Google integration disabled: configuration is incomplete or invalid.", file=sys.stderr)
     secret = read_secret("GOOGLE_CONTROL_SECRET")
+    data_secret = read_secret("GOOGLE_DATA_SECRET")
+    if len(data_secret) < 32 or not data_secret.isascii() or secrets.compare_digest(secret, data_secret):
+        raise ValueError("Invalid Google data secret.")
     if len(secret) < 32 or not secret.isascii():
         raise ValueError("Invalid Google control secret.")
     store = GoogleStore(os.environ.get("GOOGLE_STORAGE_DIRECTORY", "/var/lib/taskopotamus/google"),
                         read_secret("GOOGLE_TOKEN_ENCRYPTION_KEY"))
     oauth = GoogleOAuth(config, store)
-    with AgentHTTPServer(("0.0.0.0", 8081), make_handler(oauth, secret, configuration_error=error)) as control:
-        with AgentHTTPServer(("0.0.0.0", 8080), make_handler(oauth, secret, public=True)) as callback:
+    from .data_api import make_data_handler
+    with AgentHTTPServer(("0.0.0.0", 8082), make_data_handler(oauth, data_secret)) as data:
+        with AgentHTTPServer(("0.0.0.0", 8081), make_handler(oauth, secret, configuration_error=error)) as control, \
+                AgentHTTPServer(("0.0.0.0", 8080), make_handler(oauth, secret, public=True)) as callback:
+            data_thread = threading.Thread(target=data.serve_forever, daemon=True)
+            data_thread.start()
             thread = threading.Thread(target=callback.serve_forever, daemon=True)
             thread.start()
             try:
@@ -164,6 +171,8 @@ def main():
             finally:
                 callback.shutdown()
                 thread.join(timeout=5)
+                data.shutdown()
+                data_thread.join(timeout=5)
 
 
 if __name__ == "__main__":

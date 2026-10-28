@@ -19,6 +19,7 @@ from .instruction_refresh import refresh_instructions
 from .subagents import SubagentPolicy
 from src.messaging.delivery_store import DeliveryStore
 from .attachment_tools import attachment_config
+from .google_tools import google_config
 
 
 FAILURE_TEXT = "This request could not finish or was interrupted. Its effects may be incomplete; check before trying again."
@@ -235,6 +236,7 @@ class ChatService:
                 if cancelled.is_set():
                     raise TimeoutError("Request cancelled before worker access.")
                 profile_config.update(attachment_config())
+                profile_config.update(google_config())
                 client = self.codex_factory(token, capability)
             elif self.profiles is not None:
                 client = self.codex_factory(token)

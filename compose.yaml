@@ -137,13 +137,14 @@ services:
       GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI:-}
       GOOGLE_CONTROL_SECRET_FILE: /run/secrets/google_control_secret
       GOOGLE_TOKEN_ENCRYPTION_KEY_FILE: /run/secrets/google_token_encryption_key
+      GOOGLE_DATA_SECRET_FILE: /run/secrets/google_data_secret
       GOOGLE_STORAGE_DIRECTORY: /var/lib/taskopotamus/google
-    secrets: [google_control_secret, google_token_encryption_key]
+    secrets: [google_control_secret, google_token_encryption_key, google_data_secret]
     volumes:
       - ${DATA_DIR:-./storage}/google:/var/lib/taskopotamus/google
     ports:
       - "${GOOGLE_CALLBACK_BIND_IP:-127.0.0.1}:${GOOGLE_CALLBACK_PORT:-8090}:8080"
-    networks: [google_control, google_egress]
+    networks: [google_control, google_egress, google_data]
     tmpfs:
       - /tmp:mode=1777,size=16m
     depends_on:
@@ -207,6 +208,7 @@ services:
       WORKER_HOST_PUBLIC_KEY_FILE: /run/secrets/worker_host_public
       AGENT_API_TOKEN_FILE: /run/secrets/agent_api_token
       PROFILE_SERVICE_URL: http://mcp:8080
+      GOOGLE_DATA_SECRET_FILE: /run/secrets/google_data_secret
       PROFILE_SIGNING_KEY_FILE: /run/secrets/profile_signing_key
       ARTIFACT_DIRECTORY: /var/lib/taskopotamus/artifacts
       ARTIFACT_MAX_FILES: ${ARTIFACT_MAX_FILES:-10}
@@ -220,6 +222,7 @@ services:
     secrets:
       - agent_api_token
       - profile_signing_key
+      - google_data_secret
       - source: agent_database_password
         target: database_password
       - worker_client_key
@@ -235,6 +238,7 @@ services:
       execution:
         ipv4_address: ${WORKER_AGENT_IP:-10.203.17.30}
       database:
+      google_data:
     volumes:
       - ${AGENT_INSTRUCTIONS_DIR:-./config/agent}:/app/config/agent:ro
       - ${DATA_DIR:-./storage}/artifacts:/var/lib/taskopotamus/artifacts
@@ -334,6 +338,8 @@ volumes:
   worker_state:
 
 secrets:
+  google_data_secret:
+    file: ${CREDENTIALS_DIR:-./credentials}/google_data_secret
   google_control_secret:
     file: ${CREDENTIALS_DIR:-./credentials}/google_control_secret
   google_token_encryption_key:
@@ -362,6 +368,8 @@ secrets:
     file: ${CREDENTIALS_DIR:-./credentials}/worker_client_key.pub
 
 networks:
+  google_data:
+    internal: true
   google_control:
     internal: true
   google_egress:

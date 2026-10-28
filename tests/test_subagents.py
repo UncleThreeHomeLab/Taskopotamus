@@ -84,8 +84,9 @@ class SubagentTests(unittest.TestCase):
 
     def test_pinned_native_runtime_accepts_config_without_starting_a_model_turn(self):
         from src.agent.attachment_tools import attachment_config
+        from src.agent.google_tools import google_config
         with tempfile.TemporaryDirectory() as directory:
-            config = {**SubagentPolicy().config(), **attachment_config()}
+            config = {**SubagentPolicy().config(), **attachment_config(), **google_config()}
             Path(directory, "config.toml").write_text("\n".join(f"{key} = {json.dumps(value)}" for key, value in config.items()))
             result = subprocess.run([str(bundled_codex_path()), "app-server", "--strict-config"],
                                     input="", capture_output=True, text=True, timeout=20,
