@@ -2,6 +2,7 @@
 import json
 import re
 import time
+import unicodedata
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from http.client import HTTPException
@@ -111,12 +112,18 @@ def event_time(value):
 
 def event_fields(value, *, create=False):
     if (not isinstance(value, dict) or not value
-            or not set(value) <= {"summary", "description", "location", "start", "end"}):
-        raise ValueError("Only summary, description, location, start and end are supported.")
+            or not set(value) <= {"summary", "description", "location", "start", "end", "colorId"}):
+        raise ValueError("Only summary (title), description, location, start, end and colorId are supported.")
     for key, limit in (("summary", 256), ("description", 4000), ("location", 512)):
         if key in value and (not isinstance(value[key], str) or len(value[key]) > limit
-                             or any(ord(c) < 32 and c not in "\n\t" for c in value[key])):
+                             or any(unsafe_text_control(c) for c in value[key])):
             raise ValueError("Invalid event text.")
+    if "colorId" in value:
+        if value["colorId"] is None:
+            if create:
+                raise ValueError("Omit colorId to use the calendar default when creating an event.")
+        else:
+            color_id(value["colorId"])
     if create and not {"start", "end"} <= set(value):
         raise ValueError("Start and exclusive end required.")
     for key in ("start", "end"):
@@ -129,12 +136,31 @@ def event_fields(value, *, create=False):
     return value
 
 
+def unsafe_text_control(character):
+    # Keep joiners, combining marks and directional text; reject control codes and invalid surrogates.
+    return character not in "\n\t" and unicodedata.category(character) in {"Cc", "Cs"}
+
+
+def color_id(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[1-9][0-9]{0,2}", value):
+        raise ValueError("Use an event color ID returned by list_calendar_event_colors, or null to reset an edit.")
+    return value
+
+
+def page_token(value):
+    if (not isinstance(value, str) or not 1 <= len(value) <= 4096
+            or any(not c.isprintable() or c.isspace() for c in value)):
+        raise ValueError("Invalid Calendar page token; restart the same bounded search without a token.")
+    return value
+
+
 def calendar_arguments(value):
     if not isinstance(value, dict):
         raise ValueError("Invalid Calendar arguments.")
     operation = value.get("operation")
     required = {
         "list_calendars": {"offset", "limit"},
+        "list_calendar_event_colors": {"calendar_id"},
         "list_calendar_events": {"calendar_id", "time_min", "time_max", "limit"},
         "read_calendar_event": {"calendar_id", "event_id"},
         "create_calendar_event": {"calendar_id", "operation_key", "fields"},
@@ -142,7 +168,9 @@ def calendar_arguments(value):
         "delete_calendar_event": {"calendar_id", "event_id", "etag", "occurrence", "operation_key"},
         "calendar_operation_status": {"calendar_id", "operation_key"},
     }
-    if operation not in required or set(value) != required[operation] | {"operation"}:
+    optional = {"query", "page_token"} if operation == "list_calendar_events" else set()
+    if (operation not in required or not required[operation] | {"operation"} <= set(value)
+            or not set(value) <= required[operation] | optional | {"operation"}):
         raise ValueError("Unsupported Calendar operation or arguments.")
     if "calendar_id" in value:
         calendar_id(value["calendar_id"])
@@ -158,6 +186,11 @@ def calendar_arguments(value):
         start, end = timestamp(value["time_min"]), timestamp(value["time_max"])
         if not timedelta(0) < end - start <= timedelta(days=93):
             raise ValueError("Explicit event window must be at most 93 days.")
+        if "query" in value and (not isinstance(value["query"], str) or not 1 <= len(value["query"]) <= 1024
+                                 or any(unsafe_text_control(c) or c in "\n\t" for c in value["query"])):
+            raise ValueError("Calendar search requires 1-1024 characters without control codes.")
+        if "page_token" in value:
+            page_token(value["page_token"])
     if "fields" in value:
         event_fields(value["fields"], create=operation == "create_calendar_event")
     if "etag" in value:

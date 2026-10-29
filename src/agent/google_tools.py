@@ -13,7 +13,7 @@ def google_config():
         "mcp_servers.gmail.tools.read_gmail.approval_mode": "auto",
     }
     tools = ["list_calendars", "list_calendar_events", "read_calendar_event", "create_calendar_event",
-             "update_calendar_event", "delete_calendar_event", "calendar_operation_status"]
+             "update_calendar_event", "delete_calendar_event", "calendar_operation_status", "list_calendar_event_colors"]
     config.update({
         "mcp_servers.calendar.command": "/usr/local/bin/python",
         "mcp_servers.calendar.args": ["-I", "-m", "taskopotamus_worker.calendar_mcp"],

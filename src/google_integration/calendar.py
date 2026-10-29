@@ -1,6 +1,7 @@
 """Bounded Calendar operations and durable encrypted replay protection."""
 import hashlib
 import json
+import re
 import secrets
 from http.client import HTTPException
 from urllib.error import HTTPError, URLError
@@ -8,12 +9,12 @@ from urllib.parse import quote, urlencode
 from urllib.request import ProxyHandler, Request, build_opener
 
 from .data_protocol import (GoogleUnavailable, NoRedirects, bounded_body, calendar_arguments,
-                            event_fields, event_id, event_time, remaining)
+                            color_id, event_fields, event_id, event_time, page_token, remaining, unsafe_text_control)
 from .permissions import CALENDAR_EDIT, CALENDAR_READ, scopes_allow
 
 
 CALENDAR_URL = "https://www.googleapis.com/calendar/v3/calendars/"
-EVENT_FIELDS = "id,etag,eventType,status,summary,description,location,start,end,recurrence,recurringEventId,originalStartTime,extendedProperties/private"
+EVENT_FIELDS = "id,etag,eventType,status,summary,description,location,start,end,colorId,eventLabelId,recurrence,recurringEventId,originalStartTime,extendedProperties/private"
 MARKER = "taskopotamusOperation"
 
 
@@ -48,12 +49,18 @@ def summarize(value):
         raw = value.get(key, "")
         if not isinstance(raw, str):
             raise ValueError("Invalid Calendar text.")
-        result[key] = "".join(c for c in raw[:limit] if c.isprintable() or c in "\n\t")
+        result[key] = "".join(c for c in raw[:limit] if not unsafe_text_control(c))
         result["truncated"] |= len(raw) > limit
     for key in ("start", "end"):
         if key in value:
             event_time(value[key])
             result[key] = value[key]
+    result["colorId"] = color_id(value["colorId"]) if value.get("colorId") is not None else None
+    if "eventLabelId" in value:
+        label = value["eventLabelId"]
+        if not isinstance(label, str) or len(label) > 1024 or any(unsafe_text_control(c) for c in label):
+            raise ValueError("Invalid Calendar event label.")
+        result["eventLabelId"] = label
     return result
 
 
@@ -68,12 +75,16 @@ class Calendar:
         self.store = store
         self.opener = build_opener(ProxyHandler({}), NoRedirects())
 
-    def request(self, method, calendar, identifier, token, deadline, guard, *, parameters=None, fields=None, etag=None):
+    def request(self, method, calendar, identifier, token, deadline, guard, *, parameters=None, fields=None, etag=None,
+                palette=False):
         deadline = min(deadline, guard())
         url = CALENDAR_URL + quote(calendar, safe="") + "/events"
         if identifier is not None:
             url += "/" + quote(event_id(identifier), safe="")
-        parameters = {**(parameters or {}), "fields": ("items(" + EVENT_FIELDS + "),nextPageToken" if identifier is None and method == "GET" else EVENT_FIELDS)}
+        selection = "items(" + EVENT_FIELDS + "),nextPageToken" if identifier is None and method == "GET" else EVENT_FIELDS
+        if palette:
+            url, selection = "https://www.googleapis.com/calendar/v3/colors", "event"
+        parameters = {**(parameters or {}), "fields": selection}
         headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json"}
         if etag is not None:
             headers["If-Match"] = etag
@@ -94,6 +105,21 @@ class Calendar:
             raise CalendarHTTP(status) from None
         except (URLError, OSError, ValueError, HTTPException, RecursionError):
             raise GoogleUnavailable("Calendar provider unavailable.") from None
+
+    def colors(self, calendar, token, deadline, guard):
+        response = self.request("GET", calendar, None, token, deadline, guard, palette=True)
+        entries = response.get("event")
+        if not isinstance(entries, dict) or not 1 <= len(entries) <= 64:
+            raise GoogleUnavailable("Calendar event palette unavailable.")
+        result = {}
+        for identifier, item in entries.items():
+            color_id(identifier)
+            if (not isinstance(item, dict) or not {"background", "foreground"} <= set(item)
+                    or any(not isinstance(item[key], str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", item[key])
+                           for key in ("background", "foreground"))):
+                raise GoogleUnavailable("Calendar event palette invalid.")
+            result[identifier] = {key: item[key] for key in ("background", "foreground")}
+        return result
 
     def journal(self, chat, key):
         with self.store.transaction() as db:
@@ -144,10 +170,17 @@ class Calendar:
                            {CALENDAR_EDIT if item["mode"] == "edit" else CALENDAR_READ}, context["scopes"])]
             start, limit = value["offset"], value["limit"]
             result = {"untrusted_calendar_data": entries[start:start + limit], "incomplete": start + limit < len(entries)}
+        elif operation == "list_calendar_event_colors":
+            result = {"untrusted_calendar_data": self.colors(value["calendar_id"], token, deadline, guard),
+                      "palette": "legacy_event_colors", "custom_labels_supported": False}
         elif operation in ("list_calendar_events", "read_calendar_event"):
             identifier = value.get("event_id")
             parameters = ({"timeMin": value["time_min"], "timeMax": value["time_max"], "maxResults": value["limit"],
                            "singleEvents": "true", "orderBy": "startTime"} if identifier is None else {})
+            if "query" in value:
+                parameters["q"] = value["query"]
+            if "page_token" in value:
+                parameters["pageToken"] = value["page_token"]
             response = self.request("GET", value["calendar_id"], identifier, token, deadline, guard, parameters=parameters)
             if identifier is not None:
                 if response.get("id") != identifier:
@@ -157,8 +190,13 @@ class Calendar:
                 entries = response.get("items", [])
                 if not isinstance(entries, list) or len(entries) > value["limit"]:
                     raise GoogleUnavailable("Calendar response invalid.")
+                next_page = response.get("nextPageToken")
+                if next_page == "":
+                    next_page = None
+                if next_page is not None:
+                    page_token(next_page)
                 result = {"untrusted_calendar_data": [summarize(item) for item in entries],
-                          "incomplete": bool(response.get("nextPageToken"))}
+                          "incomplete": next_page is not None, "next_page_token": next_page}
         else:
             result = self.mutate(value, token, deadline, guard, chat, request_id, context)
         guard()
@@ -184,6 +222,12 @@ class Calendar:
         elif operation == "calendar_operation_status":
             raise ValueError("Unknown operation reference.")
         identifier = saved["event_id"]
+
+        def reject(reason):
+            saved.update(status="rejected", result={"reason": reason})
+            self.save(chat, key, saved, expected_status="prepared")
+            return self.status(key, saved)
+
         if operation == "create_calendar_event":
             marker = canonical_hash({"account": context["sub"], "calendar": calendar, "operation": key, "binding": binding})
             fields = {**value["fields"], "id": identifier, "extendedProperties": {"private": {MARKER: marker}}}
@@ -193,11 +237,6 @@ class Calendar:
             if before.get("id") != identifier:
                 raise GoogleUnavailable("Calendar preflight response invalid.")
 
-            def reject(reason):
-                saved.update(status="rejected", result={"reason": reason})
-                self.save(chat, key, saved, expected_status="prepared")
-                return self.status(key, saved)
-
             if before.get("etag") != value["etag"]:
                 return reject("Event changed; read fresh etag and reconsider before creating a new operation.")
             if before.get("eventType", "default") != "default" or "recurrence" in before:
@@ -205,6 +244,8 @@ class Calendar:
             if before.get("status") == "cancelled" or occurrence(before) != value["occurrence"]:
                 return reject("Event cancelled or single occurrence identity differs; read again and reconsider.")
             if operation == "update_calendar_event":
+                if "colorId" in value["fields"] and before.get("eventLabelId"):
+                    return reject("This event has a custom colour label. Label changes are unsupported; change its colour in Google Calendar.")
                 combined = {name: before[name] for name in ("start", "end") if name in before}
                 combined.update({name: value["fields"][name] for name in ("start", "end") if name in value["fields"]})
                 try:
@@ -216,6 +257,9 @@ class Calendar:
                 method = "PATCH" if value["occurrence"] is not None else "DELETE"
                 fields = {"status": "cancelled"} if method == "PATCH" else None
             target = identifier
+        requested_color = value.get("fields", {}).get("colorId")
+        if requested_color is not None and requested_color not in self.colors(calendar, token, deadline, guard):
+            return reject("Unknown event colour. Read list_calendar_event_colors and choose a returned ID.")
         guard()
         # Commit before sending: every failure after this point requires inspection, never automatic replay.
         saved, claimed = self.attempt(chat, key, binding)

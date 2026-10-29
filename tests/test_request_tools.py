@@ -45,7 +45,7 @@ class RequestToolsTests(unittest.IsolatedAsyncioTestCase):
         originals = {tool.name: tool for server in self.servers for tool in await server.list_tools()}
         aggregate = {tool.name: tool for tool in await self.server.list_tools()}
         self.assertEqual(set(aggregate), set(TOOLS))
-        self.assertEqual(len(aggregate), 12)
+        self.assertEqual(len(aggregate), 13)
         for name, tool in originals.items():
             self.assertEqual(aggregate[name].model_dump(), tool.model_dump())
             self.assertEqual(self.server._tool_input_schema(name), tool.input_schema)
@@ -70,6 +70,14 @@ class RequestToolsTests(unittest.IsolatedAsyncioTestCase):
         self.gmail.execute.assert_called_with({"operation": "search_gmail", **arguments})
         await self.server.call_tool("list_calendars", {"offset": 0, "limit": 2})
         self.calendar.execute.assert_called_once_with({"operation": "list_calendars", "offset": 0, "limit": 2})
+        await self.server.call_tool("list_calendar_event_colors", {"calendar_id": "synthetic"})
+        self.calendar.execute.assert_called_with({"operation": "list_calendar_event_colors", "calendar_id": "synthetic"})
+        listing = {"calendar_id": "synthetic", "time_min": "2026-10-28T00:00:00Z", "time_max": "2026-10-29T00:00:00Z"}
+        await self.server.call_tool("list_calendar_events", listing)
+        self.calendar.execute.assert_called_with({"operation": "list_calendar_events", **listing, "limit": 5})
+        await self.server.call_tool("list_calendar_events", {**listing, "query": "牙醫", "page_token": "opaque"})
+        self.calendar.execute.assert_called_with({"operation": "list_calendar_events", **listing, "limit": 5,
+                                                 "query": "牙醫", "page_token": "opaque"})
         await self.server.call_tool("send_message", {"message_id": "synthetic", "items": [{"type": "text", "text": "hello"}]})
         self.messages.send.assert_called_once()
 

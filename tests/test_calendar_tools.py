@@ -19,7 +19,7 @@ from src.agent.google_data import GoogleDataAPI
 from src.agent.google_tools import google_config
 from src.agent.http_server import AgentHTTPServer
 from src.agent.server import make_handler
-from src.google_integration.calendar import Calendar, CalendarHTTP, MARKER
+from src.google_integration.calendar import Calendar, CalendarHTTP, MARKER, summarize
 from src.google_integration.data_api import make_data_handler
 from src.google_integration.data_protocol import calendar_arguments, NoRedirects
 from src.google_integration.store import GoogleStore
@@ -79,11 +79,58 @@ class CalendarValidationTests(unittest.TestCase):
         server = make_server(client)
         async def check():
             tools = await server.list_tools()
-            self.assertEqual(len(tools), 7)
+            self.assertEqual({tool.name for tool in tools}, set(config["mcp_servers.calendar.enabled_tools"]))
+            self.assertEqual(len(tools), 8)
             with self.assertRaises(Exception):
                 await server.call_tool("create_calendar_event", {**CREATE, "operation": "override"})
         asyncio.run(check())
         client.execute.assert_not_called()
+
+    def test_structured_fields_preserve_omission_and_explicit_colour_reset(self):
+        client = CalendarClient("x" * 43, "10.203.17.30")
+        client.execute = Mock(return_value={"ok": True})
+        server = make_server(client)
+        create = {key: value for key, value in CREATE.items() if key != "operation"}
+        update = {"calendar_id": CALENDAR, "event_id": "event_1", "etag": '\"v1\"',
+                  "operation_key": "synthetic-update-0001", "fields": {"summary": "牙醫 🦷"}}
+        async def check():
+            tools = {tool.name: tool for tool in await server.list_tools()}
+            schema = tools["create_calendar_event"].input_schema
+            self.assertIn("$defs", schema)
+            self.assertIn("EventCreate", schema["$defs"])
+            self.assertIn("summary", schema["$defs"]["EventCreate"]["properties"])
+            self.assertEqual(set(schema["$defs"]["EventCreate"]["required"]), {"start", "end"})
+            await server.call_tool("create_calendar_event", create)
+            self.assertEqual(client.execute.call_args.args[0]["fields"], FIELDS)
+            await server.call_tool("update_calendar_event", update)
+            self.assertEqual(client.execute.call_args.args[0]["fields"], update["fields"])
+            await server.call_tool("update_calendar_event", {**update, "fields": {"colorId": None}})
+            self.assertEqual(client.execute.call_args.args[0]["fields"], {"colorId": None})
+            client.execute.reset_mock()
+            for fields in ({}, {"summary": None}, {"start": None}, {"attendees": []},
+                           {"colorId": True}, {"colorId": "0"}, {"colorId": 1},
+                           {"start": {"date": "2026-10-28", "dateTime": "2026-10-28T10:00:00Z"}}):
+                with self.subTest(fields=fields), self.assertRaises(Exception):
+                    await server.call_tool("update_calendar_event", {**update, "fields": fields})
+            with self.assertRaises(Exception):
+                await server.call_tool("create_calendar_event", {**create, "fields": {**FIELDS, "colorId": None}})
+            client.execute.assert_not_called()
+        asyncio.run(check())
+
+    def test_query_tokens_and_colours_are_bounded_at_private_boundary(self):
+        search = {"operation": "list_calendar_events", "calendar_id": CALENDAR,
+                  "time_min": "2026-10-28T00:00:00Z", "time_max": "2026-10-29T00:00:00Z", "limit": 5}
+        calendar_arguments({**search, "query": "牙醫 می\u200cروم", "page_token": "opaque+/=token"})
+        for values in ({"query": ""}, {"query": "x" * 1025}, {"query": "x\n"}, {"query": True},
+                       {"page_token": ""}, {"page_token": "x" * 4097}, {"page_token": "bad token"},
+                       {"page_token": None}, {"limit": True}, {"unexpected": "x"}):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                calendar_arguments({**search, **values})
+        for color in (True, 1, "0", "1000", "blue", {}, "1\n"):
+            with self.subTest(color=color), self.assertRaises(ValueError):
+                calendar_arguments({**CREATE, "fields": {**FIELDS, "colorId": color}})
+        raw = "牙醫 موعد می\u200cروم क्\u200dष e\u0301 👩\u200d💻\x00\x85"
+        self.assertEqual(summarize(event(summary=raw))["summary"], raw[:-2])
 
 
 class CalendarBridgeTests(unittest.TestCase):
@@ -108,6 +155,9 @@ class CalendarBridgeTests(unittest.TestCase):
         self.calendar = Calendar(self.store)
         self.events, self.calls, self.on_effect, self.force_status = {"event_1": event()}, [], None, None
         self.expected_calendar = CALENDAR
+        self.palette = {"1": {"background": "#7986cb", "foreground": "#000000"},
+                        "2": {"background": "#33b679", "foreground": "#ffffff"}}
+        self.event_pages = None
         fixture = self
         class Provider(BaseHTTPRequestHandler):
             def log_message(self, *_):
@@ -117,18 +167,26 @@ class CalendarBridgeTests(unittest.TestCase):
                 parts = urlsplit(self.path)
                 path = unquote(parts.path)
                 prefix = "/calendar/v3/calendars/" + fixture.expected_calendar + "/events"
-                self.assert_path = path.startswith(prefix)
+                palette = path == "/calendar/v3/colors"
+                self.assert_path = palette or path.startswith(prefix)
                 if not self.assert_path:
                     raise AssertionError(path)
-                identifier = path[len(prefix):].removeprefix("/") or None
+                identifier = "palette" if palette else path[len(prefix):].removeprefix("/") or None
                 size = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(size)) if size else None
                 fixture.calls.append((self.command, identifier, parse_qs(parts.query), body, self.headers.get("If-Match")))
                 status = fixture.force_status or 200
                 if fixture.force_status:
                     result = {"error": "synthetic"}
+                elif palette:
+                    result = {"event": copy.deepcopy(fixture.palette)}
                 elif self.command == "GET":
-                    result = copy.deepcopy(fixture.events.get(identifier)) if identifier else {"items": list(copy.deepcopy(fixture.events).values())[:5], "nextPageToken": "more"}
+                    if identifier:
+                        result = copy.deepcopy(fixture.events.get(identifier))
+                    elif fixture.event_pages is not None:
+                        result = copy.deepcopy(fixture.event_pages[parse_qs(parts.query).get("pageToken", [""])[0]])
+                    else:
+                        result = {"items": list(copy.deepcopy(fixture.events).values())[:5], "nextPageToken": "more"}
                     if result is None:
                         status, result = 404, {}
                 elif self.command == "POST":
@@ -142,6 +200,8 @@ class CalendarBridgeTests(unittest.TestCase):
                     status, result = 412, {}
                 elif self.command == "PATCH":
                     fixture.events[identifier].update(body)
+                    if "colorId" in body and body["colorId"] is None:
+                        fixture.events[identifier].pop("colorId", None)
                     fixture.events[identifier]["etag"] = '"v2"'
                     result = copy.deepcopy(fixture.events[identifier])
                     if body == {"status": "cancelled"}:
@@ -195,6 +255,114 @@ class CalendarBridgeTests(unittest.TestCase):
 
     def writes(self):
         return [call for call in self.calls if call[0] != "GET"]
+
+    def test_multilingual_create_rename_colour_and_reset_through_mcp_and_private_bridge(self):
+        client = CalendarClient(self.cap, "10.203.17.30")
+        client.url = f"http://127.0.0.1:{self.agent.server_port}/google/worker/calendar"
+        server = make_server(client)
+        title = "牙醫 موعد می\u200cروم क्\u200dष e\u0301 👩\u200d💻"
+        async def check():
+            await server.call_tool("create_calendar_event", {"calendar_id": CALENDAR,
+                "operation_key": "synthetic-colour-create", "fields": {**FIELDS, "summary": title, "colorId": "1"}})
+            identifier = self.writes()[0][3]["id"]
+            self.assertEqual(self.events[identifier]["summary"], title)
+            self.assertEqual(self.events[identifier]["colorId"], "1")
+            self.assertEqual(self.post({"operation": "read_calendar_event", "calendar_id": CALENDAR,
+                                      "event_id": identifier})[1]["untrusted_calendar_data"]["summary"], title)
+            self.events[identifier]["attendees"] = [{"email": "synthetic@example.test"}]
+            change = {"calendar_id": CALENDAR, "event_id": identifier, "etag": '\"v1\"',
+                      "operation_key": "synthetic-colour-change", "fields": {"colorId": "2"}}
+            await server.call_tool("update_calendar_event", change)
+            self.assertEqual(self.writes()[-1][3], {"colorId": "2"})
+            await server.call_tool("update_calendar_event", {**change, "etag": '\"v2\"',
+                "operation_key": "synthetic-title-rename", "fields": {"summary": title + " 覆診"}})
+            self.assertEqual(self.writes()[-1][3], {"summary": title + " 覆診"})
+            self.assertEqual(self.events[identifier]["colorId"], "2")
+            await server.call_tool("update_calendar_event", {**change, "etag": '\"v2\"',
+                "operation_key": "synthetic-colour-reset", "fields": {"colorId": None}})
+            self.assertEqual(self.writes()[-1][3], {"colorId": None})
+            self.assertNotIn("colorId", self.events[identifier])
+            data = self.post({"operation": "read_calendar_event", "calendar_id": CALENDAR,
+                              "event_id": identifier})[1]["untrusted_calendar_data"]
+            self.assertIsNone(data["colorId"])
+            self.assertEqual(data["summary"], title + " 覆診")
+            self.assertEqual(self.events[identifier]["attendees"], [{"email": "synthetic@example.test"}])
+            self.assertTrue(all("eventLabelVersion" not in call[2] for call in self.calls))
+        asyncio.run(check())
+
+    def test_palette_permissions_invalid_colours_and_custom_label_recovery(self):
+        palette = {"operation": "list_calendar_event_colors", "calendar_id": CALENDAR}
+        status, result = self.post(palette)
+        self.assertEqual(status, 200)
+        self.assertEqual(result["untrusted_calendar_data"], self.palette)
+        self.assertFalse(result["custom_labels_supported"])
+        self.assertEqual(self.calls[-1][1:3], ("palette", {"fields": ["event"]}))
+        self.assertEqual(self.post({**CREATE, "fields": {**FIELDS, "colorId": "99"}})[1]["status"], "rejected")
+        self.assertEqual(self.writes(), [])
+        self.events["event_1"].update(eventLabelId="synthetic-label", colorId="1")
+        self.assertEqual(self.post(self.change(fields={"colorId": "2"}))[1]["status"], "rejected")
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.post(self.change(key="synthetic-label-title", fields={"summary": "牙醫"}))[1]["status"], "confirmed")
+        self.assertEqual(self.events["event_1"]["eventLabelId"], "synthetic-label")
+        self.assertEqual(self.events["event_1"]["colorId"], "1")
+        self.click(self.select_mode(self.menu(True), 1, "Read"), "Save")
+        self.assertEqual(self.post(palette)[0], 200)
+        self.click(self.select_mode(self.menu(True), 1, "Off"), "Save")
+        calls = len(self.calls)
+        self.assertGreaterEqual(self.post(palette)[0], 400)
+        self.assertEqual(len(self.calls), calls)
+        self.assertGreaterEqual(self.post({**palette, "calendar_id": "unknown"})[0], 400)
+
+    def test_palette_failure_before_attempt_never_writes_and_can_retry_same_key(self):
+        value = {**CREATE, "fields": {**FIELDS, "colorId": "1"}}
+        self.palette["1"]["background"] = "invalid"
+        self.assertEqual(self.post(value)[0], 503)
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.calendar.journal("42", CREATE["operation_key"])["status"], "prepared")
+        self.palette["1"]["background"] = "#7986cb"
+        self.assertEqual(self.post(value)[1]["status"], "confirmed")
+        self.assertEqual(len(self.writes()), 1)
+        calls = len(self.calls)
+        self.assertEqual(self.post(value)[1]["status"], "confirmed")
+        self.assertEqual(len(self.calls), calls)
+
+    def test_unicode_search_continues_past_five_and_empty_page_preserves_candidates(self):
+        title = "牙醫 می\u200cروم 👩\u200d💻"
+        self.event_pages = {"": {"items": [event(f"first_{i}") for i in range(5)], "nextPageToken": "second+/="},
+                            "second+/=": {"items": [], "nextPageToken": "third"},
+                            "third": {"items": [event("target_1", summary=title), event("target_2", summary=title)]}}
+        value = {"operation": "list_calendar_events", "calendar_id": CALENDAR, "query": title,
+                 "time_min": "2026-10-28T00:00:00Z", "time_max": "2026-10-29T00:00:00Z", "limit": 5}
+        first = self.post(value)[1]
+        self.assertEqual(len(first["untrusted_calendar_data"]), 5)
+        second = self.post({**value, "page_token": first["next_page_token"]})[1]
+        self.assertEqual(second["untrusted_calendar_data"], [])
+        self.assertTrue(second["incomplete"])
+        third = self.post({**value, "page_token": second["next_page_token"]})[1]
+        self.assertFalse(third["incomplete"])
+        self.assertIsNone(third["next_page_token"])
+        self.assertEqual([item["event_id"] for item in third["untrusted_calendar_data"]], ["target_1", "target_2"])
+        self.assertEqual(len(self.calls), 3)
+        self.assertTrue(all(call[2]["q"] == [title] for call in self.calls))
+        self.assertEqual(self.calls[1][2]["pageToken"], ["second+/="])
+        self.assertEqual(self.writes(), [])
+        self.event_pages["third"]["nextPageToken"] = ""
+        self.assertFalse(self.post({**value, "page_token": "third"})[1]["incomplete"])
+        self.event_pages[""]["nextPageToken"] = "bad token"
+        self.assertEqual(self.post(value)[0], 503)
+
+    def test_all_day_and_dst_offsets_survive_create_and_read(self):
+        for index, times in enumerate((
+            {"start": {"date": "2026-10-28"}, "end": {"date": "2026-10-29"}},
+            {"start": {"dateTime": "2026-10-25T01:30:00+01:00", "timeZone": "Europe/London"},
+             "end": {"dateTime": "2026-10-25T01:30:00+00:00", "timeZone": "Europe/London"}},
+        )):
+            with self.subTest(times=times):
+                result = self.post({**CREATE, "operation_key": f"synthetic-time-{index:04}", "fields": times})[1]
+                self.assertEqual(result["status"], "confirmed")
+                data = self.post({"operation": "read_calendar_event", "calendar_id": CALENDAR,
+                                  "event_id": result["event_id"]})[1]["untrusted_calendar_data"]
+                self.assertEqual({key: data[key] for key in ("start", "end")}, times)
 
     def test_real_bridge_crud_conditional_patch_preserves_fields_and_empty_delete(self):
         self.assertEqual(self.post({"operation": "read_calendar_event", "calendar_id": CALENDAR, "event_id": "event_1"})[0], 200)
