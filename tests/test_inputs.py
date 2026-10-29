@@ -6,7 +6,7 @@ import os
 import tempfile
 import threading
 import unittest
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -20,7 +20,7 @@ from src.agent.chat_service import ChatService
 from src.agent.http_server import AgentHTTPServer
 from src.messaging.artifacts import ArtifactStore
 from src.telegram.agent_client import AgentRequestError
-from src.telegram.bot import process_input
+from src.telegram.bot import process_input, dispatch_inputs
 from src.telegram.delivery_store import DeliveryStore
 from src.telegram.inbox import Inbox
 from src.telegram.input_files import download, InputRejected
@@ -82,6 +82,10 @@ class InputTests(unittest.TestCase):
 
         def factory(profile, token):
             tokens.append(token)
+            # Worker access must see committed admission and hold no capacity lock.
+            with self.database.connect() as observer:
+                self.assertTrue(observer.execute(
+                    "SELECT pg_try_advisory_xact_lock(hashtextextended('artifact-capacity',0))").fetchone()[0])
             manifest = self.store.input_manifest(token)
             self.assertEqual(
                 [i["artifact_id"] for i in manifest["files"]], [picture["artifact_id"], document["artifact_id"]]
@@ -107,6 +111,98 @@ class InputTests(unittest.TestCase):
             chat.reply("42", "Inspect these", "1", attachments=list(reversed(selected)))
         with self.assertRaises(ValueError):
             self.store.input_identity("43", "1", selected)
+
+    def test_caller_owned_admission_is_invisible_until_commit(self):
+        selected = [self.upload("csv")["artifact_id"]]
+        with self.database.connect() as db:
+            self.store.accept_inputs("42", "1", selected, 4000, db=db)
+            cap = self.store.begin_run("42", "1", 30, deadline=self.now + 25, db=db)
+            with self.database.connect() as observer:
+                self.assertEqual(observer.execute("SELECT count(*) FROM accepted_inputs").fetchone()[0], 0)
+                self.assertEqual(observer.execute("SELECT count(*) FROM artifact_runs").fetchone()[0], 0)
+                self.assertLess(observer.execute("SELECT expires FROM artifacts").fetchone()[0], self.now + 4000)
+            with self.assertRaises(PermissionError):
+                self.store.scope(cap)
+            db.commit()
+            self.assertFalse(db.closed)
+        self.assertEqual(self.store.scope(cap), ("42", "1"))
+        self.assertEqual([item["artifact_id"] for item in self.store.input_manifest(cap)["files"]], selected)
+        with self.database.connect() as observer:
+            self.assertEqual(observer.execute("SELECT expires FROM artifacts").fetchone()[0], self.now + 4000)
+            self.assertEqual(observer.execute("SELECT deadline FROM artifact_runs").fetchone()[0], self.now + 25)
+
+    def test_caller_owned_admission_can_roll_back_both_changes(self):
+        with self.database.connect() as db:
+            self.store.accept_inputs("42", "1", [], 300, db=db)
+            cap = self.store.begin_run("42", "1", 30, db=db)
+            db.rollback()
+            self.assertFalse(db.closed)
+        with self.database.connect() as observer:
+            self.assertEqual(observer.execute("SELECT count(*) FROM accepted_inputs").fetchone()[0], 0)
+            self.assertEqual(observer.execute("SELECT count(*) FROM artifact_runs").fetchone()[0], 0)
+        with self.assertRaises(PermissionError):
+            self.store.scope(cap)
+
+    def test_shared_admission_preserves_owner_selection_and_active_run_checks(self):
+        selected = [self.upload("csv")["artifact_id"]]
+        with self.database.connect() as db:
+            with self.assertRaises(ValueError):
+                self.store.accept_inputs("43", "1", selected, 300, db=db)
+            db.rollback()
+            self.store.accept_inputs("42", "1", selected, 300, db=db)
+            cap = self.store.begin_run("42", "1", 30, db=db)
+            db.commit()
+            with self.assertRaisesRegex(ValueError, "cannot change"):
+                self.store.accept_inputs("42", "1", [], 300, db=db)
+            db.rollback()
+            with self.assertRaises(BlockingIOError):
+                self.store.begin_run("42", "1", 30, db=db)
+            db.rollback()
+        self.assertEqual(self.store.scope(cap), ("42", "1"))
+        self.assertEqual([item["artifact_id"] for item in self.store.input_manifest(cap)["files"]], selected)
+
+    def test_failed_or_uncertain_admission_commit_never_starts_worker_and_attempts_revocation(self):
+        factory = Mock(side_effect=AssertionError("Worker must not start after admission commit failure"))
+        chat = ChatService(factory, self.database, artifacts=self.store)
+        connect = self.database.connect
+        sessions = Mock()
+        for request, committed, rollback_fails in (("1", False, False), ("2", True, True)):
+            with self.subTest(committed=committed):
+                chat.runtime_sessions = sessions if committed else None
+                first, rollbacks = [True], []
+                class FailedCommit:
+                    def __init__(self, connection):
+                        self.connection = connection
+                    def __getattr__(self, name):
+                        return getattr(self.connection, name)
+                    def commit(self):
+                        if committed:
+                            self.connection.commit()
+                        raise RuntimeError("Synthetic uncertain admission commit")
+                    def rollback(self):
+                        rollbacks.append(True)
+                        if rollback_fails:
+                            raise RuntimeError("Synthetic rollback unavailable")
+                        self.connection.rollback()
+                @contextmanager
+                def failing_connection():
+                    with connect() as connection:
+                        if first[0]:
+                            first[0] = False
+                            yield FailedCommit(connection)
+                        else:
+                            yield connection
+                with patch.object(self.database, "connect", side_effect=failing_connection), \
+                        patch.object(self.store, "cancel_run", wraps=self.store.cancel_run) as cleanup:
+                    with self.assertRaisesRegex(RuntimeError, "uncertain admission commit"):
+                        chat.reply("42", "hello", request)
+                    cleanup.assert_called_once_with("42", request)
+                self.assertEqual(rollbacks, [True])
+                with connect() as observer:
+                    state = observer.execute("SELECT state,capability FROM artifact_runs WHERE request_id=%s", (request,)).fetchone()
+                    self.assertEqual(state, ("cancelled", None) if committed else None)
+        factory.assert_not_called()
+        sessions.lease.assert_not_called()
 
     def test_attachment_only_and_malformed_claimed_image(self):
         malformed = self.upload("malformed", b"<html>untrusted</html>", "image/png")
@@ -553,3 +649,29 @@ class ConsoleInputTests(unittest.TestCase):
         self.assertEqual(post(body), 303)
         self.assertEqual(post(body.replace(b"alpha,17", b"alpha,18")), 400)
         client.console_chat.assert_called_once()
+
+
+class InputWakeTests(unittest.TestCase):
+    def test_arrival_between_durable_claim_and_wait_is_not_lost(self):
+        stopped, wake, input_wake = threading.Event(), threading.Event(), threading.Event()
+        inbox = Mock()
+        job = {"id": "synthetic"}
+        claims = []
+        def claim():
+            claims.append(True)
+            if len(claims) == 1:
+                input_wake.set()  # Durable receipt races with an empty claim.
+                return None
+            return job
+        inbox.claim.side_effect = claim
+        with patch("src.telegram.bot.process_input", side_effect=lambda *a, **k: stopped.set()) as process:
+            dispatcher = threading.Thread(target=dispatch_inputs,
+                args=(inbox, None, "synthetic", set(), None, wake, stopped), kwargs={"input_wake": input_wake})
+            dispatcher.start()
+            dispatcher.join(.5)
+            stopped.set()
+            input_wake.set()
+            dispatcher.join(2)
+        self.assertEqual(len(claims), 2)
+        process.assert_called_once()
+        self.assertFalse(wake.is_set())

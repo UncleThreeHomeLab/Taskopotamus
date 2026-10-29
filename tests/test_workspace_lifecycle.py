@@ -7,7 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from codex_cli_bin import bundled_codex_path
 from src.agent.device_login import start_device_login
 
@@ -31,6 +31,22 @@ class WorkspacePolicyTests(unittest.TestCase):
             with patch.object(lifecycle, "directory"), patch.dict(os.environ, {"TASKOPOTAMUS_ARTIFACT_AUTH": "invalid"}):
                 with self.assertRaises(ValueError):
                     worker.child_command("runtime", ["--version"])
+
+    def test_empty_input_manifest_avoids_second_usage_walk_but_is_validated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worker = lifecycle.WorkspaceLifecycle(workspace=root / "workspace", state=root / "state")
+            worker.state.mkdir()
+            worker.usage = Mock(side_effect=AssertionError("Unexpected empty-input workspace walk"))
+            for tag in ("b" * 64, "invalid"):
+                with patch("taskopotamus_worker.input_files.fetch_inputs",
+                           return_value=({"request_tag": tag, "files": []}, Mock())):
+                    if tag == "invalid":
+                        with self.assertRaises(ValueError):
+                            worker.stage_inputs("a" * 43)
+                    else:
+                        worker.stage_inputs("a" * 43)
+            worker.usage.assert_not_called()
 
     def test_production_defaults_and_invalid_settings(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -77,6 +93,20 @@ class WorkspaceLifecycleTests(unittest.TestCase):
         lifecycle.atomic_write(self.worker.state / "input-refusal.json", b'{"blocked":true}')
         self.worker.prepare()
         self.assertTrue(self.worker.status()["admission_blocked"])
+
+    def test_nonempty_staging_still_enforces_remaining_capacity(self):
+        import hashlib
+        import io
+        content = b"synthetic-input"
+        info = {"artifact_id": "a" * 32, "size": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+        with patch("taskopotamus_worker.input_files.fetch_inputs", return_value=(
+                {"request_tag": "b" * 64, "files": [info]}, lambda _: io.BytesIO(content))), \
+                patch.object(self.worker, "usage", return_value=self.worker.max_bytes) as usage:
+            with self.assertRaisesRegex(RuntimeError, "storage limit"):
+                self.worker.stage_inputs("a" * 43)
+        self.assertEqual(usage.call_count, 2)
+        self.assertTrue(self.worker.status()["admission_blocked"])
+        self.assertFalse((self.worker.workspace / ".incoming" / ("b" * 64)).exists())
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
