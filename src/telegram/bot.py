@@ -439,7 +439,7 @@ def process_input(job, inbox, allowed_users, agent, token, store, wake, _google=
             activity.join(timeout=0.1)
 
 
-def input_loop(inbox, agent, token, allowed, store, wake, stopped, google=None):
+def input_loop(inbox, agent, token, allowed, store, wake, stopped, google=None, input_wake=None):
     with inbox.database.connect() as connection:
         owns = connection.execute(
             "SELECT pg_try_advisory_lock(hashtextextended('telegram-input-dispatcher',0))"
@@ -448,11 +448,14 @@ def input_loop(inbox, agent, token, allowed, store, wake, stopped, google=None):
         if not owns:
             return
         inbox.recover()
-        dispatch_inputs(inbox, agent, token, allowed, store, wake, stopped, google)
+        dispatch_inputs(inbox, agent, token, allowed, store, wake, stopped, google, input_wake)
 
 
-def dispatch_inputs(inbox, agent, token, allowed, store, wake, stopped, google=None):
+def dispatch_inputs(inbox, agent, token, allowed, store, wake, stopped, google=None, input_wake=None):
     while not stopped.is_set():
+        if input_wake is not None:
+            # Clear before the durable claim so arrivals between claim and wait cannot be lost.
+            input_wake.clear()
         job = None
         try:
             job = inbox.claim()
@@ -463,7 +466,9 @@ def dispatch_inputs(inbox, agent, token, allowed, store, wake, stopped, google=N
             if job is not None:
                 inbox.finish(job["id"], retry=True)
             print("Input processing unavailable; request identity is preserved.", file=sys.stderr, flush=True)
-        stopped.wait(1)
+            stopped.wait(1)
+            continue
+        (input_wake if input_wake is not None else stopped).wait(1)
 
 
 def main():
@@ -486,11 +491,11 @@ def main():
             agent.import_legacy_delivery(chat, str(identifier), json.loads(chunks), next_chunk)
         store.finish(identifier)
     print("Telegram connected. Ready for private messages from allowed users.", flush=True)
-    wake, stopped = threading.Event(), threading.Event()
+    wake, stopped, input_wake = threading.Event(), threading.Event(), threading.Event()
     sender = threading.Thread(target=delivery_loop, args=(agent, token, allowed_users, wake, stopped), daemon=True)
     sender.start()
     dispatcher = threading.Thread(
-        target=input_loop, args=(inbox, agent, token, allowed_users, store, wake, stopped, google), daemon=True
+        target=input_loop, args=(inbox, agent, token, allowed_users, store, wake, stopped, google, input_wake), daemon=True
     )
     dispatcher.start()
     try:
@@ -507,6 +512,7 @@ def main():
                 )
                 for update in updates:
                     inbox.receive(update, allowed_users)
+                    input_wake.set()
             except (RuntimeError, DatabaseError, BlockingIOError) as error:
                 message = str(error) if isinstance(error, RuntimeError) else "Telegram storage unavailable. Retrying."
                 print(message, file=sys.stderr, flush=True)
@@ -514,6 +520,7 @@ def main():
     finally:
         stopped.set()
         wake.set()
+        input_wake.set()
         sender.join(timeout=2)
         dispatcher.join(timeout=2)
 

@@ -9,6 +9,7 @@ import stat
 import time
 import uuid
 from dataclasses import dataclass
+from contextlib import nullcontext
 from pathlib import Path
 
 from .messages import identity, opaque_id, validate_items
@@ -127,10 +128,10 @@ class ArtifactStore:
             raise ValueError("Attachments exceed the combined 20 MB limit.")
         return result
 
-    def accept_inputs(self, chat_id, request_id, identifiers, seconds):
+    def accept_inputs(self, chat_id, request_id, identifiers, seconds, db=None):
         from src.worker.input_files import request_tag
 
-        with self.database.connect() as db:
+        with (self.database.connect() if db is None else nullcontext(db)) as db:
             db.execute("SELECT pg_advisory_xact_lock(hashtextextended('artifact-capacity',0))")
             items = self.input_identity(chat_id, request_id, identifiers, True, db)
             serialized = json.dumps(items, sort_keys=True)
@@ -174,7 +175,7 @@ class ArtifactStore:
             ).fetchone()
             return self.describe(row[0], chat_id, request_id, db=db) if row else None
 
-    def begin_run(self, chat_id, request_id, seconds, deadline=None):
+    def begin_run(self, chat_id, request_id, seconds, deadline=None, db=None):
         identity(chat_id, request_id)
         if type(seconds) not in (int, float) or not math.isfinite(seconds) or not 0 < seconds <= 1830:
             raise ValueError("Invalid run lifetime.")
@@ -184,7 +185,7 @@ class ArtifactStore:
                 raise ValueError("Invalid run deadline.")
             expires = min(expires, deadline)
         token = secrets.token_urlsafe(32)
-        with self.database.connect() as db:
+        with (self.database.connect() if db is None else nullcontext(db)) as db:
             changed = db.execute(
                 """INSERT INTO artifact_runs VALUES (%s,%s,'active',%s,%s)
                 ON CONFLICT(chat_id,request_id) DO UPDATE SET state='active',capability=EXCLUDED.capability,deadline=EXCLUDED.deadline

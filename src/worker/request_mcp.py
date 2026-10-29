@@ -1,5 +1,6 @@
 """One request-bound MCP process dispatching the existing domain tools unchanged."""
 import asyncio
+from collections.abc import Mapping
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -48,6 +49,35 @@ async def make_server(scope):
         gmail_server(GmailClient(token, address)),
         calendar_server(CalendarClient(token, address)),
         profile_server(scope),
+    ])
+
+
+async def make_scoped_server(current_scope):
+    """Register domain schemas once; bind clients to one admitted call's snapshot."""
+    class ScopeView(Mapping):
+        def __getitem__(self, key):
+            return current_scope()[key]
+
+        def __iter__(self):
+            return iter(current_scope())
+
+        def __len__(self):
+            return len(current_scope())
+
+    class BoundClient:
+        def __init__(self, kind):
+            self.kind = kind
+
+        def __getattr__(self, name):
+            def call(*arguments, **options):
+                scope = current_scope()
+                client = self.kind(scope["artifact_token"], scope["agent_ip"])
+                return getattr(client, name)(*arguments, **options)
+            return call
+
+    return await RequestServer.combine([
+        message_server(BoundClient(MessageClient)), gmail_server(BoundClient(GmailClient)),
+        calendar_server(BoundClient(CalendarClient)), profile_server(ScopeView()),
     ])
 
 

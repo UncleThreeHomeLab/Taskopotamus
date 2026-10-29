@@ -216,11 +216,15 @@ class ChatService:
             instructions, profile_config = load_system_instructions(), {}
             turn_input, token, capability = text, None, None
             if self.profiles is not None:
+                profile_started = time.monotonic()
                 profile, profile_config, token = self.profiles.prepare(chat_id)
+                timings["profile_prepare"] = round((time.monotonic() - profile_started) * 1000)
                 # Saved user text must never acquire developer authority.
                 turn_input = json.dumps({"profile": profile, "message": text}, ensure_ascii=False)
             if self.artifacts is not None:
-                accepted = self.artifacts.accept_inputs(chat_id, request_id, attachments, self.turn_timeout + 60)
+                inputs_started = time.monotonic()
+                accepted = self.artifacts.accept_inputs(chat_id, request_id, attachments, self.turn_timeout + 60, db=db)
+                timings["artifact_inputs"] = round((time.monotonic() - inputs_started) * 1000)
                 if attachments:
                     from src.worker.input_files import input_path
 
@@ -234,9 +238,20 @@ class ChatService:
                     turn_input.extend(
                         LocalImageInput(item["path"]) for item in information if item.get("presentation_mime")
                     )
+                scope_started = time.monotonic()
                 capability_deadline = self.artifacts.clock() + self._remaining(deadline)
-                capability = self.artifacts.begin_run(chat_id, request_id, self._remaining(deadline), deadline=capability_deadline)
+                capability = self.artifacts.begin_run(chat_id, request_id, self._remaining(deadline), deadline=capability_deadline, db=db)
                 runtime.callback(self._revoke_artifacts, chat_id, request_id)
+                try:
+                    db.commit()  # Publish admission and release capacity lock before worker access.
+                except Exception:
+                    # A failed commit may have succeeded; cleanup still revokes on a fresh connection.
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                    raise
+                timings["artifact_scope"] = round((time.monotonic() - scope_started) * 1000)
                 if cancelled.is_set():
                     raise TimeoutError("Request cancelled before worker access.")
                 if self.runtime_sessions is None:
@@ -252,6 +267,9 @@ class ChatService:
                 lease = runtime.enter_context(self.runtime_sessions.lease(
                     chat_id, configuration, token, capability, self._remaining(deadline)))
                 codex = lease.client
+                timings.update(lease.begin_timings)
+                if lease.tools is not None:
+                    profile_config = request_config(lease.tools)
             else:
                 if self.artifacts is not None:
                     client = self.codex_factory(token, capability)
@@ -280,8 +298,7 @@ class ChatService:
             timings["account"] = round((time.monotonic() - account_started) * 1000)
             thread_started = time.monotonic()
             db.execute("INSERT INTO replies VALUES (%s, %s, %s, NULL)", (chat_id, request_id, digest))
-            if include_details:
-                db.execute("INSERT INTO reply_runs VALUES (%s, %s, 'pending', NULL)", (chat_id, request_id))
+            db.execute("INSERT INTO reply_runs VALUES (%s, %s, 'pending', NULL)", (chat_id, request_id))
             db.commit()
             try:
                 row = db.execute("SELECT thread_id FROM conversations WHERE chat_id = %s", (chat_id,)).fetchone()
@@ -304,20 +321,31 @@ class ChatService:
                     options["config"].update(self.compaction.config(context[0] if context else None))
                 if cancelled.is_set():
                     raise TimeoutError("Request cancelled.")
+                acquiring_thread = time.monotonic()
                 if row:
                     thread = lease.resume(row[0], **options) if lease else codex.thread_resume(row[0], **options)
-                    if self.profiles is not None or workspace is not None or self.artifacts is not None:
+                    timings["thread_acquire"] = round((time.monotonic() - acquiring_thread) * 1000)
+                    refreshing = time.monotonic()
+                    if ((self.profiles is not None or workspace is not None or self.artifacts is not None)
+                            and not (lease and lease.instructions_current(instructions))):
                         refresh_instructions(thread, instructions)
+                    timings["instruction_refresh"] = round((time.monotonic() - refreshing) * 1000)
                 else:
                     thread = codex.thread_start(**options)
+                    timings["thread_acquire"] = round((time.monotonic() - acquiring_thread) * 1000)
+                    timings["instruction_refresh"] = 0
                     db.execute("INSERT INTO conversations VALUES (%s, %s)", (chat_id, thread.id))
                     db.commit()
                 if lease is not None:
-                    lease.parent_thread_id = thread.id
+                    binding = time.monotonic()
+                    lease.bind(thread, options, instructions)
+                    timings["request_binding"] = round((time.monotonic() - binding) * 1000)
                 # Failed turns and model switches must not leave stale window metadata behind.
                 db.execute("DELETE FROM thread_context WHERE thread_id = %s", (thread.id,))
                 db.commit()
+                preparing_turn = time.monotonic()
                 turn = thread.turn(turn_input)
+                timings["turn_prepare"] = round((time.monotonic() - preparing_turn) * 1000)
                 active_turn.append(turn)
                 if cancelled.is_set():
                     self._interrupt(turn)
@@ -401,21 +429,24 @@ class ChatService:
                 print("Completed reply retained; runtime cleanup requires recovery.", file=sys.stderr, flush=True)
             timings["cleanup"] = round((time.monotonic() - cleanup_started) * 1000)
             timings["request_total"] = round((time.monotonic() - started) * 1000)
+            details = None
+            try:
+                details = summarize_run(
+                    response, self.model, self.effort, self.subagents, parent_id=thread.id,
+                    native_threads=lease.native_threads if lease else None,
+                    metadata_incomplete=lease.metadata_incomplete if lease else False,
+                )
+                details.update(system_timings_ms=timings, runtime_reused=lease.reused if lease else False,
+                               runtime_retained=bool(lease and lease.finished and not lease.discarded),
+                               thread_action=lease.thread_action if lease else "unavailable",
+                               tools_retained=bool(lease and lease.bound and lease.finished and not lease.discarded),
+                               tool_activity=lease.tool_counts if lease else {},
+                               cleanup=lease.cleanup_counts if lease else {}, cleanup_error=cleanup_error)
+            except Exception:
+                # A telemetry defect must not discard a completed reply or cause another paid turn.
+                pass
+            self._save_run(db, chat_id, request_id, "completed", details)
             if include_details:
-                details = None
-                try:
-                    details = summarize_run(
-                        response, self.model, self.effort, self.subagents, parent_id=thread.id,
-                        native_threads=lease.native_threads if lease else None,
-                        metadata_incomplete=lease.metadata_incomplete if lease else False,
-                    )
-                    details.update(system_timings_ms=timings, runtime_reused=lease.reused if lease else False,
-                                   runtime_retained=bool(lease and lease.finished and not lease.discarded),
-                                   cleanup=lease.cleanup_counts if lease else {}, cleanup_error=cleanup_error)
-                except Exception:
-                    # A telemetry defect must not discard a completed reply or cause another paid turn.
-                    pass
-                self._save_run(db, chat_id, request_id, "completed", details)
                 result.update(status="completed", details=details)
             return result
 

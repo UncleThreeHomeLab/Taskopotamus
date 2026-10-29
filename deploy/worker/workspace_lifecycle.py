@@ -107,10 +107,11 @@ def uid_processes(uid):
 def stop_uid(uid, grace=2, retained_pid=None):
     if uid == 0 or uid == os.getuid():
         raise ValueError("Refusing to stop supervisor identity.")
+    retained = set() if retained_pid is None else {retained_pid} if type(retained_pid) is int else set(retained_pid)
     for signum in (signal.SIGTERM, signal.SIGKILL):
         deadline = time.monotonic() + grace
         while True:
-            processes = [pid for pid in uid_processes(uid) if pid != retained_pid]
+            processes = [pid for pid in uid_processes(uid) if pid not in retained]
             if not processes:
                 return
             for pid in processes:
@@ -126,7 +127,7 @@ def stop_uid(uid, grace=2, retained_pid=None):
             if time.monotonic() >= deadline:
                 break
             time.sleep(0.05)
-    if [pid for pid in uid_processes(uid) if pid != retained_pid]:
+    if [pid for pid in uid_processes(uid) if pid not in retained]:
         raise RuntimeError("Worker execution has not stopped.")
 
 
@@ -254,7 +255,8 @@ class WorkspaceLifecycle:
         return total
 
     def stop_runtime_except(self, pid):
-        if pid not in uid_processes(self.runtime_uid):
+        retained = {pid} if type(pid) is int else set(pid)
+        if not retained or not retained.issubset(uid_processes(self.runtime_uid)):
             raise RuntimeError("Retained native identity is unavailable.")
         stop_uid(self.runtime_uid, retained_pid=pid)
 
@@ -347,7 +349,10 @@ class WorkspaceLifecycle:
         (self.state / "input-refusal.json").unlink(missing_ok=True)
         manifest, source = fetch_inputs(token, self.agent_ip)
         try:
-            materialize_inputs(manifest, source, self.workspace, self.max_bytes - self.usage(), self.runtime_uid)
+            # prepare() already checked capacity. Empty manifests still pass the
+            # normal validator, but add no bytes and need no second workspace walk.
+            remaining = 0 if manifest.get("files") == [] else self.max_bytes - self.usage()
+            materialize_inputs(manifest, source, self.workspace, remaining, self.runtime_uid)
         except OverflowError:
             atomic_write(self.state / "input-refusal.json", b'{"blocked":true}')
             atomic_write(self.state / "admission.json", json.dumps({"usage_bytes": self.usage(), "admission_blocked": True}).encode())

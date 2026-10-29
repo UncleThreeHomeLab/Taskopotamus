@@ -24,6 +24,7 @@ for line in sys.stdin:
         program="import pathlib,time\np=pathlib.Path('descendant-observed')\nwhile True:\n p.open('a').write(pathlib.Path("+repr(os.environ['TASKOPOTAMUS_REQUEST_SCOPE'])+").read_text())\n time.sleep(.01)\n"
         child=subprocess.Popen([sys.executable,'-u','-c',program],start_new_session=True)
         result={'pid':child.pid}
+    elif method=='identity': result={'pid':os.getpid()}
     elif method=='flood':
         while True: print('x'*65536,flush=True)
     elif method=='forge':
@@ -50,11 +51,14 @@ worker=lifecycle.WorkspaceLifecycle(workspace=root/'workspace',saved=root/'saved
 worker.initialize()
 if sys.argv[2]!='pinned-native':
  lifecycle.atomic_write(worker.auth_home/'auth.json',b'{"synthetic_version":"initial"}',uid=51004)
+staging_count=0
 def stage(_token):
+ global staging_count
  if (root/'long-retention').exists(): worker.retention=3600
  pids=lifecycle.uid_processes(51003)
- assert len(pids)==1
- assert '\nState:\tT' in Path('/proc',str(pids[0]),'status').read_text()
+ assert len(pids)==(2 if staging_count else 1)
+ staging_count+=1
+ assert all('\nState:\tT' in Path('/proc',str(pid),'status').read_text() for pid in pids)
  (root/'stage-paused').write_text('true')
  if (root/'stall-stage').exists(): time.sleep(30)
  if (root/'capacity-refusal').exists():
@@ -130,14 +134,18 @@ class RuntimeProxyTests(unittest.TestCase):
         return self.receive(self.send(method, params))
 
     def begin(self, token="a", lifetime=10):
-        return self.rpc("taskopotamus/runtime/begin", {"scope": {
+        result = self.rpc("taskopotamus/runtime/begin", {"scope": {
             "profile_token": "synthetic-profile", "artifact_token": token * 43,
             "profile_url": "http://mcp:8080", "agent_ip": "10.203.17.30", "deadline": time.time() + lifetime}})
+        self.assertEqual(set(result["phase_timings_ms"]), {
+            "boundary", "prepare", "stage_inputs", "write_scope", "helper_transition"})
+        self.assertTrue(all(type(value) is int and value >= 0 for value in result["phase_timings_ms"].values()))
+        return result
 
     def test_old_descendants_die_before_new_scope_and_close_ack_follows_recovery(self):
         self.begin()
         retained = self.lifecycle.uid_processes(51003)
-        self.assertEqual(len(retained), 1)
+        self.assertEqual(len(retained), 2)
         self.assertEqual((self.root / "stage-paused").read_text(), "true")
         descendant = self.rpc("spawn", {})["pid"]
         until = time.monotonic() + 2
@@ -163,6 +171,46 @@ class RuntimeProxyTests(unittest.TestCase):
         self.assertFalse((self.root / "state" / "runtime-credentials-pending.json").exists())
         self.assertEqual(json.loads((self.root / "auth" / "auth.json").read_text())["synthetic_version"], "refreshed")
 
+    def test_helper_private_control_is_inaccessible_to_same_uid_and_both_pause(self):
+        self.begin()
+        native = self.rpc("identity", {})["pid"]
+        retained = self.lifecycle.uid_processes(51003)
+        helper, = set(retained) - {native}
+        program = """import json,os,sys
+results=[]
+for suffix,flags in [('environ',os.O_RDONLY),('fd/0',os.O_RDONLY),('fd/0',os.O_WRONLY),('fd/1',os.O_RDONLY)]:
+ try:
+  descriptor=os.open('/proc/'+sys.argv[1]+'/'+suffix,flags)
+ except PermissionError: results.append('denied')
+ else:
+  os.close(descriptor);results.append('opened')
+print(json.dumps(results))
+"""
+        probe = subprocess.run(["setpriv", "--reuid=51003", "--regid=51003", "--clear-groups",
+                                sys.executable, "-I", "-c", program, str(helper)],
+                               capture_output=True, text=True, check=True, timeout=3)
+        self.assertEqual(json.loads(probe.stdout), ["denied"] * 4)
+        descendant = self.rpc("spawn", {})["pid"]
+        self.rpc("taskopotamus/runtime/end", {"unloaded": True})
+        self.assertNotIn(descendant, self.lifecycle.uid_processes(51003))
+        self.assertEqual(set(self.lifecycle.uid_processes(51003)), set(retained))
+        for pid in retained:
+            self.assertIn("\nState:\tT", Path("/proc", str(pid), "status").read_text())
+        self.assertFalse((self.root / "runtime-scope" / "current.json").exists())
+        self.begin("b")
+        self.assertEqual(set(self.lifecycle.uid_processes(51003)), set(retained))
+
+    def test_helper_death_discards_scope_and_all_uid_processes(self):
+        import signal
+        self.begin()
+        native = self.rpc("identity", {})["pid"]
+        helper, = set(self.lifecycle.uid_processes(51003)) - {native}
+        os.kill(helper, signal.SIGKILL)
+        self.process.wait(timeout=4)
+        self.assertEqual(self.lifecycle.uid_processes(51003), [])
+        self.assertFalse((self.root / "runtime-scope" / "current.json").exists())
+        self.assertFalse((self.root / "state" / "runtime-credentials-pending.json").exists())
+
     def test_native_output_cannot_invoke_privileged_controls(self):
         self.begin()
         self.rpc("forge", {})
@@ -173,7 +221,7 @@ class RuntimeProxyTests(unittest.TestCase):
         (self.root / "long-retention").touch()
         self.begin()
         retained = self.lifecycle.uid_processes(51003)
-        self.assertEqual(len(retained), 1)
+        self.assertEqual(len(retained), 2)
         descendant = self.rpc("spawn", {})["pid"]
         self.rpc("taskopotamus/runtime/end", {"unloaded": True})
         self.assertNotIn(descendant, self.lifecycle.uid_processes(51003))
@@ -199,6 +247,8 @@ class RuntimeProxyTests(unittest.TestCase):
         self.assertFalse((self.root / "state" / "runtime-credentials-pending.json").exists())
 
     def test_stalled_controller_output_cannot_prevent_cleanup(self):
+        self.begin()
+        self.rpc("taskopotamus/runtime/end", {"unloaded": True})
         self.begin(lifetime=.5)
         self.send("flood", {})
         self.process.wait(timeout=4)
@@ -276,3 +326,107 @@ class RuntimeProxyTests(unittest.TestCase):
         self.assertIsNotNone(transport.poll())
         for stream in (transport.stdin, transport.stdout, transport.stderr):
             self.assertTrue(stream.closed)
+
+    def test_actual_http_helper_catalog_and_loaded_thread_remain_initialized(self):
+        from openai_codex import Codex, CodexConfig, Sandbox, ApprovalMode
+        from src.agent.runtime_session import RuntimeSessions
+        from src.agent.request_tools import request_config, TOOLS
+        from src.agent.instruction_refresh import refresh_instructions
+        from openai_codex.generated.v2_all import ThreadReadResponse
+
+        self.cleanup()
+        root = self.root / "warm-native"
+        root.mkdir(mode=0o755)
+        (root / "long-retention").touch()
+        sessions = RuntimeSessions(lambda: Codex(CodexConfig(launch_args_override=[
+            sys.executable, "-u", "-c", HARNESS, str(root), "pinned-native"])))
+        try:
+            counts = []
+            for index, token in enumerate(("a", "b", "c")):
+                with sessions.lease("42", {}, "synthetic-profile", token * 43, 20) as lease:
+                    options = {"cwd": str(root / "workspace"), "sandbox": Sandbox.full_access,
+                               "approval_mode": ApprovalMode.deny_all,
+                               "config": {**request_config(lease.tools), "features.apps": False,
+                                          "web_search": "disabled"}}
+                    if index == 0:
+                        thread = lease.client.thread_start(**options)
+                        refresh_instructions(thread, "Synthetic persisted history marker")
+                    else:
+                        acquired = lease.resume(thread.id, **options)
+                        self.assertIs(acquired, thread)
+                        self.assertEqual(lease.thread_action, "reuse")
+                        response = lease.client._client.request("thread/read", {
+                            "threadId": thread.id, "includeTurns": True}, response_model=ThreadReadResponse)
+                        self.assertEqual(response.thread.id, thread.id)
+                    lease.bind(thread, options, "synthetic")
+                counts.append(lease.tool_counts["catalog_lists"])
+                retained = self.lifecycle.uid_processes(51003)
+                self.assertEqual(len(retained), 2)
+                for pid in retained:
+                    self.assertIn("\nState:\tT", Path("/proc", str(pid), "status").read_text())
+            self.assertGreater(counts[0], 0)
+            self.assertEqual(counts, [counts[0]] * 3)
+            with sessions.lease("42", {}, "synthetic-profile", "d" * 43, 20) as configured:
+                changed = {**options, "config": {**options["config"],
+                    "model_auto_compact_token_limit": 1000, "model_auto_compact_token_limit_scope": "total"}}
+                thread = configured.resume(thread.id, **changed)
+                self.assertEqual(configured.thread_action, "configure")
+                configured.bind(thread, changed, "synthetic")
+            self.assertEqual(configured.tool_counts["catalog_lists"], counts[0])
+        finally:
+            sessions.shutdown()
+        self.assertEqual(self.lifecycle.uid_processes(51003), [])
+
+    def test_persisted_stdio_history_migrates_replaces_helper_and_rolls_back(self):
+        from openai_codex import Codex, CodexConfig, Sandbox, ApprovalMode
+        from src.agent.runtime_session import RuntimeSessions
+        from src.agent.request_tools import request_config, TOOLS
+        from src.agent.instruction_refresh import refresh_instructions
+
+        self.cleanup()
+        root = self.root / "migration-native"
+        root.mkdir(mode=0o755)
+        (root / "long-retention").touch()
+        sessions = RuntimeSessions(lambda: Codex(CodexConfig(launch_args_override=[
+            sys.executable, "-u", "-c", HARNESS, str(root), "pinned-native"])))
+        observed = root / "workspace" / "stdio-starts"
+        program = ("from pathlib import Path; import asyncio,os; from taskopotamus_worker import request_mcp; "
+                   "from taskopotamus_worker.request_scope import load_scope; "
+                   "request_mcp.credentials=lambda: load_scope(os.environ['TASKOPOTAMUS_REQUEST_SCOPE'],runtime_gid=51003); "
+                   f"Path({str(observed)!r}).open('a').write('start\\n'); asyncio.run(request_mcp.main())")
+        def options(config):
+            return {"cwd": str(root / "workspace"), "sandbox": Sandbox.full_access,
+                    "approval_mode": ApprovalMode.deny_all,
+                    "config": {"features.apps": False, "web_search": "disabled", **config}}
+        legacy = options({"mcp_servers.request_tools": {
+            "command": sys.executable, "args": ["-c", program],
+            "env_vars": ["TASKOPOTAMUS_REQUEST_SCOPE"], "enabled_tools": list(TOOLS),
+            "required": True, "tool_timeout_sec": 120,
+            "tools": {name: {"approval_mode": "auto"} for name in TOOLS}}})
+        marker = "offline-persisted-conversation-marker"
+        try:
+            with sessions.lease("42", {}, "synthetic-profile", "a" * 43, 20) as first:
+                thread = first.client.thread_start(**legacy)
+                identifier = thread.id
+                refresh_instructions(thread, marker)
+                first.parent_thread_id = identifier
+            self.assertEqual(observed.read_text().splitlines(), ["start"])
+            for token in ("b", "c"):
+                with sessions.lease("42", {}, "synthetic-profile", token * 43, 20) as lease:
+                    current = options(request_config(lease.tools))
+                    thread = lease.resume(identifier, **current)
+                    self.assertEqual(thread.id, identifier)
+                    lease.bind(thread, current, "synthetic")
+                self.assertGreater(lease.tool_counts["catalog_lists"], 0)
+                self.assertEqual(observed.read_text().splitlines(), ["start"])
+                sessions.close()  # Replace native plus helper without rewriting persisted state.
+            with sessions.lease("42", {}, "synthetic-profile", "d" * 43, 20) as rollback:
+                restored = rollback.resume(identifier, **legacy)
+                self.assertEqual(restored.id, identifier)
+                rollback.parent_thread_id = identifier
+            self.assertEqual(observed.read_text().splitlines(), ["start", "start"])
+            histories = list((root / "native" / "sessions").rglob("*.jsonl"))
+            self.assertTrue(any(marker in path.read_text() for path in histories))
+        finally:
+            sessions.shutdown()
+        self.assertEqual(self.lifecycle.uid_processes(51003), [])

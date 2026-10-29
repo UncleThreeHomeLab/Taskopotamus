@@ -67,6 +67,8 @@ class ChatServiceTests(unittest.TestCase):
         self.assertTrue(second["details"]["runtime_reused"])
         self.assertTrue(second["details"]["runtime_retained"])
         self.assertIn("setup_total", second["details"]["system_timings_ms"])
+        self.assertTrue({"profile_prepare", "artifact_inputs", "artifact_scope"}.issubset(
+            second["details"]["system_timings_ms"]))
         self.assertEqual(factory.call_count, 1)
         from src.agent.request_tools import request_config
 
@@ -94,6 +96,26 @@ class ChatServiceTests(unittest.TestCase):
         self.codex.close.assert_called_once()
         self.assertIsNone(sessions.client)
         self.assertEqual(chat.reply("42", "hello", "1", include_details=True), first)
+        self.turn.run.assert_called_once()
+
+    def test_bound_helper_is_not_reported_retained_after_cleanup_failure(self):
+        from src.agent.runtime_session import RuntimeLease
+        chat, _sessions, _factory = self.warm_chat()
+        original_bind, observed = RuntimeLease.bind, []
+        def bind(lease, *arguments):
+            original_bind(lease, *arguments)
+            lease.bound = True
+            observed.append(lease)
+        def fail(lease):
+            lease.cleanup_error = {"stage": "pause", "error_type": "RuntimeError"}
+            raise RuntimeError("Synthetic pause failure")
+        with patch.object(RuntimeLease, "bind", bind), patch.object(RuntimeLease, "finish", fail):
+            result = chat.reply("42", "hello", "1", include_details=True)
+        self.assertTrue(observed[0].bound)
+        self.assertTrue(observed[0].discarded)
+        self.assertFalse(result["details"]["runtime_retained"])
+        self.assertFalse(result["details"]["tools_retained"])
+        self.assertEqual(chat.reply("42", "hello", "1", include_details=True), result)
         self.turn.run.assert_called_once()
 
     def test_warm_begin_capacity_refusal_reaches_http_507_without_inference(self):

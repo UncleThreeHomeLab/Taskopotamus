@@ -1,5 +1,6 @@
 """Own one warm app-server while keeping every tool process request-bound."""
 import json
+import copy
 import sys
 import threading
 import time
@@ -7,7 +8,7 @@ from contextlib import contextmanager
 
 from openai_codex.errors import InvalidRequestError
 from openai_codex.generated.v2_all import ThreadLoadedListResponse
-from pydantic import BaseModel, ConfigDict, StrictBool
+from pydantic import BaseModel, ConfigDict, StrictBool, Field
 
 from .worker_transport import WorkspaceStorageError
 from .run_details import cleanup_failure, read_thread_metadata
@@ -24,10 +25,17 @@ class RuntimeState(BaseModel):
     usage_bytes: int
     admission_blocked: StrictBool
     runtime_active: StrictBool
+    tools: dict | None = Field(default=None, exclude=True, repr=False)
+    phase_timings_ms: dict = Field(default_factory=dict, exclude=True, repr=False)
 
 
 class RuntimePaused(BaseModel):
     paused: StrictBool
+    tools: dict = Field(default_factory=dict)
+
+
+class RuntimeBound(BaseModel):
+    bound: StrictBool
 
 
 class RuntimeClosed(BaseModel):
@@ -41,6 +49,7 @@ class RuntimeSessions:
         self.client, self.identity = None, None
         self.active, self.failed = False, False
         self.guard = threading.RLock()
+        self.thread, self.thread_options, self.instructions = None, None, None
 
     @staticmethod
     def _rpc(client, operation, params, response):
@@ -49,6 +58,7 @@ class RuntimeSessions:
 
     def _close(self):
         client, self.client, self.identity = self.client, None, None
+        self.thread, self.thread_options, self.instructions = None, None, None
         if client is not None:
             try:
                 acknowledgment = self._rpc(client, "close", {}, RuntimeClosed)
@@ -140,10 +150,11 @@ class RuntimeSessions:
         finished, lease = False, None
         try:
             try:
-                workspace = self._rpc(client, "begin", {"scope": {
+                ready = self._rpc(client, "begin", {"scope": {
                     "profile_token": token, "artifact_token": artifact_token, "profile_url": self.profile_url,
                     "agent_ip": self.agent_ip, "deadline": time.time() + deadline - time.monotonic(),
-                }}, RuntimeState).model_dump()
+                }}, RuntimeState)
+                workspace = ready.model_dump()
             except Exception:
                 with self.guard:
                     self._close()
@@ -156,7 +167,8 @@ class RuntimeSessions:
                     if blocked:
                         raise WorkspaceStorageError("Workspace storage limit reached.") from None
                 raise
-            lease = RuntimeLease(client, workspace, reused, deadline=deadline)
+            lease = RuntimeLease(client, workspace, reused, deadline=deadline, sessions=self, tools=ready.tools,
+                                 begin_timings=ready.phase_timings_ms)
             yield lease
             if not lease.discarded:
                 lease.finish()
@@ -176,7 +188,7 @@ class RuntimeSessions:
 
 
 class RuntimeLease:
-    def __init__(self, client, workspace, reused, deadline=None):
+    def __init__(self, client, workspace, reused, deadline=None, sessions=None, tools=None, begin_timings=None):
         self.client, self.workspace, self.reused = client, workspace, reused
         self.finished = False
         self.published, self.discarded = False, False
@@ -186,8 +198,30 @@ class RuntimeLease:
         self.cleanup_error = None
         self.cleanup_counts = {}
         self.deadline = deadline
+        self.sessions, self.tools = sessions, tools
+        self.bound = False
+        self.thread_action = "start"
+        self.tool_counts = {}
+        # Privileged diagnostics are private and may only contribute these numeric phases.
+        self.begin_timings = {
+            "runtime_" + name: value for name, value in (begin_timings or {}).items()
+            if name in ("boundary", "prepare", "stage_inputs", "write_scope", "helper_transition")
+            and type(value) is int and 0 <= value <= 1860000
+        }
 
     def resume(self, thread_id, **options):
+        cached = self.sessions.thread if self.sessions is not None else None
+        if self.tools is not None and cached is not None and cached.id == thread_id:
+            previous = copy.deepcopy(self.sessions.thread_options)
+            current = copy.deepcopy(options)
+            previous.pop("developer_instructions", None)
+            current.pop("developer_instructions", None)
+            if previous == current:
+                self.thread_action = "reuse"
+                return cached
+            self.thread_action = "configure"
+        else:
+            self.thread_action = "resume"
         try:
             return self.client.thread_resume(thread_id, **options)
         except InvalidRequestError as error:
@@ -196,6 +230,21 @@ class RuntimeLease:
                 raise
             self.client.thread_unarchive(thread_id)
             return self.client.thread_resume(thread_id, **options)
+
+    def instructions_current(self, instructions):
+        return self.tools is not None and self.sessions is not None and self.sessions.instructions == instructions
+
+    def bind(self, thread, options, instructions):
+        self.parent_thread_id = thread.id
+        if self.tools is None:
+            return
+        result = RuntimeSessions._rpc(self.client, "bind", {"thread": thread.id}, RuntimeBound)
+        if result.bound is not True:
+            raise RuntimeError("Conversation binding was not confirmed.")
+        self.bound = True
+        if self.sessions is not None:
+            self.sessions.thread, self.sessions.thread_options = thread, copy.deepcopy(options)
+            self.sessions.instructions = instructions
 
     def _loaded(self):
         result, cursor, visited = [], None, set()
@@ -244,6 +293,23 @@ class RuntimeLease:
                 "persistent_threads": sum(not value["ephemeral"] for value in self.native_threads.values()),
                 "metadata_unavailable": len(loaded) - len(self.native_threads),
             }
+            if self.bound:
+                stage = "verify_unloaded"
+                if self.parent_thread_id not in loaded or self.metadata_incomplete:
+                    raise RuntimeError("Retained conversation state is incomplete.")
+                for identifier, metadata in self.native_threads.items():
+                    if (metadata["status"] != "idle" or
+                            (identifier != self.parent_thread_id and metadata["parent_id"] != self.parent_thread_id)):
+                        raise RuntimeError("Retained conversation work is not quiescent.")
+                stage = "pause"
+                response = RuntimeSessions._rpc(self.client, "end", {"quiescent": True}, RuntimePaused)
+                if response.paused is not True:
+                    raise RuntimeError("Runtime did not enter idle state.")
+                self.tool_counts = {key: value for key, value in response.tools.items()
+                                    if key in ("calls", "child_calls", "rejected", "catalog_lists") and type(value) is int and value >= 0}
+                self.cleanup_counts["retained_threads"] = len(loaded)
+                self.finished = True
+                return
             archived_parent = False
             stage = "verify_unloaded"
             if loaded and not self.parent_thread_id:
