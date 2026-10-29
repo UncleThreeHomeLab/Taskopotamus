@@ -277,11 +277,13 @@ class ChatServiceTests(unittest.TestCase):
         recreated.reply("42", "follow up", "2")
         self.codex.thread_resume.assert_called_once()
         self.assertEqual(self.codex.thread_resume.call_args.args[0], "synthetic-thread")
+        self.assertIs(self.codex.thread_resume.call_args.kwargs["include_turns"], False)
         self.assertEqual(self.codex.thread_resume.call_args.kwargs["model"], "gpt-6.1-sol")
         self.assertEqual(self.codex.thread_resume.call_args.kwargs["config"]["service_tier"], "fast")
         recreated.reply("43", "separate chat", "3")
         self.assertEqual(self.codex.thread_start.call_count, 2)
         options = self.codex.thread_start.call_args.kwargs
+        self.assertNotIn("include_turns", options)
         self.assertEqual(options["model"], "gpt-6.1-sol")
         self.assertEqual(options["config"]["model_reasoning_effort"], "medium")
         self.assertEqual(options["config"]["service_tier"], "fast")

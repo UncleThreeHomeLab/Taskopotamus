@@ -323,7 +323,7 @@ class ChatService:
                     raise TimeoutError("Request cancelled.")
                 acquiring_thread = time.monotonic()
                 if row:
-                    thread = lease.resume(row[0], **options) if lease else codex.thread_resume(row[0], **options)
+                    thread = lease.resume(row[0], **options) if lease else codex.thread_resume(row[0], include_turns=False, **options)
                     timings["thread_acquire"] = round((time.monotonic() - acquiring_thread) * 1000)
                     refreshing = time.monotonic()
                     if ((self.profiles is not None or workspace is not None or self.artifacts is not None)

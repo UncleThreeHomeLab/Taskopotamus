@@ -223,13 +223,13 @@ class RuntimeLease:
         else:
             self.thread_action = "resume"
         try:
-            return self.client.thread_resume(thread_id, **options)
+            return self.client.thread_resume(thread_id, include_turns=False, **options)
         except InvalidRequestError as error:
             # Only pre-turn archived recovery is retried; model turns and their effects are never replayed.
             if " is archived." not in error.message:
                 raise
             self.client.thread_unarchive(thread_id)
-            return self.client.thread_resume(thread_id, **options)
+            return self.client.thread_resume(thread_id, include_turns=False, **options)
 
     def instructions_current(self, instructions):
         return self.tools is not None and self.sessions is not None and self.sessions.instructions == instructions
