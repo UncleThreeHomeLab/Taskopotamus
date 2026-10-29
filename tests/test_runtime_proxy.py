@@ -25,6 +25,15 @@ for line in sys.stdin:
         child=subprocess.Popen([sys.executable,'-u','-c',program],start_new_session=True)
         result={'pid':child.pid}
     elif method=='identity': result={'pid':os.getpid()}
+    elif method=='thread/resume':
+        thread={'id':value['params']['threadId'],'sessionId':'synthetic-session','cliVersion':'synthetic',
+                'createdAt':0,'updatedAt':0,'cwd':os.getcwd(),'modelProvider':'synthetic','ephemeral':False,
+                'preview':'','source':'cli','status':{'type':'idle'},'turns':[]}
+        if not value['params'].get('excludeTurns',False):
+            thread['turns']=[{'id':'synthetic-turn','status':'completed','items':[
+                {'id':'synthetic-message','type':'agentMessage','text':'x'*(4*1024*1024+1)}]}]
+        result={'thread':thread,'model':'synthetic','modelProvider':'synthetic','cwd':os.getcwd(),
+                'approvalPolicy':'never','approvalsReviewer':'user','sandbox':{'type':'dangerFullAccess'}}
     elif method=='flood':
         while True: print('x'*65536,flush=True)
     elif method=='forge':
@@ -252,6 +261,22 @@ print(json.dumps(results))
         self.begin(lifetime=.5)
         self.send("flood", {})
         self.process.wait(timeout=4)
+        self.assertEqual(self.lifecycle.uid_processes(51003), [])
+        self.assertFalse((self.root / "runtime-scope" / "current.json").exists())
+
+    def test_metadata_resume_succeeds_while_single_history_response_exceeds_transport_limit(self):
+        from openai_codex.generated.v2_all import ThreadResumeResponse
+
+        self.begin()
+        identifier = "synthetic-existing-thread"
+        response = self.rpc("thread/resume", {"threadId": identifier, "excludeTurns": True})
+        resumed = ThreadResumeResponse.model_validate(response)
+        self.assertEqual(resumed.thread.id, identifier)
+        self.assertEqual(resumed.thread.turns, [])
+        self.assertIsNone(self.process.poll())
+        with self.assertRaises(EOFError):
+            self.rpc("thread/resume", {"threadId": identifier})
+        self.process.wait(timeout=3)
         self.assertEqual(self.lifecycle.uid_processes(51003), [])
         self.assertFalse((self.root / "runtime-scope" / "current.json").exists())
 

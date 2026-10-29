@@ -154,8 +154,11 @@ class RetainedThreadTests(unittest.TestCase):
         self.assertTrue(second.instructions_current("owner-a"))
         self.assertFalse(second.instructions_current("owner-b"))
         second.resume("parent", **{**options, "config": {"limit": 20}})
-        client.thread_resume.assert_called_once()
+        client.thread_resume.assert_called_once_with("parent", include_turns=False, model="synthetic",
+                                                     config={"limit": 20}, developer_instructions="owner-a")
         self.assertEqual(second.thread_action, "configure")
+        self.assertEqual(options, {"model": "synthetic", "config": {"limit": 10}, "developer_instructions": "owner-a"})
+        self.assertEqual(sessions.thread_options, options)
 
     def test_private_phase_timings_only_admit_known_bounded_integers(self):
         lease = RuntimeLease(Mock(), {}, True, begin_timings={

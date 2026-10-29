@@ -55,6 +55,40 @@ class RuntimeSessionTests(unittest.TestCase):
     def lease(self, chat="42", config=None, token="a"):
         return self.sessions.lease(chat, config or {"model": "synthetic"}, "synthetic-profile", token * 43, 60)
 
+    def test_resume_requests_metadata_without_mutating_options(self):
+        client = Mock()
+        thread = SimpleNamespace(id="parent")
+        client.thread_resume.return_value = thread
+        options = {"model": "synthetic", "config": {"limit": 10}, "developer_instructions": "synthetic-owner"}
+        lease = RuntimeLease(client, {}, False)
+        self.assertIs(lease.resume(thread.id, **options), thread)
+        client.thread_resume.assert_called_once_with(thread.id, include_turns=False, **options)
+        self.assertEqual(options, {"model": "synthetic", "config": {"limit": 10},
+                                   "developer_instructions": "synthetic-owner"})
+
+    def test_archived_resume_retries_only_metadata_after_unarchive(self):
+        client = Mock()
+        thread = SimpleNamespace(id="parent")
+        client.thread_resume.side_effect = [InvalidRequestError(-32600, "Thread parent is archived."), thread]
+        lease = RuntimeLease(client, {}, False)
+        self.assertIs(lease.resume(thread.id, config={"limit": 10}), thread)
+        client.thread_unarchive.assert_called_once_with(thread.id)
+        self.assertEqual(client.thread_resume.call_count, 2)
+        for call in client.thread_resume.call_args_list:
+            self.assertEqual(call.args, (thread.id,))
+            self.assertEqual(call.kwargs, {"include_turns": False, "config": {"limit": 10}})
+
+    def test_resume_does_not_retry_unrelated_failures(self):
+        for error in (InvalidRequestError(-32600, "Synthetic invalid settings."), RuntimeError("Synthetic transport closed.")):
+            with self.subTest(error=type(error).__name__):
+                client = Mock()
+                client.thread_resume.side_effect = error
+                with self.assertRaises(type(error)) as caught:
+                    RuntimeLease(client, {}, False).resume("parent", config={"limit": 10})
+                self.assertIs(caught.exception, error)
+                client.thread_resume.assert_called_once_with("parent", include_turns=False, config={"limit": 10})
+                client.thread_unarchive.assert_not_called()
+
     def test_same_chat_reuses_native_and_rotates_request_scope(self):
         with self.lease() as first:
             self.assertFalse(first.reused)
@@ -249,6 +283,26 @@ class RequestScopeTests(unittest.TestCase):
 
 @unittest.skipIf(os.name == "nt", "Pinned native Linux configuration check")
 class NativeArchiveTests(unittest.TestCase):
+    def test_metadata_resume_preserves_native_thread_and_persisted_instruction(self):
+        from src.agent.instruction_refresh import refresh_instructions
+
+        with tempfile.TemporaryDirectory() as directory:
+            marker = "synthetic-persisted-resume-instruction"
+            config = {"features.apps": False, "web_search": "disabled"}
+            with Codex(CodexConfig(env={"CODEX_HOME": directory})) as codex:
+                thread = codex.thread_start(cwd=directory, config=config)
+                refresh_instructions(thread, marker)
+                identifier = thread.id
+                codex.thread_archive(identifier)
+                codex.thread_unarchive(identifier)
+                resumed = RuntimeLease(codex, {}, False).resume(identifier, cwd=directory, config=config)
+                self.assertEqual(resumed.id, identifier)
+                metadata = resumed.read(include_turns=False).thread
+                self.assertEqual(metadata.id, identifier)
+                self.assertEqual(metadata.turns, [])
+                histories = list((Path(directory) / "sessions").rglob("*.jsonl"))
+                self.assertTrue(any(marker in path.read_text() for path in histories))
+
     def test_ephemeral_native_thread_has_no_archivable_rollout(self):
         with tempfile.TemporaryDirectory() as directory:
             with Codex(CodexConfig(env={"CODEX_HOME": directory})) as codex:
