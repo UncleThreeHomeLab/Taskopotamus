@@ -5,7 +5,7 @@ from urllib.parse import urlsplit
 
 TOOLS = (
     "send_message", "search_gmail", "read_gmail", "list_calendars", "list_calendar_events", "read_calendar_event",
-    "create_calendar_event", "update_calendar_event", "delete_calendar_event", "calendar_operation_status",
+    "create_calendar_event", "update_calendar_event", "delete_calendar_event", "calendar_operation_status", "list_calendar_event_colors",
     "get_agent_profile", "update_agent_profile",
 )
 
