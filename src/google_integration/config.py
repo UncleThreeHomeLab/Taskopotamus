@@ -27,6 +27,11 @@ class GoogleConfig:
         values = []
         for name in ("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GOOGLE_OAUTH_REDIRECT_URI"):
             values.append(read_secret(name, env) if env.get(name + "_FILE") or env.get(name, "").strip() else "")
+        if any(values[:2]) and not values[2]:
+            port = env.get("GOOGLE_CALLBACK_PORT", "").strip() or "8090"
+            if not port.isascii() or not port.isdecimal() or not 1 <= int(port) <= 65535:
+                raise ValueError("Google callback port must be between 1 and 65535.")
+            values[2] = f"http://localhost:{int(port)}/oauth/google/callback"
         config = cls(*values)
         if any(values) and not config.enabled:
             raise ValueError("Google OAuth configuration is incomplete.")
