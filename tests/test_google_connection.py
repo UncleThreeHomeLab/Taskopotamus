@@ -403,6 +403,26 @@ class GoogleConnectionTests(unittest.TestCase):
             with self.subTest(uri=uri), self.assertRaises(ValueError):
                 GoogleConfig.from_env({**environment, "GOOGLE_OAUTH_REDIRECT_URI": uri})
 
+    def test_callback_defaults_to_localhost_and_respects_explicit_domain(self):
+        environment = {"GOOGLE_OAUTH_CLIENT_ID": "synthetic-id", "GOOGLE_OAUTH_CLIENT_SECRET": "synthetic-secret"}
+        self.assertEqual(GoogleConfig.from_env(environment).redirect_uri, self.config.redirect_uri)
+        self.assertEqual(GoogleConfig.from_env({**environment, "GOOGLE_OAUTH_REDIRECT_URI": "  ",
+                                               "GOOGLE_CALLBACK_PORT": "9090"}).redirect_uri,
+                         "http://localhost:9090/oauth/google/callback")
+        for port in ("0", "65536", "invalid", "8090/other", "8090@evil.example"):
+            with self.subTest(port=port), self.assertRaises(ValueError):
+                GoogleConfig.from_env({**environment, "GOOGLE_CALLBACK_PORT": port})
+        self.assertFalse(GoogleConfig.from_env({"GOOGLE_CALLBACK_PORT": "9090"}).enabled)
+        domain = "https://bot.example.test/oauth/google/callback"
+        config = GoogleConfig.from_env({**environment, "GOOGLE_OAUTH_REDIRECT_URI": domain})
+        self.assertEqual(config.redirect_uri, domain)
+        self.oauth = GoogleOAuth(config, self.store, self.transport)
+        result = self.control("connect")
+        self.assertTrue(result["url"].startswith("https://bot.example.test/oauth/google/start?"))
+        ticket = parse_qs(urlsplit(result["url"]).query)["ticket"][0]
+        url, _ = self.oauth.start(ticket)
+        self.assertEqual(parse_qs(urlsplit(url).query)["redirect_uri"], [domain])
+
     def test_private_telegram_controls_do_not_reach_model_and_forged_binding_is_rejected_before_persistence(self):
         message = {"from": {"id": 42}, "chat": {"id": 42, "type": "private"}, "text": "/google connect"}
         client, agent = Mock(), Mock()
