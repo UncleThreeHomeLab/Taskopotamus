@@ -1,5 +1,13 @@
-FROM postgres:18.6 AS test-base
-RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv openssh-client curl ca-certificates \
+FROM python:3.13-slim-bookworm@sha256:5024f48ba9441d4b13a95d3945abc6365538e3a31109833367a1923523c6efed AS trust
+
+FROM postgres:18.6@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6 AS test-base
+# Bootstrap HTTPS trust before ca-certificates can be installed.
+COPY --from=trust /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+RUN sed -i 's|http://deb.debian.org/|https://deb.debian.org/|g' /etc/apt/sources.list.d/debian.sources \
+    && sed -i 's|http://apt.postgresql.org/|https://apt.postgresql.org/|g' /etc/apt/sources.list.d/pgdg.list \
+    && ! grep -qE '^(URIs:|deb ).*http://' /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update -o APT::Update::Error-Mode=any \
+    && apt-get install -y --no-install-recommends python3 python3-venv openssh-client curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/tests
 ENV PATH=/opt/tests/bin:$PATH PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
