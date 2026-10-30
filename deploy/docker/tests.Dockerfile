@@ -1,6 +1,6 @@
 FROM python:3.13-slim-bookworm@sha256:5024f48ba9441d4b13a95d3945abc6365538e3a31109833367a1923523c6efed AS trust
 
-FROM postgres:18.6@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6 AS test-base
+FROM postgres:18.6@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6 AS test-environment
 # Bootstrap HTTPS trust before ca-certificates can be installed.
 COPY --from=trust /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 RUN sed -i 's|http://deb.debian.org/|https://deb.debian.org/|g' /etc/apt/sources.list.d/debian.sources \
@@ -25,15 +25,12 @@ RUN set -eu; \
     rm -rf /tmp/helm.tar.gz "/tmp/linux-$architecture"
 COPY requirements*.txt ./
 RUN python -m pip install --no-cache-dir pip==26.2.2 \
-    && pip install --no-cache-dir -r requirements.txt -r requirements-mcp.txt -r requirements-google.txt -r requirements-test.txt
+    && pip install --no-cache-dir -r requirements.txt -r requirements-mcp.txt -r requirements-google.txt -r requirements-test.txt \
+    && python -c "import os, site; os.symlink('/app/src/worker', site.getsitepackages()[0] + '/taskopotamus_worker')"
+
+FROM test-environment AS test-runner
 # Keep native-snapshotter disk use bounded with one allowlisted context copy.
 COPY . ./
-RUN python -c "import shutil, site; shutil.copytree('/app/src/worker', site.getsitepackages()[0] + '/taskopotamus_worker')" \
-    && install -m 644 deploy/testing/run_tests.sh /run_tests.sh
+RUN install -m 644 deploy/testing/run_tests.sh /run_tests.sh
 USER root
 ENTRYPOINT ["sh", "/run_tests.sh"]
-
-FROM test-base AS test
-RUN --network=none sh /run_tests.sh
-
-FROM test-base AS test-runner
