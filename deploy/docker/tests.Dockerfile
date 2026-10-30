@@ -1,4 +1,4 @@
-FROM postgres:18.6
+FROM postgres:18.6 AS test-base
 RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv openssh-client curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/tests
@@ -28,3 +28,8 @@ COPY deploy/helm/ ./deploy/helm/
 COPY deploy/testing/run_tests.sh /run_tests.sh
 USER root
 ENTRYPOINT ["sh", "/run_tests.sh"]
+
+FROM test-base AS test
+RUN --network=none sh /run_tests.sh
+
+FROM test-base AS test-runner

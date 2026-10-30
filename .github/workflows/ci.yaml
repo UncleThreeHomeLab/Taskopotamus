@@ -1,0 +1,31 @@
+name: CI
+"on":
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions: {contents: read, pull-requests: read}
+concurrency:
+  group: test-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: cloudlab-taskopotamus
+    timeout-minutes: 20
+    permissions: {contents: read, pull-requests: read}
+    steps:
+      - name: Check out the eligible application revision
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - name: Run offline application tests with rootless BuildKit
+        shell: bash
+        run: |
+          set -euo pipefail
+          buildctl --addr tcp://127.0.0.1:1234 build \
+            --frontend dockerfile.v0 \
+            --local context=. --local dockerfile=. \
+            --opt filename=deploy/docker/tests.Dockerfile \
+            --opt target=test --opt platform=linux/amd64
