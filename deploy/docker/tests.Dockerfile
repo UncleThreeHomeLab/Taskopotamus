@@ -26,14 +26,10 @@ RUN set -eu; \
 COPY requirements*.txt ./
 RUN python -m pip install --no-cache-dir pip==26.2.2 \
     && pip install --no-cache-dir -r requirements.txt -r requirements-mcp.txt -r requirements-google.txt -r requirements-test.txt
-COPY src/ ./src/
-RUN python -c "import shutil, site; shutil.copytree('/app/src/worker', site.getsitepackages()[0] + '/taskopotamus_worker')"
-COPY config/agent/ ./config/agent/
-COPY tests/ ./tests/
-COPY deploy/postgres/ ./deploy/postgres/
-COPY deploy/worker/ ./deploy/worker/
-COPY deploy/helm/ ./deploy/helm/
-COPY deploy/testing/run_tests.sh /run_tests.sh
+# Keep native-snapshotter disk use bounded with one allowlisted context copy.
+COPY . ./
+RUN python -c "import shutil, site; shutil.copytree('/app/src/worker', site.getsitepackages()[0] + '/taskopotamus_worker')" \
+    && install -m 644 deploy/testing/run_tests.sh /run_tests.sh
 USER root
 ENTRYPOINT ["sh", "/run_tests.sh"]
 
