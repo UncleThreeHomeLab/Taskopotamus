@@ -1,6 +1,6 @@
 FROM python:3.13.18-alpine3.24@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8 AS prepare
 RUN apk add --no-cache \
-    build-base=0.5-r4 bison=3.8.2-r3 flex=2.6.4-r8 perl=5.42.2-r1 pkgconf=2.5.1-r0 \
+    build-base=0.5-r4 linux-headers=7.0.0-r1 bison=3.8.2-r3 flex=2.6.4-r8 perl=5.42.2-r1 pkgconf=2.5.1-r0 \
     icu-dev=78.1-r0 openssl-dev=3.5.9-r0 readline-dev=8.3.3-r1 zlib-dev=1.3.2-r1 \
     curl=8.23.0-r0 bzip2=1.0.8-r6
 WORKDIR /build/postgres
