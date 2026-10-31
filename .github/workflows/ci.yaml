@@ -34,7 +34,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           repository: UncleThreeHomeLab/yasai-cloudlab
-          ref: ca724b54fa877a2eba8109065df7e7b7df253f90
+          ref: 1bc43ed484cb2e2ed4b33ef6258f639faa644232
           path: platform
           persist-credentials: false
       - name: Check out the tested application revision
@@ -42,6 +42,6 @@ jobs:
         with:
           path: application
           persist-credentials: false
-      - name: Build scan sign and propose the component release
+      - name: Build scan sign and prepare the component release
         shell: bash
         run: python3 -I -S platform/ansible/playbooks/ci/files/publisher.py
