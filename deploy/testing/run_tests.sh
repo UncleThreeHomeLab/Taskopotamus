@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 if [ "$(id -u)" = 0 ]; then
-    gosu postgres sh "$0" "$@"
+    setpriv --reuid=postgres --regid=postgres --init-groups sh "$0" "$@"
     # PostgreSQL cannot run as root; keep this list aligned with root-only security tests.
     PYTHONPATH=/app/tests python -m unittest \
         test_runtime_proxy.RuntimeProxyTests \
