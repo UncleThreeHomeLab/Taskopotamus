@@ -34,7 +34,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           repository: UncleThreeHomeLab/yasai-cloudlab
-          ref: 1bc43ed484cb2e2ed4b33ef6258f639faa644232
+          ref: d3ed0cf34e81859118ab3677c01d510945f97df1
           path: platform
           persist-credentials: false
       - name: Check out the tested application revision
