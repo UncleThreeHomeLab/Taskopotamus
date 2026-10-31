@@ -21,9 +21,12 @@ RUN sharedir="$(/opt/postgresql/bin/pg_config --sharedir)" \
     && grep -Fx "listen_addresses = '*'" "$sharedir/postgresql.conf.sample"
 
 FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+# Alpine reserves the empty ping group at the chart's required PostgreSQL GID.
 RUN apk add --no-cache bash=5.3.9-r1 setpriv=2.42.3-r1 \
       icu-libs=78.1-r0 icu-data-full=78.1-r0 readline=8.3.3-r1 zlib=1.3.2-r1 \
       libssl3=3.5.9-r0 libcrypto3=3.5.9-r0 tzdata=2026e-r0 xz=5.8.4-r0 zstd=1.5.7-r2 \
+    && grep -qx 'ping:x:999:' /etc/group \
+    && delgroup ping \
     && addgroup -S -g 999 postgres \
     && adduser -S -D -H -u 999 -G postgres -h /var/lib/postgresql -s /bin/sh postgres \
     && install -d -o postgres -g postgres -m 1777 /var/lib/postgresql \
