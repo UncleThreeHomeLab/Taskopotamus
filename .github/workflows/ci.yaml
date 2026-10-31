@@ -8,7 +8,7 @@ name: CI
 permissions: {contents: read, pull-requests: read}
 concurrency:
   group: ci-${{ github.repository }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 jobs:
   test:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -23,30 +23,25 @@ jobs:
       - name: Run offline tests from the checked-out source
         shell: bash
         run: cloudlab-test --source . -- sh deploy/testing/run_tests.sh
-  build:
+  publish:
     needs: test
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    runs-on: cloudlab-taskopotamus
+    runs-on: cloudlab-taskopotamus-publish
     timeout-minutes: 25
-    permissions: {contents: read, pull-requests: read}
+    permissions: {contents: read, pull-requests: read, id-token: write}
     steps:
+      - name: Check out the reviewed publishing implementation
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: UncleThreeHomeLab/yasai-cloudlab
+          ref: ca724b54fa877a2eba8109065df7e7b7df253f90
+          path: platform
+          persist-credentials: false
       - name: Check out the tested application revision
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
+          path: application
           persist-credentials: false
-      - name: Build application images into temporary OCI archives
+      - name: Build scan sign and propose the component release
         shell: bash
-        run: |
-          set -euo pipefail
-          image_output="$RUNNER_TEMP/taskopotamus-images"
-          mkdir -p "$image_output"
-          for component in agent mcp google telegram worker; do
-            buildctl --addr tcp://127.0.0.1:1234 build \
-              --frontend dockerfile.v0 \
-              --local context=. --local dockerfile=. \
-              --opt "filename=deploy/docker/$component.Dockerfile" \
-              --opt platform=linux/amd64 \
-              --output "type=oci,dest=$image_output/$component.tar"
-            # This job owns its disposable builder; release native snapshots between images.
-            buildctl --addr tcp://127.0.0.1:1234 prune --all
-          done
+        run: python3 -I -S platform/ansible/playbooks/ci/files/publisher.py

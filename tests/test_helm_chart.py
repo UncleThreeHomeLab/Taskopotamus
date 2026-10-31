@@ -111,6 +111,11 @@ class HelmChartTests(unittest.TestCase):
             {"network": {"clusterCIDRs": []}},
             {"network": {"clusterCIDRs": ["not-a-cidr"]}},
             {"telegram": {"allowedUserIds": []}},
+            {"telegram": {"enabled": "false"}},
+            {"images": {"agent": {"digest": "sha256:" + "a" * 63}}},
+            {"images": {"agent": {"digest": "sha512:" + "a" * 64}}},
+            {"imagePullSecrets": [{"name": "invalid/name"}]},
+            {"imagePullSecrets": [{"name": "synthetic-pull", "password": "synthetic"}]},
             {"worker": {"privileged": True}},
             {"agent": {"turnTimeoutSeconds": 29}},
             {"agent": {"artifacts": {"maxFiles": 11}}},
@@ -176,6 +181,33 @@ class HelmChartTests(unittest.TestCase):
             compile(pod["initContainers"][0]["command"][2], "<volume-initializer>", "exec")
         self.assertEqual(self.deployments["worker"]["spec"]["template"]["spec"]["securityContext"]["sysctls"],
                          [{"name": "net.ipv6.conf.all.disable_ipv6", "value": "1"}])
+
+    def test_digest_images_and_pod_pull_secrets(self):
+        digest = "sha256:" + "a" * 64
+        pull_secrets = [{"name": "synthetic-registry-pull"}]
+        items = resources({"images": {"agent": {"repository": "registry.invalid/agent", "tag": "unused", "digest": digest}},
+                           "imagePullSecrets": pull_secrets, "console": {"enabled": True}})
+        deployments = by_kind(items, "Deployment")
+        expected = "registry.invalid/agent@" + digest
+        for name, deployment in deployments.items():
+            pod = deployment["spec"]["template"]["spec"]
+            self.assertEqual(pod["imagePullSecrets"], pull_secrets)
+            self.assertEqual(pod["initContainers"][0]["image"], expected)
+            if name in ("agent", "test-console"):
+                self.assertEqual(pod["containers"][0]["image"], expected)
+        self.assertEqual(deployments["mcp"]["spec"]["template"]["spec"]["containers"][0]["image"], "taskopotamus-mcp:latest")
+        for deployment in self.deployments.values():
+            self.assertNotIn("imagePullSecrets", deployment["spec"]["template"]["spec"])
+
+    def test_disabled_telegram_omits_poller_and_its_network_access(self):
+        items = resources({"telegram": {"enabled": False, "allowedUserIds": []}})
+        self.assertEqual(set(by_kind(items, "Deployment")), set(self.deployments) - {"telegram"})
+        self.assertEqual(set(by_kind(items, "PersistentVolumeClaim")), set(by_kind(self.items, "PersistentVolumeClaim")))
+        self.assertNotIn("telegram_bot_token", yaml.safe_dump(items))
+        policies = [item for item in items if item["kind"] == "NetworkPolicy"]
+        self.assertNotIn("synthetic-telegram", {item["metadata"]["name"] for item in policies})
+        for target, port in (("agent", 8080), ("google", 8081), ("postgres", 5432)):
+            self.assertFalse(permits(policies, target, "Ingress", "telegram", port))
 
     def test_secret_item_separation_and_read_only_private_copies(self):
         expected = {

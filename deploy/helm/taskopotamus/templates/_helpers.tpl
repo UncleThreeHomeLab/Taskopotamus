@@ -16,7 +16,9 @@
 {{- end -}}
 
 {{- define "taskopotamus.components" -}}
-{{- $names := list "postgres" "agent" "mcp" "google" "telegram" "worker" -}}
+{{- $names := list "postgres" "agent" "mcp" "google" -}}
+{{- if .Values.telegram.enabled -}}{{- $names = append $names "telegram" -}}{{- end -}}
+{{- $names = append $names "worker" -}}
 {{- if .Values.objects.enabled -}}{{- $names = append $names "objects" -}}{{- end -}}
 {{- if .Values.console.enabled -}}{{- $names = append $names "test-console" -}}{{- end -}}
 {{- toJson $names -}}
@@ -31,7 +33,11 @@ app.kubernetes.io/component: {{ .component | quote }}
 {{- define "taskopotamus.image" -}}
 {{- $component := .component -}}{{- if eq $component "test-console" -}}{{- $component = "agent" -}}{{- end -}}
 {{- $image := index .root.Values.images $component -}}
+{{- if $image.digest -}}
+{{- printf "%s@%s" $image.repository $image.digest -}}
+{{- else -}}
 {{- printf "%s:%s" $image.repository $image.tag -}}
+{{- end -}}
 {{- end -}}
 
 {{- define "taskopotamus.claim" -}}
