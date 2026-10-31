@@ -1,4 +1,5 @@
 PyYAML==6.0.3
+# Security pins for the offline CI dependency environment.
 msgpack==1.2.1
 urllib3==2.8.0
 setuptools==84.2.1
