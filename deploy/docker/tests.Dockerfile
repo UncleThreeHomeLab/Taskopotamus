@@ -38,8 +38,13 @@ COPY --from=prepare /opt/helm/helm /usr/local/bin/helm
 ENV PATH=/opt/tests/bin:/opt/postgresql/bin:$PATH PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY requirements*.txt ./
+# Offline tests use preinstalled dependencies, so remove installers after validation.
 RUN python -m pip install --no-cache-dir pip==26.2.2 \
     && pip install --no-cache-dir -r requirements.txt -r requirements-mcp.txt -r requirements-google.txt -r requirements-test.txt \
+    && python -m pip check \
+    && python -m pip uninstall --yes pip \
+    && /usr/local/bin/python -m pip uninstall --yes pip \
+    && /usr/local/bin/python -c "import shutil, sysconfig; shutil.rmtree(sysconfig.get_path('stdlib') + '/ensurepip')" \
     && python -c "import os, site; os.symlink('/app/src/worker', site.getsitepackages()[0] + '/taskopotamus_worker')"
 
 FROM test-environment AS test-runner
