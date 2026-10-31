@@ -1,14 +1,16 @@
 # Install one release per dedicated namespace: application endpoints use fixed Service names.
 # Build and publish/import the repository's five application images before installing.
 existingSecret: ""
+imagePullSecrets: []
 # Required keys: agent_api_token, profile_signing_key, google_data_secret,
 # google_control_secret, google_token_encryption_key, postgres_admin_password,
 # agent_database_password, profile_database_password, telegram_database_password,
-# worker_client_key, worker_host_key.pub, worker_host_key, worker_client_key.pub,
-# telegram_bot_token. objects additionally needs silo_root_password. OAuth additionally
+# worker_client_key, worker_host_key.pub, worker_host_key, worker_client_key.pub.
+# Telegram additionally needs telegram_bot_token; objects needs silo_root_password. OAuth additionally
 # needs google_oauth_client_id, google_oauth_client_secret, google_oauth_redirect_uri.
 # Rotate Secrets with coordinated restarts; database passwords require explicit SQL rotation.
 telegram:
+  enabled: true
   allowedUserIds: []
 network:
   # Choose available private IPv4 addresses from the actual Service CIDR. Keep fixed on upgrades.
@@ -24,6 +26,7 @@ network:
     k8s-app: kube-dns
 # Requires enforcing NetworkPolicy CNI and Service VIPs visible to worker OUTPUT rules.
 # Socket-level eBPF Service translation may be incompatible; verify on the target cluster.
+# Optional per-image digest overrides its tag.
 images:
   agent: {repository: taskopotamus-agent, tag: latest, pullPolicy: IfNotPresent}
   mcp: {repository: taskopotamus-mcp, tag: latest, pullPolicy: IfNotPresent}

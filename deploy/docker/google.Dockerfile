@@ -1,13 +1,14 @@
-FROM python:3.13-slim@sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb
+FROM python:3.13.18-alpine3.24@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
-RUN sed -i 's|http://deb.debian.org/|https://deb.debian.org/|g' /etc/apt/sources.list.d/debian.sources \
-    && ! grep -qE '^URIs:.*http://' /etc/apt/sources.list.d/debian.sources \
-    && apt-get update -o APT::Update::Error-Mode=any \
-    && apt-get install -y --no-install-recommends tini \
-    && rm -rf /var/lib/apt/lists/*
-COPY requirements-google.txt ./
-RUN pip install --no-cache-dir -r requirements-google.txt
+RUN apk add --no-cache tini=0.19.0-r3 \
+    && ln -s /sbin/tini /usr/bin/tini \
+    && test -x /usr/bin/tini
+COPY requirements-google.txt requirements-security.txt ./
+RUN pip install --no-cache-dir -c requirements-security.txt -r requirements-google.txt \
+    && python -m pip check \
+    && python -m pip uninstall --yes pip \
+    && python -c "import shutil, sysconfig; shutil.rmtree(sysconfig.get_path('stdlib') + '/ensurepip')"
 COPY src/google_integration/ ./src/google_integration/
 COPY src/agent/http_server.py ./src/agent/http_server.py
 COPY src/runtime.py ./src/runtime.py
