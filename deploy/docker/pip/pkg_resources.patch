@@ -1,0 +1,39 @@
+--- a/src/pip/_vendor/pkg_resources/__init__.py
++++ b/src/pip/_vendor/pkg_resources/__init__.py
+@@ -82,12 +82,13 @@
+     # no write support, probably under GAE
+     WRITE_SUPPORT = False
+ 
+-import packaging.markers
+-import packaging.requirements
+-import packaging.specifiers
+-import packaging.utils
+-import packaging.version
+-from jaraco.text import drop_comment, join_continuation, yield_lines
++from pip._vendor import packaging
++import pip._vendor.packaging.markers
++import pip._vendor.packaging.requirements
++import pip._vendor.packaging.specifiers
++import pip._vendor.packaging.utils
++import pip._vendor.packaging.version
++from pip._internal.utils._jaraco_text import drop_comment, join_continuation, yield_lines
+ from platformdirs import user_cache_dir as _user_cache_dir
+ 
+ if TYPE_CHECKING:
+@@ -95,15 +96,7 @@
+     from _typeshed.importlib import LoaderProtocol
+     from typing_extensions import Self, TypeAlias
+ 
+-warnings.warn(
+-    "pkg_resources is deprecated as an API. "
+-    "See https://setuptools.pypa.io/en/latest/pkg_resources.html. "
+-    "The pkg_resources package is slated for removal as early as "
+-    "2025-11-30. Refrain from using this package or pin to "
+-    "Setuptools<81.",
+-    UserWarning,
+-    stacklevel=2,
+-)
++# Vendored pkg_resources uses pip internal helpers without deprecation warnings.
+ 
+ _T = TypeVar("_T")
+ _DistributionT = TypeVar("_DistributionT", bound="Distribution")

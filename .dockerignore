@@ -6,6 +6,7 @@
 !requirements-storage.txt
 !requirements-google.txt
 !requirements-test.txt
+!requirements-security.txt
 !tests/
 !tests/**
 !config/
@@ -14,6 +15,8 @@
 !deploy/
 !deploy/docker/
 !deploy/docker/*.Dockerfile
+!deploy/docker/pip/
+!deploy/docker/pip/**
 !deploy/postgres/
 !deploy/postgres/**
 !deploy/testing/

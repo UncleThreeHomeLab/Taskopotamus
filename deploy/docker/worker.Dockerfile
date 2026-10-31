@@ -1,14 +1,28 @@
-FROM python:3.13-slim@sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb
+FROM python:3.13.18-alpine3.24@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8 AS installer
+RUN apk add --no-cache git=2.54.0-r0
+COPY deploy/docker/pip/ /build/pip/
+RUN python /build/pip/build.py /build/artifacts /out
+
+FROM python:3.13.18-alpine3.24@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 CODEX_HOME=/home/agent/.codex HOME=/home/agent
-RUN sed -i 's|http://deb.debian.org/|https://deb.debian.org/|g' /etc/apt/sources.list.d/debian.sources \
-    && ! grep -qE '^URIs:.*http://' /etc/apt/sources.list.d/debian.sources \
-    && apt-get update -o APT::Update::Error-Mode=any \
-    && apt-get install -y --no-install-recommends openssh-server git curl ca-certificates iptables util-linux build-essential tini \
-    && rm -rf /var/lib/apt/lists/* /etc/ssh/ssh_host_* \
+RUN apk add --no-cache openssh-server=10.3_p1-r1 git=2.54.0-r0 curl=8.23.0-r0 \
+      ca-certificates=20261020-r0 iptables=1.8.13-r0 setpriv=2.42.3-r1 build-base=0.5-r4 tini=0.19.0-r3 \
+    && ln -s /sbin/tini /usr/bin/tini \
+    && test -x /usr/bin/tini \
+    && rm -f /etc/ssh/ssh_host_* \
     && passwd -d root
-RUN groupadd --gid 10001 agent && useradd --uid 10001 --gid 10001 --no-create-home agent \
-    && groupadd --gid 10002 codex-auth && useradd --uid 10002 --gid 10002 --no-create-home codex-auth
-RUN pip install --no-cache-dir openai-codex==0.163.0 mcp==2.3.0
+RUN addgroup -S -g 10001 agent && adduser -S -D -H -u 10001 -G agent agent \
+    && addgroup -S -g 10002 codex-auth && adduser -S -D -H -u 10002 -G codex-auth codex-auth
+COPY --from=installer /out/pip-26.2.2+taskopotamus.1-py3-none-any.whl /tmp/
+COPY deploy/docker/pip/refresh_ensurepip.py /tmp/refresh-ensurepip.py
+COPY deploy/docker/pip/verify.py /tmp/verify-installer.py
+COPY requirements-security.txt /tmp/
+RUN python -m pip install --no-cache-dir --no-deps --force-reinstall /tmp/pip-26.2.2+taskopotamus.1-py3-none-any.whl \
+    && python /tmp/refresh-ensurepip.py /tmp/pip-26.2.2+taskopotamus.1-py3-none-any.whl \
+    && pip install --no-cache-dir -c /tmp/requirements-security.txt openai-codex==0.163.0 mcp==2.3.0 \
+    && python -m pip check \
+    && python /tmp/verify-installer.py \
+    && rm /tmp/pip-26.2.2+taskopotamus.1-py3-none-any.whl /tmp/refresh-ensurepip.py /tmp/verify-installer.py /tmp/requirements-security.txt
 COPY src/worker/ /usr/local/lib/python3.13/site-packages/taskopotamus_worker/
 COPY deploy/worker/sshd_config /etc/ssh/taskopotamus_config
 COPY deploy/worker/start_worker.sh /usr/local/bin/start-worker

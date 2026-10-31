@@ -1,0 +1,4 @@
+# Shared dependency constraints for production images and the offline test environment.
+msgpack==1.2.1
+urllib3==2.8.0
+setuptools==84.2.1
