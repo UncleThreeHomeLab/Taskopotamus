@@ -441,6 +441,7 @@ class HelmChartTests(unittest.TestCase):
         self.assertFalse(by_kind(self.items, "ServiceAccount"))
         for deployment in self.deployments.values():
             self.assertNotIn("serviceAccountName", deployment["spec"]["template"]["spec"])
+            self.assertNotIn("ports", deployment["spec"]["template"]["spec"]["containers"][0])
         self.assertNotEqual(render({"ambient": {"enabled": "true"}}).returncode, 0)
         edges = {("telegram", "agent"), ("telegram", "google"), ("telegram", "postgres"),
                  ("agent", "worker"), ("agent", "mcp"), ("agent", "google"), ("agent", "postgres"),
@@ -460,6 +461,21 @@ class HelmChartTests(unittest.TestCase):
                     self.assertEqual(pod["serviceAccountName"], RELEASE + "-" + name)
                     self.assertFalse(pod["automountServiceAccountToken"])
                     self.assertFalse(accounts[pod["serviceAccountName"]]["automountServiceAccountToken"])
+                services = by_kind(items, "Service")
+                for name, deployment in deployments.items():
+                    container = deployment["spec"]["template"]["spec"]["containers"][0]
+                    if name == "telegram":
+                        self.assertNotIn("ports", container)
+                        continue
+                    ports = container["ports"]
+                    self.assertEqual({port["containerPort"] for port in ports},
+                                     {port["targetPort"] for port in services[name]["spec"]["ports"]})
+                    self.assertTrue(all(port["protocol"] == "TCP" for port in ports))
+                    names = {port["containerPort"]: port["name"] for port in ports}
+                    expected = ({8080: "http-callback", 8081: "http-control", 8082: "http-data"} if name == "google" else
+                                {services[name]["spec"]["ports"][0]["targetPort"]:
+                                 {"worker": "ssh", "postgres": "postgresql"}.get(name, "http")})
+                    self.assertEqual(names, expected)
                 policies = [item for item in items if item["kind"] == "NetworkPolicy"]
                 for source in roles:
                     for target in roles:

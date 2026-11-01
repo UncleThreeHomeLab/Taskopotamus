@@ -155,6 +155,18 @@ spec:
           args: [python, -m, {{ index (dict "agent" "src.agent.server" "mcp" "src.mcp_server.server" "google" "src.google_integration.server" "telegram" "src.telegram.bot" "test-console" "src.test_console.server") $component }}]
           {{- end }}
           {{- end }}
+          {{- if and $.Values.ambient.enabled (ne $component "telegram") }}
+          ports:
+            {{- if eq $component "google" }}
+            - {name: http-callback, containerPort: 8080, protocol: TCP}
+            - {name: http-control, containerPort: 8081, protocol: TCP}
+            - {name: http-data, containerPort: 8082, protocol: TCP}
+            {{- else }}
+            {{- $port := index (dict "postgres" 5432 "worker" 2222 "test-console" 8088 "objects" 9000 "agent" 8080 "mcp" 8080) $component }}
+            {{- $protocol := index (dict "postgres" "postgresql" "worker" "ssh") $component | default "http" }}
+            - {name: {{ $protocol }}, containerPort: {{ $port }}, protocol: TCP}
+            {{- end }}
+          {{- end }}
           env:
             {{- range $name, $value := include "taskopotamus.environment" $context | fromJson }}
             - name: {{ $name }}
