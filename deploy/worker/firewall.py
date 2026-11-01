@@ -10,7 +10,9 @@ BLOCKED_NETWORKS = (
 )
 
 
-def rules(mcp_ip, dns_ip, agent_ip="10.203.17.30"):
+def rules(mcp_ip, dns_ip, agent_ip="10.203.17.30", *, ambient=False):
+    if type(ambient) is not bool:
+        raise ValueError("Worker ambient mode must be a boolean.")
     address = ipaddress.IPv4Address(mcp_ip)
     if not address.is_private or address.is_loopback or address.is_link_local or address.is_unspecified:
         raise ValueError("Worker MCP address must be a private service IPv4 address.")
@@ -23,11 +25,29 @@ def rules(mcp_ip, dns_ip, agent_ip="10.203.17.30"):
     commands = [
         ["iptables", "-P", "OUTPUT", "DROP"],
         ["iptables", "-F", "OUTPUT"],
+    ]
+    if ambient:
+        commands.append(["iptables", "-A", "OUTPUT", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
+                         "--ctdir", "REPLY", "-j", "ACCEPT"])
+        # CNI redirects precede filter OUTPUT; authorize the kernel's original tuple, not its proxy.
+        for protocol, port in (("udp", "15053"), ("tcp", "15053"), ("tcp", "15001")):
+            listener = ["iptables", "-A", "OUTPUT", "-p", protocol, "--dport", port]
+            original = listener + ["-d", "127.0.0.1", "-m", "conntrack", "--ctstate", "DNAT",
+                                   "--ctdir", "ORIGINAL"]
+            if port == "15053":
+                commands.append(original + ["--ctorigdst", str(resolver), "--ctorigdstport", "53", "-j", "ACCEPT"])
+            else:
+                commands.extend(original + ["--ctorigdst", str(peer), "--ctorigdstport", "8080", "-j", "ACCEPT"]
+                                for peer in (address, agent))
+                commands.extend(original + ["--ctorigdst", network, "-j", "REJECT"] for network in BLOCKED_NETWORKS)
+                commands.extend(original + ["--ctorigdstport", web_port, "-j", "ACCEPT"] for web_port in ("80", "443"))
+            commands.append(listener + ["-j", "REJECT"])
+    commands.extend([
         ["iptables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"],
         ["iptables", "-A", "OUTPUT", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
         ["iptables", "-A", "OUTPUT", "-p", "tcp", "-d", str(address), "--dport", "8080", "-j", "ACCEPT"],
         ["iptables", "-A", "OUTPUT", "-p", "tcp", "-d", str(agent), "--dport", "8080", "-j", "ACCEPT"],
-    ]
+    ])
     commands.extend(["iptables", "-A", "OUTPUT", "-d", str(resolver), "-p", protocol,
                      "--dport", "53", "-j", "ACCEPT"] for protocol in ("udp", "tcp"))
     commands.extend(["iptables", "-A", "OUTPUT", "-d", network, "-j", "REJECT"] for network in BLOCKED_NETWORKS)
@@ -37,5 +57,8 @@ def rules(mcp_ip, dns_ip, agent_ip="10.203.17.30"):
 
 
 if __name__ == "__main__":
-    for command in rules(sys.argv[1], sys.argv[2], sys.argv[3]):
+    ambient = sys.argv[4] if len(sys.argv) == 5 else "false"
+    if len(sys.argv) not in (4, 5) or ambient not in ("true", "false"):
+        raise ValueError("Expected worker addresses and optional true/false ambient mode.")
+    for command in rules(sys.argv[1], sys.argv[2], sys.argv[3], ambient=ambient == "true"):
         subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
