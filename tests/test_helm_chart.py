@@ -439,6 +439,8 @@ class HelmChartTests(unittest.TestCase):
     def test_ambient_identity_and_transport_are_opt_in_and_preserve_port_policies(self):
         self.assertEqual(resources({"ambient": {"enabled": False}}), self.items)
         self.assertFalse(by_kind(self.items, "ServiceAccount"))
+        self.assertFalse(any(env["name"] == "WORKER_AMBIENT" for deployment in self.deployments.values()
+                             for env in deployment["spec"]["template"]["spec"]["containers"][0]["env"]))
         for deployment in self.deployments.values():
             self.assertNotIn("serviceAccountName", deployment["spec"]["template"]["spec"])
             self.assertNotIn("ports", deployment["spec"]["template"]["spec"]["containers"][0])
@@ -454,6 +456,10 @@ class HelmChartTests(unittest.TestCase):
                 base = resources(options)
                 items = resources({**options, "ambient": {"enabled": True}})
                 deployments = by_kind(items, "Deployment")
+                for name, deployment in deployments.items():
+                    environment = {env["name"]: env.get("value")
+                                   for env in deployment["spec"]["template"]["spec"]["containers"][0]["env"]}
+                    self.assertEqual(environment.get("WORKER_AMBIENT"), "true" if name == "worker" else None)
                 accounts = by_kind(items, "ServiceAccount")
                 self.assertEqual(set(accounts), {RELEASE + "-" + name for name in deployments})
                 for name, deployment in deployments.items():

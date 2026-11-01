@@ -168,6 +168,7 @@ app.kubernetes.io/component: {{ .component | quote }}
   "WORKSPACE_RETENTION_SECONDS" $v.worker.retentionSeconds
   "WORKSPACE_SWEEP_SECONDS" $v.worker.sweepSeconds
   "WORKSPACE_MAX_BYTES" $v.worker.maxBytes -}}
+{{- if $v.ambient.enabled -}}{{- $_ := set $env "WORKER_AMBIENT" "true" -}}{{- end -}}
 {{- else if eq .component "objects" -}}
 {{- $env = dict "MINIO_ROOT_USER" "taskopotamus-admin" "MINIO_ROOT_PASSWORD_FILE" "/run/secrets/silo_root_password" "MINIO_BROWSER" "off" "MINIO_UPDATE" "off" -}}
 {{- else if eq .component "test-console" -}}
