@@ -26,6 +26,12 @@
         "required": ["name"]
       }
     },
+    "ambient": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {"enabled": {"type": "boolean"}},
+      "required": ["enabled"]
+    },
     "telegram": {
       "type": "object",
       "additionalProperties": false,
@@ -303,6 +309,11 @@
           "type": "string",
           "pattern": "^([a-z0-9]([-a-z0-9.]*[a-z0-9])?)?$",
           "maxLength": 253
+        },
+        "workspaceSubPath": {
+          "type": "string",
+          "maxLength": 63,
+          "pattern": "^([A-Za-z0-9][A-Za-z0-9_-]{0,62})?$"
         },
         "sizes": {
           "type": "object",

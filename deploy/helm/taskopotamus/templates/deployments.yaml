@@ -30,6 +30,9 @@ spec:
         checksum/initialization: {{ $.Files.Get "files/initialize_databases.sh" | sha256sum }}
       {{- end }}
     spec:
+      {{- if $.Values.ambient.enabled }}
+      serviceAccountName: {{ printf "%s-%s" $.Release.Name $component | quote }}
+      {{- end }}
       automountServiceAccountToken: false
       enableServiceLinks: false
       terminationGracePeriodSeconds: 30
@@ -99,6 +102,10 @@ spec:
               {{- end }}
               Path('/tmp').chmod({{ if $worker }}0o700{{ else }}0o1777{{ end }})
               {{- if $worker }}
+              {{- if $.Values.storage.workspaceSubPath }}
+              os.chown('/workspace', 10001, 10001)
+              Path('/workspace').chmod(0o700)
+              {{- end }}
               for name in ('/run', '/root', '/home/agent'):
                   Path(name).chmod(0o700)
               {{- else if eq $component "postgres" }}
@@ -111,6 +118,9 @@ spec:
             - {name: run, mountPath: /run}
             - {name: root, mountPath: /root}
             - {name: home, mountPath: /home/agent}
+            {{- if $.Values.storage.workspaceSubPath }}
+            - {name: workspace, mountPath: /workspace, subPath: {{ $.Values.storage.workspaceSubPath | quote }}}
+            {{- end }}
             {{- else }}
             - {name: projected-secrets, mountPath: /secret-source, readOnly: true}
             - {name: private-secrets, mountPath: /run/secrets}
@@ -148,7 +158,7 @@ spec:
           env:
             {{- range $name, $value := include "taskopotamus.environment" $context | fromJson }}
             - name: {{ $name }}
-              value: {{ $value | toString | quote }}
+              value: {{ include "taskopotamus.environmentValue" (dict "name" $name "value" $value) | quote }}
             {{- end }}
             {{- if eq $component "telegram" }}
             - name: TELEGRAM_BOT_TOKEN
@@ -171,7 +181,7 @@ spec:
             - {name: private-secrets, mountPath: /run/secrets, readOnly: true}
             {{- end }}
             {{- range $name, $path := $data }}
-            - {name: {{ $name }}, mountPath: {{ $path }}}
+            - {name: {{ $name }}, mountPath: {{ $path }}{{ if and $worker (eq $name "workspace") $.Values.storage.workspaceSubPath }}, subPath: {{ $.Values.storage.workspaceSubPath | quote }}{{ end }}}
             {{- end }}
             {{- if eq $component "postgres" }}
             - {name: postgres-run, mountPath: /var/run/postgresql}
