@@ -49,7 +49,7 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "taskopotamus.labels" (dict "root" $ "component" $source) | nindent 14 }}
-      ports: [{protocol: TCP, port: {{ $edge.port }}}]
+      ports: [{protocol: TCP, port: {{ $edge.port }}}{{ if and $.Values.ambient.enabled (has $edge.component $components) }}, {protocol: TCP, port: 15008}{{ end }}]
   {{- end }}
   {{- end }}
   {{- end }}
@@ -65,7 +65,7 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "taskopotamus.labels" (dict "root" $ "component" $edge.component) | nindent 14 }}
-      ports: [{protocol: TCP, port: {{ $edge.port }}}]
+      ports: [{protocol: TCP, port: {{ $edge.port }}}{{ if and $.Values.ambient.enabled (has $edge.component $components) }}, {protocol: TCP, port: 15008}{{ end }}]
     {{- end }}
     - to:
         - namespaceSelector:

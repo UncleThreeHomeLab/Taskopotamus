@@ -154,6 +154,30 @@ class HelmChartTests(unittest.TestCase):
         self.assertEqual(worker["dnsConfig"]["nameservers"], [fixture["dnsIP"]])
         self.assertIn(NAMESPACE + ".svc.cluster.local", worker["dnsConfig"]["searches"])
 
+    def test_integer_policy_environment_uses_decimal_values_that_runtime_accepts(self):
+        from src.messaging.artifacts import ArtifactPolicy
+        def environment(component, deployments=self.deployments):
+            return {row["name"]: row["value"] for row in deployments[component]["spec"]["template"]["spec"]["containers"][0]["env"]
+                    if "value" in row}
+        agent = environment("agent")
+        self.assertEqual(ArtifactPolicy.from_env(agent), ArtifactPolicy())
+        expected = {"ARTIFACT_INPUT_MAX_BYTES": "20000000", "ARTIFACT_OUTPUT_MAX_BYTES": "50000000",
+                    "ARTIFACT_IMAGE_MAX_BYTES": "10000000", "ARTIFACT_CAPACITY_BYTES": "1073741824"}
+        self.assertEqual({key: agent[key] for key in expected}, expected)
+        self.assertEqual(agent["CODEX_AUTO_COMPACT_PERCENT"], "")
+        self.assertEqual(environment("worker")["WORKSPACE_MAX_BYTES"], "1073741824")
+        for component in ("agent", "telegram"):
+            self.assertEqual(environment(component)["CODEX_TURN_TIMEOUT_SECONDS"], "600")
+        changed = by_kind(resources({"agent": {"model": "synthetic-2e+07", "autoCompactPercent": 80,
+            "artifacts": {"capacityBytes": 1000000000000}}}), "Deployment")
+        values = environment("agent", changed)
+        self.assertEqual(values["CODEX_MODEL"], "synthetic-2e+07")
+        self.assertEqual(values["CODEX_AUTO_COMPACT_PERCENT"], "80")
+        self.assertEqual(ArtifactPolicy.from_env(values).capacity_bytes, 1000000000000)
+        for capacity in (1.5, True, 9007199254740992):
+            with self.subTest(capacity=capacity):
+                self.assertNotEqual(render({"agent": {"artifacts": {"capacityBytes": capacity}}}).returncode, 0)
+
     def test_single_instances_and_security_contexts(self):
         capabilities = {"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID", "SYS_CHROOT", "SETPCAP", "NET_ADMIN", "KILL"}
         for name, deployment in self.deployments.items():
@@ -311,6 +335,54 @@ class HelmChartTests(unittest.TestCase):
         for name in ("tmp", "run", "root", "home"):
             self.assertEqual(next(item for item in pod["volumes"] if item["name"] == name)["emptyDir"]["medium"], "Memory")
 
+    def test_workspace_subpath_is_opt_in_and_confines_ownership_to_that_directory(self):
+        default = self.deployments["worker"]["spec"]["template"]["spec"]
+        self.assertEqual(resources({"storage": {"workspaceSubPath": ""}}), self.items)
+        self.assertFalse(any("subPath" in mount for mount in default["containers"][0]["volumeMounts"]))
+        self.assertFalse(any(mount["name"] == "workspace" for mount in default["initContainers"][0]["volumeMounts"]))
+        deployments = by_kind(resources({"storage": {"workspaceSubPath": "workspace"}}), "Deployment")
+        worker = deployments["worker"]["spec"]["template"]["spec"]
+        initializer = worker["initContainers"][0]
+        for container in (initializer, worker["containers"][0]):
+            mount, = [mount for mount in container["volumeMounts"] if mount["name"] == "workspace"]
+            self.assertEqual(mount, {"name": "workspace", "mountPath": "/workspace", "subPath": "workspace"})
+            self.assertFalse(any("subPath" in mount for mount in container["volumeMounts"] if mount["name"] != "workspace"))
+        for name in deployments.keys() - {"worker"}:
+            self.assertEqual(deployments[name], self.deployments[name])
+        self.assertEqual(worker["volumes"], default["volumes"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            volume = root / "volume"
+            (volume / "lost+found").mkdir(parents=True)
+            sentinel = volume / "lost+found" / "retained"
+            sentinel.write_bytes(b"synthetic-filesystem-metadata")
+            workspace = volume / "workspace"
+            workspace.mkdir()
+            (workspace / "retained").write_bytes(b"synthetic-existing-data")
+            def isolated_path(path):
+                target = workspace if path == "/workspace" else root / path.lstrip("/")
+                target.mkdir(parents=True, exist_ok=True)
+                return target
+            ownership = []
+            tree = ast.parse(initializer["command"][2])
+            tree.body = [node for node in tree.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
+            exec(compile(tree, "<workspace-initializer>", "exec"),
+                 {"__builtins__": {}, "Path": isolated_path,
+                  "os": SimpleNamespace(chown=lambda *args: ownership.append(args))})
+            self.assertEqual(ownership, [("/workspace", 10001, 10001)])
+            self.assertEqual(workspace.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(sentinel.read_bytes(), b"synthetic-filesystem-metadata")
+            self.assertEqual((workspace / "retained").read_bytes(), b"synthetic-existing-data")
+
+    def test_workspace_subpath_rejects_paths_and_accepts_bounded_single_components(self):
+        for value in (".", "..", "../workspace", "/workspace", "workspace/data", "a..b", "a.b", "a\\b", "-workspace", "a" * 64, 1):
+            with self.subTest(value=value):
+                self.assertNotEqual(render({"storage": {"workspaceSubPath": value}}).returncode, 0)
+        for value in ("", "workspace", "Workspace_1-2", "a" * 63):
+            with self.subTest(value=value):
+                result = render({"storage": {"workspaceSubPath": value}})
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_existing_claims_optional_components_and_instructions(self):
         overrides = {
             "storage": {"existingClaims": {"native": "existing-native"}, "legacyClaim": "existing-legacy"},
@@ -363,6 +435,62 @@ class HelmChartTests(unittest.TestCase):
         for source, target, port in forbidden:
             with self.subTest(source=source, target=target, port=port):
                 self.assertFalse(permits(policies, source, "Egress", target, port))
+
+    def test_ambient_identity_and_transport_are_opt_in_and_preserve_port_policies(self):
+        self.assertEqual(resources({"ambient": {"enabled": False}}), self.items)
+        self.assertFalse(by_kind(self.items, "ServiceAccount"))
+        for deployment in self.deployments.values():
+            self.assertNotIn("serviceAccountName", deployment["spec"]["template"]["spec"])
+            self.assertNotIn("ports", deployment["spec"]["template"]["spec"]["containers"][0])
+        self.assertNotEqual(render({"ambient": {"enabled": "true"}}).returncode, 0)
+        edges = {("telegram", "agent"), ("telegram", "google"), ("telegram", "postgres"),
+                 ("agent", "worker"), ("agent", "mcp"), ("agent", "google"), ("agent", "postgres"),
+                 ("worker", "agent"), ("worker", "mcp"), ("google", "agent"), ("mcp", "postgres"),
+                 ("test-console", "agent")}
+        roles = {"postgres", "agent", "mcp", "google", "telegram", "worker", "objects", "test-console"}
+        for options in ({}, {"telegram": {"enabled": False, "allowedUserIds": []}},
+                        {"console": {"enabled": True}, "objects": {"enabled": True}}):
+            with self.subTest(options=options):
+                base = resources(options)
+                items = resources({**options, "ambient": {"enabled": True}})
+                deployments = by_kind(items, "Deployment")
+                accounts = by_kind(items, "ServiceAccount")
+                self.assertEqual(set(accounts), {RELEASE + "-" + name for name in deployments})
+                for name, deployment in deployments.items():
+                    pod = deployment["spec"]["template"]["spec"]
+                    self.assertEqual(pod["serviceAccountName"], RELEASE + "-" + name)
+                    self.assertFalse(pod["automountServiceAccountToken"])
+                    self.assertFalse(accounts[pod["serviceAccountName"]]["automountServiceAccountToken"])
+                services = by_kind(items, "Service")
+                for name, deployment in deployments.items():
+                    container = deployment["spec"]["template"]["spec"]["containers"][0]
+                    if name == "telegram":
+                        self.assertNotIn("ports", container)
+                        continue
+                    ports = container["ports"]
+                    self.assertEqual({port["containerPort"] for port in ports},
+                                     {port["targetPort"] for port in services[name]["spec"]["ports"]})
+                    self.assertTrue(all(port["protocol"] == "TCP" for port in ports))
+                    names = {port["containerPort"]: port["name"] for port in ports}
+                    expected = ({8080: "http-callback", 8081: "http-control", 8082: "http-data"} if name == "google" else
+                                {services[name]["spec"]["ports"][0]["targetPort"]:
+                                 {"worker": "ssh", "postgres": "postgresql"}.get(name, "http")})
+                    self.assertEqual(names, expected)
+                policies = [item for item in items if item["kind"] == "NetworkPolicy"]
+                for source in roles:
+                    for target in roles:
+                        allowed = (source, target) in edges and source in deployments and target in deployments
+                        self.assertEqual(permits(policies, source, "Egress", target, 15008), allowed)
+                        self.assertEqual(permits(policies, target, "Ingress", source, 15008), allowed)
+                        self.assertFalse(permits(policies, source, "Egress", target, 15008, namespace="another-namespace"))
+                        self.assertFalse(permits(policies, target, "Ingress", source, 15008, namespace="another-namespace"))
+                # Transport adds only its peer-scoped port; application, DNS and external rules stay identical.
+                for policy in policies:
+                    for direction in ("ingress", "egress"):
+                        for rule in policy["spec"][direction]:
+                            rule["ports"] = [port for port in rule["ports"] if port["port"] != 15008]
+                self.assertEqual(by_kind(policies, "NetworkPolicy"), by_kind(base, "NetworkPolicy"))
+                self.assertFalse(any(item["apiVersion"].endswith("istio.io/v1") for item in items))
 
     def test_public_egress_excludes_cluster_private_and_metadata_addresses(self):
         policies = [item for item in self.items if item["kind"] == "NetworkPolicy"]

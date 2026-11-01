@@ -175,3 +175,18 @@ app.kubernetes.io/component: {{ .component | quote }}
 {{- end -}}
 {{- toJson $env -}}
 {{- end -}}
+
+{{- define "taskopotamus.environmentValue" -}}
+{{- $integers := list "CODEX_AUTO_COMPACT_PERCENT" "CODEX_SUBAGENT_MAX_THREADS" "CODEX_TURN_TIMEOUT_SECONDS"
+  "ARTIFACT_MAX_FILES" "ARTIFACT_INPUT_MAX_BYTES" "ARTIFACT_OUTPUT_MAX_BYTES" "ARTIFACT_IMAGE_MAX_BYTES"
+  "ARTIFACT_CAPACITY_BYTES" "ARTIFACT_STAGING_SECONDS" "ARTIFACT_RETENTION_SECONDS" "ARTIFACT_SWEEP_SECONDS"
+  "WORKSPACE_RETENTION_SECONDS" "WORKSPACE_SWEEP_SECONDS" "WORKSPACE_MAX_BYTES" -}}
+{{- if and (has .name $integers) (kindIs "float64" .value) (eq .value (floor .value)) -}}
+{{- if or (gt .value 9007199254740991.0) (lt .value -9007199254740991.0) -}}
+{{- fail "Integer environment values must remain within the exact numeric range" -}}
+{{- end -}}
+{{- printf "%d" (int64 .value) -}}
+{{- else -}}
+{{- toString .value -}}
+{{- end -}}
+{{- end -}}

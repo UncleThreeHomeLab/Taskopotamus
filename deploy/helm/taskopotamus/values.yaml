@@ -2,6 +2,9 @@
 # Build and publish/import the repository's five application images before installing.
 existingSecret: ""
 imagePullSecrets: []
+# Requires platform-managed ambient identity and original peer/port authorization.
+ambient:
+  enabled: false
 # Required keys: agent_api_token, profile_signing_key, google_data_secret,
 # google_control_secret, google_token_encryption_key, postgres_admin_password,
 # agent_database_password, profile_database_password, telegram_database_password,
@@ -65,6 +68,8 @@ storage:
   # without storage fencing. PVC requests/admission checks do not prove hard disk quotas:
   # use a backend that enforces capacity. Managed claims remain after Helm uninstall.
   storageClassName: ""
+  # Optional workspace PVC directory; changing it does not migrate existing data.
+  workspaceSubPath: ""
   sizes:
     postgres: 20Gi
     artifacts: 2Gi
