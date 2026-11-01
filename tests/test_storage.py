@@ -91,6 +91,21 @@ class StorageTests(unittest.TestCase):
 
     def test_bootstrap_creates_roles_that_cannot_access_other_service_databases(self):
         database = isolated_database(self)
+        names = ["taskopotamus_" + service for service in ("agent", "profiles", "telegram")]
+        admin = {**database.settings, "dbname": "postgres"}
+        with psycopg.connect(**admin, autocommit=True) as db:
+            existing_databases = db.execute("SELECT datname FROM pg_database WHERE datname = ANY(%s)", (names,)).fetchall()
+            existing_roles = db.execute("SELECT rolname FROM pg_roles WHERE rolname = ANY(%s)", (names,)).fetchall()
+        self.assertFalse(existing_databases or existing_roles, "Bootstrap fixture names must be unused.")
+
+        def cleanup_bootstrap():
+            with psycopg.connect(**admin, autocommit=True) as db:
+                for name in names:
+                    db.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name)))
+                for name in names:
+                    db.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(name)))
+
+        self.addCleanup(cleanup_bootstrap)
         environment = {**os.environ, "PGHOST": database.settings["host"], "POSTGRES_USER": "postgres"}
         for service in ("AGENT", "PROFILE", "TELEGRAM"):
             path = self.root / (service + "_password")
