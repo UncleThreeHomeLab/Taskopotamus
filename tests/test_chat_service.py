@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
-from openai_codex.errors import InternalRpcError
+from openai_codex.errors import InternalRpcError, TransportClosedError
 
 from src.agent.chat_service import ChatService
 from src.agent.server import make_handler
@@ -139,6 +139,23 @@ class ChatServiceTests(unittest.TestCase):
             client.chat("42", "hello", "1")
         self.assertEqual(caught.exception.status, 507)
         self.assertNotIn("private", str(caught.exception))
+        self.turn.run.assert_not_called()
+
+    def test_warm_transport_exit_releases_request_without_inference(self):
+        chat, sessions, _factory = self.warm_chat()
+
+        def request(*_args, **_kwargs):
+            self.codex._client._proc.poll.return_value = 1
+            raise TransportClosedError("synthetic closed worker")
+
+        self.codex._client.request.side_effect = request
+        sessions.cleanup_status = Mock(return_value={"runtime_active": False})
+        with self.assertRaises(TransportClosedError):
+            chat.reply("42", "hello", "1")
+        self.assertFalse(chat.lock.locked())
+        self.assertFalse(sessions.active)
+        self.assertFalse(sessions.failed)
+        self.assertIsNone(sessions.client)
         self.turn.run.assert_not_called()
 
     def test_gmail_and_existing_tools_start_resume_and_cached_replay(self):

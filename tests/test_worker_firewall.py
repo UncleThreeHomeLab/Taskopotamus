@@ -1,9 +1,12 @@
 """Offline packet decisions against generated filter rules; never modify host networking."""
 import importlib.util
 import ipaddress
+import os
 from pathlib import Path
 import runpy
+import socket
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -18,7 +21,7 @@ MCP, AGENT, DNS = "10.96.3.18", "10.96.3.30", "10.96.0.10"
 
 def verdict(commands, *, destination="127.0.0.1", port=15001, protocol="tcp", interface="eth0",
             original_destination="8.8.8.8", original_port=443, direction="ORIGINAL", dnat=True,
-            state="NEW"):
+            state="NEW", mark=0):
     values = {"-p": protocol, "--dport": str(port), "-o": interface, "--ctdir": direction,
               "--ctorigdstport": str(original_port)}
     for rule in commands:
@@ -37,6 +40,9 @@ def verdict(commands, *, destination="127.0.0.1", port=15001, protocol="tcp", in
                 matches &= bool(set(value.split(",")) & ({state, "DNAT"} if dnat else {state}))
             elif name == "--dports":
                 matches &= str(port) in value.split(",")
+            elif name == "--mark":
+                expected, mask = (int(part, 0) for part in value.split("/"))
+                matches &= mark & mask == expected & mask
             elif name != "-m":
                 matches &= values[name] == value
     return "DROP"
@@ -54,6 +60,18 @@ class WorkerFirewallTests(unittest.TestCase):
                            {"destination": "127.0.0.2"}, {"direction": "REPLY"}, {"dnat": False}):
                 with self.subTest(protocol=protocol, change=change):
                     self.assertEqual(verdict(self.rules, **{**args, **change}), "REJECT")
+
+    def test_hbone_transport_requires_exact_privileged_mark(self):
+        for mark in (0x539, 0x1539):
+            self.assertEqual(verdict(self.rules, destination="10.244.1.10", port=15008, dnat=False, mark=mark), "ACCEPT")
+        for mark in (0, 0x538, 0x1538):
+            for interface in ("eth0", "lo"):
+                for state in ("NEW", "ESTABLISHED"):
+                    self.assertEqual(verdict(self.rules, destination="10.244.1.10", port=15008, dnat=False,
+                                             mark=mark, interface=interface, state=state), "REJECT")
+        self.assertEqual(verdict(self.rules, destination="10.244.1.10", port=15009, dnat=False, mark=0x539), "REJECT")
+        self.assertEqual(verdict(firewall.rules(MCP, DNS, AGENT), destination="10.244.1.10",
+                                 port=15008, dnat=False, mark=0x539), "REJECT")
 
     def test_redirected_peers_keep_exact_addresses_and_ports(self):
         for peer in (MCP, AGENT):
@@ -84,7 +102,7 @@ class WorkerFirewallTests(unittest.TestCase):
 
     def test_established_remote_replies_preserve_unrestricted_client_source_ports(self):
         legacy = firewall.rules(MCP, DNS, AGENT)
-        for protocol, port in (("udp", 15053), ("tcp", 15053), ("tcp", 15001)):
+        for protocol, port in (("udp", 15053), ("tcp", 15053), ("tcp", 15001), ("tcp", 15008)):
             for state in ("ESTABLISHED", "RELATED"):
                 packet = dict(protocol=protocol, port=port, destination="10.244.1.20", original_port=2222,
                               direction="REPLY", dnat=False, state=state)
@@ -147,3 +165,46 @@ class WorkerFirewallTests(unittest.TestCase):
                 drop_call = next(i for i, call in enumerate(calls) if "--bounding-set=-net_admin" in call)
                 self.assertLess(firewall_call, drop_call)
                 self.assertTrue(calls[firewall_call].endswith(f"{MCP} {DNS} {AGENT} {value or 'false'}"))
+
+
+@unittest.skipUnless(os.environ.get("TASKOPOTAMUS_KERNEL_FIREWALL_TEST") == "1",
+                     "Requires an offline network-none Docker container with NET_ADMIN and setpriv capabilities")
+class WorkerFirewallKernelTests(unittest.TestCase):
+    def test_hbone_mark_allows_transport_but_worker_cannot_set_it(self):
+        self.assertTrue(Path("/.dockerenv").is_file())
+        self.assertEqual(os.listdir("/sys/class/net"), ["lo"], "Never apply fixture rules to a connected network")
+        address = "127.0.0.2"
+        tables = {name: subprocess.run([name + "-save"], capture_output=True, check=True).stdout
+                  for name in ("iptables", "ip6tables")}
+        try:
+            for command in firewall.rules(MCP, DNS, AGENT, ambient=True):
+                subprocess.run(command, check=True)
+            with socket.socket() as listener:
+                listener.bind((address, 15008))
+                listener.listen()
+                for mark in (0x539, 0x1539):
+                    with socket.socket() as client:
+                        client.settimeout(1)
+                        client.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, mark)
+                        client.connect((address, 15008))
+                    connection, _ = listener.accept()
+                    connection.close()
+                for mark in (0, 0x538):
+                    with socket.socket() as client:
+                        client.settimeout(1)
+                        client.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, mark)
+                        with self.assertRaises(ConnectionRefusedError):
+                            client.connect((address, 15008))
+            program = ("import errno,socket,sys\n"
+                       "with socket.socket() as connection:\n"
+                       " try: connection.setsockopt(socket.SOL_SOCKET,socket.SO_MARK,0x539)\n"
+                       " except OSError as error: sys.exit(0 if error.errno==errno.EPERM else 2)\n"
+                       " sys.exit(1)\n")
+            for identity in ([], ["--reuid=10001", "--regid=10001", "--clear-groups"]):
+                result = subprocess.run(["setpriv", *identity, "--bounding-set=-net_admin,-net_raw",
+                                         "--inh-caps=-all", "--ambient-caps=-all", "--no-new-privs",
+                                         sys.executable, "-c", program], capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        finally:
+            for name, content in tables.items():
+                subprocess.run([name + "-restore"], input=content, check=True)

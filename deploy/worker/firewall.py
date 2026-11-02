@@ -29,6 +29,10 @@ def rules(mcp_ip, dns_ip, agent_ip="10.203.17.30", *, ambient=False):
     if ambient:
         commands.append(["iptables", "-A", "OUTPUT", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
                          "--ctdir", "REPLY", "-j", "ACCEPT"])
+        # In-pod ztunnel HBONE sockets carry the CNI's privileged mark, unavailable to worker processes.
+        commands.append(["iptables", "-A", "OUTPUT", "-p", "tcp", "--dport", "15008",
+                         "-m", "mark", "--mark", "0x539/0xfff", "-j", "ACCEPT"])
+        commands.append(["iptables", "-A", "OUTPUT", "-p", "tcp", "--dport", "15008", "-j", "REJECT"])
         # CNI redirects precede filter OUTPUT; authorize the kernel's original tuple, not its proxy.
         for protocol, port in (("udp", "15053"), ("tcp", "15053"), ("tcp", "15001")):
             listener = ["iptables", "-A", "OUTPUT", "-p", protocol, "--dport", port]
