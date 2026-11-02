@@ -108,12 +108,34 @@ class RuntimeSessionTests(unittest.TestCase):
             pass
         old = self.clients[0]
         old._client._proc.poll.return_value = 0
-        old._client.request.side_effect = RuntimeError("transport closed")
+        old._client.request.reset_mock()
+        old._client.request.side_effect = AssertionError("Dead transport must not receive another RPC.")
         self.sessions.cleanup_status = Mock(side_effect=[{"runtime_active": True}, {"runtime_active": False}])
         with self.lease() as lease:
             self.assertFalse(lease.reused)
         self.assertFalse(self.sessions.failed)
         self.assertEqual(self.factory.call_count, 2)
+        old._client.request.assert_not_called()
+        old.close.assert_called_once()
+        old._client._proc.wait.assert_called_once_with(timeout=3)
+
+    def test_dead_worker_without_trusted_cleanup_quarantines_future_requests(self):
+        for process_missing in (False, True):
+            with self.subTest(process_missing=process_missing):
+                client = self.factory()
+                client._client._proc.poll.return_value = 1
+                if process_missing:
+                    client._client._proc = None
+                client._client.request.reset_mock()
+                sessions = RuntimeSessions(self.factory)
+                sessions.client = client
+                with self.assertRaisesRegex(RuntimeError, "not confirmed"):
+                    sessions.close()
+                client._client.request.assert_not_called()
+                client.close.assert_called_once()
+                self.assertTrue(sessions.failed)
+                with self.assertRaisesRegex(RuntimeError, "restart"), sessions.lease("42", {}, "profile", "a" * 43, 60):
+                    pass
 
     def test_uncertain_cleanup_quarantines_future_requests(self):
         with self.lease():
@@ -193,6 +215,18 @@ class RuntimeSessionTests(unittest.TestCase):
             lease.discarded = True
         self.assertIsNone(self.sessions.client)
         self.assertFalse(self.sessions.failed)
+
+    def test_published_reply_survives_dead_worker_with_unconfirmed_cleanup(self):
+        with self.lease() as lease:
+            lease.published = True
+            lease.discarded = True
+            lease.client._client._proc.poll.return_value = 1
+            lease.client._client.request.reset_mock()
+            self.sessions.cleanup_status = Mock(side_effect=RuntimeError("synthetic unavailable status"))
+        lease.client._client.request.assert_not_called()
+        lease.client.close.assert_called_once()
+        self.assertIsNone(self.sessions.client)
+        self.assertTrue(self.sessions.failed)
 
     def test_cleanup_diagnostics_are_safe_and_do_not_claim_pause_on_failure(self):
         client = Mock()

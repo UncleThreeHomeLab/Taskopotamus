@@ -61,6 +61,10 @@ class RuntimeSessions:
         self.thread, self.thread_options, self.instructions = None, None, None
         if client is not None:
             try:
+                process = client._client._proc
+                # SDK 0.163 cannot answer a new request after its reader has exited.
+                if process is None or process.poll() is not None:
+                    raise RuntimeError("Runtime transport is closed.")
                 acknowledgment = self._rpc(client, "close", {}, RuntimeClosed)
                 if acknowledgment.closed is not True:
                     raise RuntimeError("Runtime cleanup was not confirmed.")
