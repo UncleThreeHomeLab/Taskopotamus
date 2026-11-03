@@ -409,6 +409,22 @@ class HelmChartTests(unittest.TestCase):
         keys = next(volume["secret"]["items"] for volume in deployments["google"]["spec"]["template"]["spec"]["volumes"] if "secret" in volume)
         self.assertTrue({"google_oauth_client_id", "google_oauth_client_secret", "google_oauth_redirect_uri"}.issubset({item["key"] for item in keys}))
 
+    def test_console_external_origin_is_scoped_and_local_probe_is_preserved(self):
+        for origin in ("", "https://console.example.test", "https://console.example.test:8443"):
+            with self.subTest(origin=origin):
+                deployments = by_kind(resources({"console": {"enabled": True, "externalOrigin": origin}}), "Deployment")
+                for name, deployment in deployments.items():
+                    container = deployment["spec"]["template"]["spec"]["containers"][0]
+                    environment = {item["name"]: item.get("value") for item in container.get("env", [])}
+                    self.assertEqual(environment.get("CONSOLE_ORIGIN"), origin if name == "test-console" and origin else None)
+                    if name == "test-console":
+                        self.assertIn("http://localhost:8088/health", container["readinessProbe"]["exec"]["command"][-1])
+        for origin in ("http://console.example.test", "https://console.example.test/", "https://user@console.example.test",
+                       "https://console.example.test?x=1", "https://console.example.test#part", "https://*.example.test",
+                       "https://console.example.test:65536", "https://bad..example.test", "https://" + ".".join(["a" * 63] * 4)):
+            with self.subTest(origin=origin):
+                self.assertNotEqual(render({"console": {"enabled": True, "externalOrigin": origin}}).returncode, 0)
+
     def test_postgres_initialization_matches_canonical_asset(self):
         config = by_kind(self.items, "ConfigMap")["synthetic-postgres-init"]
         self.assertEqual(config["data"]["initialize_databases.sh"].strip(), (ROOT / "deploy/postgres/initialize_databases.sh").read_text().strip())

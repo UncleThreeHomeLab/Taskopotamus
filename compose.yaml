@@ -178,6 +178,7 @@ services:
       AGENT_URL: http://agent:8080
       AGENT_API_TOKEN_FILE: /run/secrets/agent_api_token
       CODEX_TURN_TIMEOUT_SECONDS: ${CODEX_TURN_TIMEOUT_SECONDS:-600}
+      CONSOLE_ORIGIN: ${CONSOLE_ORIGIN:-}
     secrets: [agent_api_token]
     networks: [execution, console_ingress]
     ports: ["127.0.0.1:8088:8088"]

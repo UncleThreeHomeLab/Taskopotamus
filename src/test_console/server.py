@@ -1,4 +1,4 @@
-"""Opt-in localhost browser interface; live work starts only from protected forms."""
+"""Opt-in operator console; live work starts only from protected forms."""
 import os
 import re
 import secrets
@@ -238,7 +238,19 @@ class ConsoleState:
                 self.active_request = None
 
 
-def make_handler(state):
+def make_handler(state, origin=""):
+    if not isinstance(origin, str):
+        raise ValueError("Console origin must be an HTTPS origin or empty for localhost.")
+    authority = None
+    if origin:
+        match = re.fullmatch(r"https://([A-Za-z0-9.-]+)(?::([1-9][0-9]{0,4}))?", origin)
+        if (match is None or len(match[1]) > 253 or any(
+                re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label) is None
+                for label in match[1].split(".")) or int(match[2] or 443) > 65535):
+            raise ValueError("Console origin must contain only an HTTPS hostname and optional port.")
+        authority = match[1].lower() + (":" + match[2] if match[2] and match[2] != "443" else "")
+        origin = "https://" + authority
+
     class Handler(BaseHTTPRequestHandler):
         read_timeout = 10
 
@@ -273,7 +285,8 @@ def make_handler(state):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "same-origin")
             if cookie:
-                self.send_header("Set-Cookie", f"console_session={state.cookie}; HttpOnly; SameSite=Strict; Path=/")
+                secure = "; Secure" if origin else ""
+                self.send_header("Set-Cookie", f"console_session={state.cookie}; HttpOnly; SameSite=Strict; Path=/{secure}")
             if status == 303:
                 self.send_header("Location", "/")
             self.send_header("Content-Length", str(len(body)))
@@ -287,10 +300,19 @@ def make_handler(state):
 
         def trusted(self, post=False):
             hosts = self.headers.get_all("Host", [])
-            if len(hosts) != 1 or hosts[0] not in ("localhost:8088", "127.0.0.1:8088"):
+            if len(hosts) != 1:
                 return False
+            local = hosts[0] in ("localhost:8088", "127.0.0.1:8088")
+            if origin and not (not post and self.path == "/health" and local):
+                if hosts[0] != authority:
+                    return False
+                expected = origin
+            else:
+                if not local:
+                    return False
+                expected = "http://" + hosts[0]
             origins = self.headers.get_all("Origin", [])
-            return (len(origins) == 1 and origins[0] == "http://" + hosts[0]) if post or origins else True
+            return (len(origins) == 1 and origins[0] == expected) if post or origins else True
 
         def do_GET(self):
             self.deadline.cancel()
@@ -433,8 +455,8 @@ def make_handler(state):
 def main():
     os.umask(0o077)
     client = AgentClient(os.environ.get("AGENT_URL", "http://agent:8080"), read_secret("AGENT_API_TOKEN"))
-    with AgentHTTPServer(("0.0.0.0", 8088), make_handler(ConsoleState(client))) as server:
-        print("Local test console ready.", flush=True)
+    with AgentHTTPServer(("0.0.0.0", 8088), make_handler(ConsoleState(client), os.environ.get("CONSOLE_ORIGIN", ""))) as server:
+        print("Console ready.", flush=True)
         server.serve_forever()
 
 
