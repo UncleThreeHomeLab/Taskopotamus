@@ -28,12 +28,15 @@ def finished(state):
 
 
 class ConsoleTests(unittest.TestCase):
+    origin = ""
+    host = "localhost:8088"
+
     def setUp(self):
         self.client = Mock()
         self.client.status.return_value = {"state": "signed_in"}
         self.client.console_chat.return_value = {"text": "Hello <script>private</script>", "status": "completed", "details": None}
         self.state = ConsoleState(self.client)
-        self.handler = make_handler(self.state)
+        self.handler = make_handler(self.state, self.origin)
         self.server = AgentHTTPServer(("127.0.0.1", 0), self.handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
@@ -42,11 +45,12 @@ class ConsoleTests(unittest.TestCase):
     def request(self, method="GET", path="/", fields=None, headers=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
         self.addCleanup(connection.close)
-        default = {"Host": "localhost:8088"}
+        default = {"Host": self.host}
         if method == "POST":
-            default.update({"Origin": "http://localhost:8088", "Cookie": f"console_session={self.state.cookie}",
+            default.update({"Origin": self.origin or "http://" + self.host, "Cookie": f"console_session={self.state.cookie}",
                             "Content-Type": "application/x-www-form-urlencoded"})
         default.update(headers or {})
+        default = {key: value for key, value in default.items() if value is not None}
         connection.request(method, path, urlencode(fields).encode() if fields is not None else None, default)
         response = connection.getresponse()
         return response.status, dict(response.getheaders()), response.read().decode()
@@ -61,6 +65,7 @@ class ConsoleTests(unittest.TestCase):
         status, headers, body = self.request()
         self.assertEqual(status, 200)
         self.assertIn("HttpOnly; SameSite=Strict", headers["Set-Cookie"])
+        self.assertEqual("; Secure" in headers["Set-Cookie"], bool(self.origin))
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
         self.assertIn("Message", body)
@@ -227,12 +232,79 @@ class ConsoleTests(unittest.TestCase):
     def test_slow_body_is_closed_before_backend_and_oversized_forms_fail(self):
         self.handler.read_timeout = 0.1
         with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=2) as connection:
-            connection.sendall(("POST /chat HTTP/1.1\r\nHost: localhost:8088\r\nOrigin: http://localhost:8088\r\n"
+            connection.sendall((f"POST /chat HTTP/1.1\r\nHost: {self.host}\r\nOrigin: {self.origin or 'http://' + self.host}\r\n"
                                 f"Cookie: console_session={self.state.cookie}\r\nContent-Type: application/x-www-form-urlencoded\r\n"
                                 "Content-Length: 100\r\n\r\na").encode())
             self.assertEqual(connection.recv(1), b"")
         self.assertEqual(self.request("POST", "/chat", self.fields("x" * 65537))[0], 400)
         self.client.console_chat.assert_not_called()
+
+
+class GatewayConsoleTests(ConsoleTests):
+    origin = "https://console.example.test"
+    host = "console.example.test"
+
+    def test_localhost_is_health_only_and_never_issues_session_cookie(self):
+        for host in ("localhost:8088", "127.0.0.1:8088"):
+            with self.subTest(host=host):
+                status, headers, body = self.request(path="/health", headers={"Host": host})
+                self.assertEqual((status, body), (200, "Ready"))
+                self.assertNotIn("Set-Cookie", headers)
+                self.assertEqual(self.request(headers={"Host": host})[0], 403)
+                self.assertEqual(self.request(path="/artifact/" + "a" * 32, headers={"Host": host})[0], 403)
+                self.assertEqual(self.request("POST", "/status", self.fields(), {"Host": host})[0], 403)
+                self.assertEqual(self.request(path="/health", headers={"Host": host, "Origin": self.origin})[0], 403)
+        self.client.status.assert_not_called()
+        self.client.console_chat.assert_not_called()
+
+    def test_gateway_origin_cannot_be_inferred_from_forwarded_headers(self):
+        forwarded = {"Forwarded": "host=console.example.test;proto=https",
+                     "X-Forwarded-Host": self.host, "X-Forwarded-Proto": "https"}
+        for headers in ({**forwarded, "Host": "localhost:8088"},
+                        {**forwarded, "Origin": "http://" + self.host},
+                        {"Origin": None}, {"Origin": ""}, {"Cookie": None}):
+            with self.subTest(headers=list(headers)):
+                self.assertEqual(self.request("POST", "/chat", self.fields("hi"), headers)[0], 403)
+        self.client.console_chat.assert_not_called()
+
+    def test_duplicate_host_and_origin_headers_fail_before_backend(self):
+        for duplicate in ("Host", "Origin"):
+            with self.subTest(header=duplicate):
+                connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
+                self.addCleanup(connection.close)
+                body = urlencode(self.fields("hi")).encode()
+                connection.putrequest("POST", "/chat", skip_host=True)
+                for name, value in (("Host", self.host), ("Origin", self.origin)):
+                    connection.putheader(name, value)
+                    if name == duplicate:
+                        connection.putheader(name, value)
+                connection.putheader("Cookie", "console_session=" + self.state.cookie)
+                connection.putheader("Content-Type", "application/x-www-form-urlencoded")
+                connection.putheader("Content-Length", str(len(body)))
+                connection.endheaders(body)
+                response = connection.getresponse()
+                self.assertEqual(response.status, 403)
+                response.read()
+        self.client.console_chat.assert_not_called()
+
+    def test_configured_port_is_exact_and_default_https_port_is_canonical(self):
+        self.server.RequestHandlerClass = make_handler(self.state, "https://console.example.test:8443")
+        self.assertEqual(self.request()[0], 403)
+        self.assertEqual(self.request(headers={"Host": self.host + ":8443"})[0], 200)
+        self.assertEqual(self.request("POST", "/status", self.fields(),
+                                     {"Host": self.host + ":8443", "Origin": self.origin + ":8443"})[0], 303)
+        self.assertEqual(self.request("POST", "/status", self.fields(), {"Host": self.host + ":8443"})[0], 403)
+        self.server.RequestHandlerClass = make_handler(self.state, "https://CONSOLE.example.test:443")
+        self.assertEqual(self.request()[0], 200)
+
+    def test_invalid_configured_origins_fail_before_listening(self):
+        for origin in (None, "http://console.example.test", "https://console.example.test/", "https://user@console.example.test",
+                       "https://console.example.test?x=1", "https://console.example.test#part", "https://*.example.test",
+                       "https://console.example.test:65536", "https://console.example.test:0", "https://-bad.example.test",
+                       "https://bad..example.test", " https://console.example.test", "https://console.example.test\n",
+                       "https://" + ".".join(["a" * 63] * 4)):
+            with self.subTest(origin=origin), self.assertRaises(ValueError):
+                make_handler(self.state, origin)
 
 
 class RunDetailsTests(unittest.TestCase):

@@ -173,6 +173,7 @@ app.kubernetes.io/component: {{ .component | quote }}
 {{- $env = dict "MINIO_ROOT_USER" "taskopotamus-admin" "MINIO_ROOT_PASSWORD_FILE" "/run/secrets/silo_root_password" "MINIO_BROWSER" "off" "MINIO_UPDATE" "off" -}}
 {{- else if eq .component "test-console" -}}
 {{- $env = dict "AGENT_URL" "http://agent:8080" "AGENT_API_TOKEN_FILE" "/run/secrets/agent_api_token" "CODEX_TURN_TIMEOUT_SECONDS" $v.agent.turnTimeoutSeconds -}}
+{{- if $v.console.externalOrigin -}}{{- $_ := set $env "CONSOLE_ORIGIN" $v.console.externalOrigin -}}{{- end -}}
 {{- end -}}
 {{- toJson $env -}}
 {{- end -}}

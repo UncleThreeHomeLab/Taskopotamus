@@ -94,12 +94,14 @@ storage:
 instructionsConfigMap: ""
 google:
   oauthEnabled: false
-# Local access only: port-forward google:8080 (OAuth callback path /oauth/google/callback)
-# or test-console:8088. No public Ingress or LoadBalancer is created.
+# Port-forward google:8080 (OAuth callback path /oauth/google/callback) or test-console:8088.
+# Console gateway access requires an explicit HTTPS origin and private operator access protection.
+# No Ingress or LoadBalancer is created.
 objects:
   enabled: false
 console:
   enabled: false
+  externalOrigin: ""
 resources:
   postgres: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: "1", memory: 512Mi}}
   agent: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: "1", memory: 1Gi}}

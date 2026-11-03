@@ -45,12 +45,12 @@ def render(state):
     replay = form("replay", "Check same request (never resend as new work)") if state["uncertain"] else ""
     disabled = " disabled" if state["pending"] else ""
     return f'''<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">{refresh}<title>Taskopotamus local console</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">{refresh}<title>Taskopotamus console</title>
 <style>body{{font:16px system-ui;max-width:850px;margin:2rem auto;padding:0 1rem;color:#162232;background:#f4f6fa}}
 article,section{{background:white;border:1px solid #cbd2de;border-radius:8px;padding:1rem;margin:1rem 0}}
 pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}}textarea{{width:100%;box-sizing:border-box;font:inherit}}
 button{{padding:.6rem .9rem;cursor:pointer}}nav{{display:flex;flex-wrap:wrap;gap:.5rem}}label{{display:block;font-weight:bold}}</style></head>
-<body><h1>Taskopotamus local console</h1><p>Manual live testing. Sending messages consumes real model usage.</p>
+<body><h1>Taskopotamus console</h1><p>Sending messages consumes real model usage.</p>
 <p>Separate console conversation and profile. Codex account, worker files, and busy slot are shared with Telegram. Trusted operators only.</p>
 <p>Visible transcript clears when this console restarts; the agent conversation continues until New conversation.</p>
 <section><h2>Codex sign-in</h2><p>Status: {escape(auth.get("state", "unknown"))}</p>{signin}
